@@ -5,8 +5,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Literal, Optional
 
-from pydantic import Field
-from pydantic_settings import BaseSettings
+from pydantic import Field, model_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
@@ -15,7 +15,7 @@ class Settings(BaseSettings):
     All settings can be overridden via environment variables prefixed with ``AGENT_KB_``.
     """
 
-    model_config = {"env_prefix": "AGENT_KB_"}
+    model_config = SettingsConfigDict(env_prefix="AGENT_KB_")
 
     # --- Storage ---
     db_path: Path = Field(
@@ -64,12 +64,21 @@ class Settings(BaseSettings):
     # --- Chunking ---
     chunk_size: int = Field(
         default=512,
+        gt=0,
         description="Default chunk size in tokens",
     )
     chunk_overlap: int = Field(
         default=64,
+        ge=0,
         description="Chunk overlap in tokens",
     )
+
+    @model_validator(mode="after")
+    def _validate_chunk_overlap(self) -> Settings:
+        if self.chunk_overlap >= self.chunk_size:
+            msg = f"chunk_overlap ({self.chunk_overlap}) must be less than chunk_size ({self.chunk_size})"
+            raise ValueError(msg)
+        return self
 
     # --- Export ---
     export_path: Optional[Path] = Field(

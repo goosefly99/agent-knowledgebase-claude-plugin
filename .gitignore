@@ -20,5 +20,9 @@ Thumbs.db
 .coverage
 htmlcov/
 
+# Secrets
+.env
+.env.*
+
 # Project
 *.db
