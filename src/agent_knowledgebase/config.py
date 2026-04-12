@@ -35,7 +35,7 @@ class Settings(BaseSettings):
     # --- Storage ---
     saves_dir: Path = Field(
         description="Base directory for knowledgebase storage (AGENT_KB_SAVES_DIR). "
-        "Each KB gets its own subdirectory under <saves_dir>/agent-knowledgebases/. "
+        "Each KB gets its own subdirectory directly under <saves_dir>/<sanitized-name>/. "
         "This environment variable is required and the directory must exist.",
     )
 
@@ -103,6 +103,8 @@ class Settings(BaseSettings):
 
         Raises
         ------
+        NotADirectoryError
+            If the resolved *saves_dir* path exists but is not a directory.
         FileNotFoundError
             If the resolved *saves_dir* does not exist on disk.
         """
@@ -112,9 +114,13 @@ class Settings(BaseSettings):
             if value is not None:
                 updates[field_name] = Path(value).expanduser().resolve()
         resolved = self.model_copy(update=updates)
-        if not resolved.saves_dir.is_dir():
+        if not resolved.saves_dir.exists():
             raise FileNotFoundError(
-                f"AGENT_KB_SAVES_DIR does not exist or is not a directory: {resolved.saves_dir}"
+                f"AGENT_KB_SAVES_DIR does not exist: {resolved.saves_dir}"
+            )
+        if not resolved.saves_dir.is_dir():
+            raise NotADirectoryError(
+                f"AGENT_KB_SAVES_DIR exists but is not a directory: {resolved.saves_dir}"
             )
         return resolved
 
@@ -122,12 +128,12 @@ class Settings(BaseSettings):
 
     @property
     def knowledgebases_dir(self) -> Path:
-        """The ``agent-knowledgebases`` directory under *saves_dir*."""
-        return self.saves_dir / "agent-knowledgebases"
+        """Base directory under which each KB gets its own subdirectory."""
+        return self.saves_dir
 
     def kb_data_dir(self, dir_name: str) -> Path:
         """Data directory for a single knowledgebase."""
-        return self.knowledgebases_dir / dir_name
+        return self.saves_dir / dir_name
 
     def kb_db_path(self, dir_name: str) -> Path:
         """SQLite database path for a single knowledgebase."""

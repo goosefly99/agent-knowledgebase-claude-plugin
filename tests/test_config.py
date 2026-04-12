@@ -12,8 +12,9 @@ from agent_knowledgebase.config import Settings, sanitize_kb_dir_name
 class TestSavesDir:
     """saves_dir is required and validated."""
 
-    def test_saves_dir_required(self) -> None:
+    def test_saves_dir_required(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Settings() without AGENT_KB_SAVES_DIR raises."""
+        monkeypatch.delenv("AGENT_KB_SAVES_DIR", raising=False)
         with pytest.raises(Exception):
             Settings()
 
@@ -25,9 +26,17 @@ class TestSavesDir:
         assert cfg.saves_dir == saves
 
     def test_resolve_paths_fails_if_dir_missing(self, tmp_path: Path) -> None:
+        """Missing saves_dir must raise loudly — no silent auto-create."""
         cfg = Settings(saves_dir=tmp_path / "nonexistent")
         with pytest.raises(FileNotFoundError, match="AGENT_KB_SAVES_DIR"):
             cfg.resolve_paths()
+
+    def test_resolve_paths_rejects_file_as_saves_dir(self, tmp_path: Path) -> None:
+        """If the path exists as a file, raise instead of clobbering it."""
+        not_a_dir = tmp_path / "iam_a_file"
+        not_a_dir.write_text("hi")
+        with pytest.raises(NotADirectoryError, match="AGENT_KB_SAVES_DIR"):
+            Settings(saves_dir=not_a_dir).resolve_paths()
 
     def test_resolve_paths_succeeds_for_existing_dir(self, tmp_path: Path) -> None:
         saves = tmp_path / "ok"
@@ -127,24 +136,22 @@ class TestPathExpansion:
 class TestPerKBPaths:
     """Per-KB path helpers derive from saves_dir."""
 
-    def test_knowledgebases_dir(self, tmp_path: Path) -> None:
+    def test_knowledgebases_dir_is_saves_dir(self, tmp_path: Path) -> None:
+        """Each KB is placed directly under saves_dir, not under a nested folder."""
         cfg = Settings(saves_dir=tmp_path)
-        assert cfg.knowledgebases_dir == tmp_path / "agent-knowledgebases"
+        assert cfg.knowledgebases_dir == tmp_path
 
     def test_kb_data_dir(self, tmp_path: Path) -> None:
         cfg = Settings(saves_dir=tmp_path)
-        assert cfg.kb_data_dir("my-kb") == tmp_path / "agent-knowledgebases" / "my-kb"
+        assert cfg.kb_data_dir("my-kb") == tmp_path / "my-kb"
 
     def test_kb_db_path(self, tmp_path: Path) -> None:
         cfg = Settings(saves_dir=tmp_path)
-        assert (
-            cfg.kb_db_path("my-kb")
-            == tmp_path / "agent-knowledgebases" / "my-kb" / "knowledgebase.db"
-        )
+        assert cfg.kb_db_path("my-kb") == tmp_path / "my-kb" / "knowledgebase.db"
 
     def test_kb_chroma_path(self, tmp_path: Path) -> None:
         cfg = Settings(saves_dir=tmp_path)
-        assert cfg.kb_chroma_path("my-kb") == tmp_path / "agent-knowledgebases" / "my-kb" / "chroma"
+        assert cfg.kb_chroma_path("my-kb") == tmp_path / "my-kb" / "chroma"
 
 
 class TestSanitizeKBDirName:

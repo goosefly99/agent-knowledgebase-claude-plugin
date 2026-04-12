@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -57,11 +57,10 @@ def service(
     Uses real per-KB SQLite databases (in tmp dirs), a mocked embedder,
     a mocked vectorstore, and a mocked IngestionOrchestrator.
     """
-    with patch(
-        "agent_knowledgebase.services.knowledgebase.create_embedder",
-        return_value=mock_embedder,
-    ):
-        svc = KnowledgebaseService(test_config)
+    svc = KnowledgebaseService(test_config)
+    # Embedder is lazily created; inject the mock directly so tests don't
+    # load sentence-transformers.
+    svc._embedder_instance = mock_embedder
 
     # Override _get_vectorstore to always return the mock
     svc._get_vectorstore = lambda kb_id: mock_vectorstore  # type: ignore[assignment]

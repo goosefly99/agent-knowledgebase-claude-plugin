@@ -1,10 +1,9 @@
 """Top-level knowledgebase lifecycle service coordinating all sub-services.
 
 Each knowledgebase is stored in its own subdirectory under
-``<saves_dir>/agent-knowledgebases/<sanitized-name>/``, containing a
-per-KB SQLite database and ChromaDB directory.  A lightweight
-``.index.json`` at the ``agent-knowledgebases/`` level maps
-``kb_id -> dir_name`` for fast lookups.
+``<saves_dir>/<sanitized-name>/``, containing a per-KB SQLite database
+and ChromaDB directory.  A lightweight ``.index.json`` at the
+``saves_dir`` level maps ``kb_id -> dir_name`` for fast lookups.
 """
 
 from __future__ import annotations
@@ -92,15 +91,23 @@ class KnowledgebaseService:
     def __init__(self, config: Settings) -> None:
         self._config = config.resolve_paths()
         self._base_dir = self._config.knowledgebases_dir
-        self._base_dir.mkdir(parents=True, exist_ok=True)
 
-        # Shared (stateless / model-level) services
-        self._embedder: Embedder = create_embedder(self._config)
+        # Shared stateless services — embedder is loaded lazily the first
+        # time it is needed since the sentence-transformers model load takes
+        # several seconds and would otherwise dominate first-call latency.
+        self._embedder_instance: Embedder | None = None
         self._ingestion = IngestionOrchestrator(self._config)
 
         # Per-KB state — lazily populated
         self._contexts: dict[str, _KBContext] = {}
         self._index: dict[str, str] = _load_index(self._base_dir)
+
+    @property
+    def _embedder(self) -> Embedder:
+        """Lazily instantiate the embedder on first use."""
+        if self._embedder_instance is None:
+            self._embedder_instance = create_embedder(self._config)
+        return self._embedder_instance
 
     # ------------------------------------------------------------------
     # Per-KB context management
