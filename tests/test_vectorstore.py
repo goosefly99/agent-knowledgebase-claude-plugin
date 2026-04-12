@@ -211,7 +211,9 @@ class TestPineconeStore:
     @pytest.fixture()
     def store(self, mock_index: MagicMock) -> PineconeStore:
         """Return a PineconeStore with mocked internals."""
-        with patch("agent_knowledgebase.services.vectorstore.PineconeStore.__init__", lambda s, **kw: None):
+        with patch(
+            "agent_knowledgebase.services.vectorstore.PineconeStore.__init__", lambda s, **kw: None
+        ):
             s = PineconeStore.__new__(PineconeStore)
         s._index = mock_index
         s._namespace = "test-ns"
@@ -239,9 +241,7 @@ class TestPineconeStore:
         assert vectors[1]["metadata"]["_document"] == "doc b"
         assert call_kwargs.kwargs["namespace"] == "test-ns"
 
-    def test_add_without_metadata(
-        self, store: PineconeStore, mock_index: MagicMock
-    ) -> None:
+    def test_add_without_metadata(self, store: PineconeStore, mock_index: MagicMock) -> None:
         store.add(
             ids=["a"],
             embeddings=[_EMBEDDINGS[0]],
@@ -250,15 +250,11 @@ class TestPineconeStore:
         vectors = mock_index.upsert.call_args.kwargs["vectors"]
         assert vectors[0]["metadata"] == {"_document": "doc a"}
 
-    def test_add_empty_list(
-        self, store: PineconeStore, mock_index: MagicMock
-    ) -> None:
+    def test_add_empty_list(self, store: PineconeStore, mock_index: MagicMock) -> None:
         store.add(ids=[], embeddings=[], documents=[])
         mock_index.upsert.assert_not_called()
 
-    def test_query_calls_index_query(
-        self, store: PineconeStore, mock_index: MagicMock
-    ) -> None:
+    def test_query_calls_index_query(self, store: PineconeStore, mock_index: MagicMock) -> None:
         mock_index.query.return_value = {
             "matches": [
                 {"id": "a", "score": 0.95, "metadata": {"_document": "doc a", "source": "s1"}},
@@ -281,23 +277,17 @@ class TestPineconeStore:
         assert results[0].distance == pytest.approx(0.05)
         assert results[1].distance == pytest.approx(0.20)
 
-    def test_query_with_filter(
-        self, store: PineconeStore, mock_index: MagicMock
-    ) -> None:
+    def test_query_with_filter(self, store: PineconeStore, mock_index: MagicMock) -> None:
         mock_index.query.return_value = {"matches": []}
         store.query(embedding=_EMBEDDINGS[0], top_k=3, where={"source": "test"})
         call_kwargs = mock_index.query.call_args.kwargs
         assert call_kwargs["filter"] == {"source": "test"}
 
-    def test_delete_calls_index_delete(
-        self, store: PineconeStore, mock_index: MagicMock
-    ) -> None:
+    def test_delete_calls_index_delete(self, store: PineconeStore, mock_index: MagicMock) -> None:
         store.delete(ids=["a", "b"])
         mock_index.delete.assert_called_once_with(ids=["a", "b"], namespace="test-ns")
 
-    def test_delete_empty_list(
-        self, store: PineconeStore, mock_index: MagicMock
-    ) -> None:
+    def test_delete_empty_list(self, store: PineconeStore, mock_index: MagicMock) -> None:
         store.delete(ids=[])
         mock_index.delete.assert_not_called()
 
@@ -319,15 +309,11 @@ class TestPineconeStore:
         assert results[1].id == "b"
         assert results[1].document == "doc b"
 
-    def test_get_empty_ids(
-        self, store: PineconeStore, mock_index: MagicMock
-    ) -> None:
+    def test_get_empty_ids(self, store: PineconeStore, mock_index: MagicMock) -> None:
         assert store.get(ids=[]) == []
         mock_index.fetch.assert_not_called()
 
-    def test_get_skips_missing_ids(
-        self, store: PineconeStore, mock_index: MagicMock
-    ) -> None:
+    def test_get_skips_missing_ids(self, store: PineconeStore, mock_index: MagicMock) -> None:
         mock_index.fetch.return_value = {
             "vectors": {
                 "a": {"metadata": {"_document": "doc a"}},
@@ -365,14 +351,24 @@ class TestCreateVectorstore:
 
     def test_creates_chromadb_store(self, tmp_path: Path) -> None:
         config = Settings(
+            saves_dir=tmp_path,
             vectorstore="chromadb",
+        )
+        store = create_vectorstore(
+            config,
+            collection_name="test-kb",
             chroma_path=tmp_path / "chroma",
         )
-        store = create_vectorstore(config, collection_name="test-kb")
         assert isinstance(store, ChromaDBStore)
 
-    def test_creates_pinecone_store(self) -> None:
+    def test_chromadb_missing_chroma_path_raises(self, tmp_path: Path) -> None:
+        config = Settings(saves_dir=tmp_path, vectorstore="chromadb")
+        with pytest.raises(ValueError, match="chroma_path"):
+            create_vectorstore(config, collection_name="test-kb")
+
+    def test_creates_pinecone_store(self, tmp_path: Path) -> None:
         config = Settings(
+            saves_dir=tmp_path,
             vectorstore="pinecone",
             pinecone_api_key="pk-test",
             pinecone_index="my-index",
@@ -384,8 +380,9 @@ class TestCreateVectorstore:
             store = create_vectorstore(config, collection_name="test-kb")
         assert isinstance(store, PineconeStore)
 
-    def test_pinecone_missing_api_key_raises(self) -> None:
+    def test_pinecone_missing_api_key_raises(self, tmp_path: Path) -> None:
         config = Settings(
+            saves_dir=tmp_path,
             vectorstore="pinecone",
             pinecone_api_key=None,
             pinecone_index="my-index",
@@ -394,8 +391,9 @@ class TestCreateVectorstore:
         with pytest.raises(ValueError, match="Pinecone requires"):
             create_vectorstore(config, collection_name="test-kb")
 
-    def test_pinecone_missing_index_raises(self) -> None:
+    def test_pinecone_missing_index_raises(self, tmp_path: Path) -> None:
         config = Settings(
+            saves_dir=tmp_path,
             vectorstore="pinecone",
             pinecone_api_key="pk-test",
             pinecone_index=None,
@@ -404,8 +402,9 @@ class TestCreateVectorstore:
         with pytest.raises(ValueError, match="Pinecone requires"):
             create_vectorstore(config, collection_name="test-kb")
 
-    def test_pinecone_missing_environment_raises(self) -> None:
+    def test_pinecone_missing_environment_raises(self, tmp_path: Path) -> None:
         config = Settings(
+            saves_dir=tmp_path,
             vectorstore="pinecone",
             pinecone_api_key="pk-test",
             pinecone_index="my-index",

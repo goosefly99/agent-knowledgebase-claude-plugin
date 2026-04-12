@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -37,9 +38,7 @@ class TestSentenceTransformerEmbedder:
         result = embedder.embed(texts)
         assert len(result) == 2
 
-    def test_embed_returns_correct_dimension(
-        self, embedder: SentenceTransformerEmbedder
-    ) -> None:
+    def test_embed_returns_correct_dimension(self, embedder: SentenceTransformerEmbedder) -> None:
         result = embedder.embed(["test sentence"])
         assert len(result[0]) == 384
 
@@ -48,9 +47,7 @@ class TestSentenceTransformerEmbedder:
         assert isinstance(result[0], list)
         assert all(isinstance(v, float) for v in result[0])
 
-    def test_embed_query_returns_single_vector(
-        self, embedder: SentenceTransformerEmbedder
-    ) -> None:
+    def test_embed_query_returns_single_vector(self, embedder: SentenceTransformerEmbedder) -> None:
         result = embedder.embed_query("single query")
         assert isinstance(result, list)
         assert len(result) == 384
@@ -110,9 +107,7 @@ class TestOpenAIEmbedder:
         assert emb.dimension == 1536
 
     def test_dimension_unknown_model_defaults_1536(self) -> None:
-        emb = OpenAIEmbedder(
-            model_name="some-future-model", api_key="sk-test", _client=MagicMock()
-        )
+        emb = OpenAIEmbedder(model_name="some-future-model", api_key="sk-test", _client=MagicMock())
         assert emb.dimension == 1536
 
     def test_embed_calls_api(self, embedder: OpenAIEmbedder) -> None:
@@ -162,17 +157,19 @@ class TestOpenAIEmbedder:
 class TestCreateEmbedder:
     """Factory function tests."""
 
-    def test_creates_sentence_transformer(self) -> None:
+    def test_creates_sentence_transformer(self, tmp_path: Path) -> None:
         config = Settings(
+            saves_dir=tmp_path,
             embedding_provider="sentence-transformers",
             embedding_model="all-MiniLM-L6-v2",
         )
         embedder = create_embedder(config)
         assert isinstance(embedder, SentenceTransformerEmbedder)
 
-    def test_creates_openai_embedder(self) -> None:
+    def test_creates_openai_embedder(self, tmp_path: Path) -> None:
         """Factory returns OpenAIEmbedder; real OpenAI import is avoided via _client."""
         config = Settings(
+            saves_dir=tmp_path,
             embedding_provider="openai",
             embedding_model="text-embedding-3-small",
             openai_api_key="sk-test-key",
@@ -193,8 +190,9 @@ class TestCreateEmbedder:
 
         assert isinstance(embedder, OpenAIEmbedder)
 
-    def test_openai_without_key_raises(self) -> None:
+    def test_openai_without_key_raises(self, tmp_path: Path) -> None:
         config = Settings(
+            saves_dir=tmp_path,
             embedding_provider="openai",
             embedding_model="text-embedding-3-small",
             openai_api_key=None,

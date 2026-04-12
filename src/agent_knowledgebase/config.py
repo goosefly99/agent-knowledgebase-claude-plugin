@@ -2,11 +2,26 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Literal, Optional
 
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+def sanitize_kb_dir_name(name: str) -> str:
+    """Convert a knowledgebase name to a filesystem-safe directory name.
+
+    >>> sanitize_kb_dir_name("My Research KB!")
+    'my-research-kb'
+    >>> sanitize_kb_dir_name("  hello   world  ")
+    'hello-world'
+    """
+    safe = re.sub(r"[^\w\s-]", "", name.lower())
+    safe = re.sub(r"[\s_]+", "-", safe)
+    safe = safe.strip("-")
+    return safe or "unnamed"
 
 
 class Settings(BaseSettings):
@@ -18,19 +33,16 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="AGENT_KB_")
 
     # --- Storage ---
-    db_path: Path = Field(
-        default=Path("~/.agent-kb/knowledgebase.db"),
-        description="SQLite database path",
+    saves_dir: Path = Field(
+        description="Base directory for knowledgebase storage (AGENT_KB_SAVES_DIR). "
+        "Each KB gets its own subdirectory under <saves_dir>/agent-knowledgebases/. "
+        "This environment variable is required and the directory must exist.",
     )
 
     # --- Vector store ---
     vectorstore: Literal["chromadb", "pinecone"] = Field(
         default="chromadb",
         description="Vector store backend",
-    )
-    chroma_path: Path = Field(
-        default=Path("~/.agent-kb/chroma"),
-        description="ChromaDB persistence directory",
     )
 
     # --- Pinecone ---
@@ -87,10 +99,40 @@ class Settings(BaseSettings):
     )
 
     def resolve_paths(self) -> Settings:
-        """Return a copy with all ``~`` paths expanded to absolute paths."""
+        """Return a copy with all ``~`` paths expanded to absolute paths.
+
+        Raises
+        ------
+        FileNotFoundError
+            If the resolved *saves_dir* does not exist on disk.
+        """
         updates: dict[str, Path] = {}
-        for field_name in ("db_path", "chroma_path", "export_path"):
+        for field_name in ("saves_dir", "export_path"):
             value = getattr(self, field_name)
             if value is not None:
                 updates[field_name] = Path(value).expanduser().resolve()
-        return self.model_copy(update=updates)
+        resolved = self.model_copy(update=updates)
+        if not resolved.saves_dir.is_dir():
+            raise FileNotFoundError(
+                f"AGENT_KB_SAVES_DIR does not exist or is not a directory: {resolved.saves_dir}"
+            )
+        return resolved
+
+    # --- Per-KB path helpers ---
+
+    @property
+    def knowledgebases_dir(self) -> Path:
+        """The ``agent-knowledgebases`` directory under *saves_dir*."""
+        return self.saves_dir / "agent-knowledgebases"
+
+    def kb_data_dir(self, dir_name: str) -> Path:
+        """Data directory for a single knowledgebase."""
+        return self.knowledgebases_dir / dir_name
+
+    def kb_db_path(self, dir_name: str) -> Path:
+        """SQLite database path for a single knowledgebase."""
+        return self.kb_data_dir(dir_name) / "knowledgebase.db"
+
+    def kb_chroma_path(self, dir_name: str) -> Path:
+        """ChromaDB persistence directory for a single knowledgebase."""
+        return self.kb_data_dir(dir_name) / "chroma"

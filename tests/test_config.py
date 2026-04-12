@@ -6,119 +6,184 @@ from pathlib import Path
 
 import pytest
 
-from agent_knowledgebase.config import Settings
+from agent_knowledgebase.config import Settings, sanitize_kb_dir_name
+
+
+class TestSavesDir:
+    """saves_dir is required and validated."""
+
+    def test_saves_dir_required(self) -> None:
+        """Settings() without AGENT_KB_SAVES_DIR raises."""
+        with pytest.raises(Exception):
+            Settings()
+
+    def test_saves_dir_from_env(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        saves = tmp_path / "env_saves"
+        saves.mkdir()
+        monkeypatch.setenv("AGENT_KB_SAVES_DIR", str(saves))
+        cfg = Settings()
+        assert cfg.saves_dir == saves
+
+    def test_resolve_paths_fails_if_dir_missing(self, tmp_path: Path) -> None:
+        cfg = Settings(saves_dir=tmp_path / "nonexistent")
+        with pytest.raises(FileNotFoundError, match="AGENT_KB_SAVES_DIR"):
+            cfg.resolve_paths()
+
+    def test_resolve_paths_succeeds_for_existing_dir(self, tmp_path: Path) -> None:
+        saves = tmp_path / "ok"
+        saves.mkdir()
+        resolved = Settings(saves_dir=saves).resolve_paths()
+        assert resolved.saves_dir.is_absolute()
+        assert resolved.saves_dir.is_dir()
 
 
 class TestDefaults:
-    """Default values load correctly without any env vars."""
+    """Default values for fields other than saves_dir."""
 
-    def test_default_db_path(self) -> None:
-        cfg = Settings()
-        assert cfg.db_path == Path("~/.agent-kb/knowledgebase.db")
+    def test_default_vectorstore(self, test_config: Settings) -> None:
+        assert test_config.vectorstore == "chromadb"
 
-    def test_default_vectorstore(self) -> None:
-        cfg = Settings()
-        assert cfg.vectorstore == "chromadb"
+    def test_default_embedding_provider(self, test_config: Settings) -> None:
+        assert test_config.embedding_provider == "sentence-transformers"
 
-    def test_default_chroma_path(self) -> None:
-        cfg = Settings()
-        assert cfg.chroma_path == Path("~/.agent-kb/chroma")
+    def test_default_embedding_model(self, test_config: Settings) -> None:
+        assert test_config.embedding_model == "all-MiniLM-L6-v2"
 
-    def test_default_embedding_provider(self) -> None:
-        cfg = Settings()
-        assert cfg.embedding_provider == "sentence-transformers"
+    def test_default_chunk_size(self, test_config: Settings) -> None:
+        assert test_config.chunk_size == 512
 
-    def test_default_embedding_model(self) -> None:
-        cfg = Settings()
-        assert cfg.embedding_model == "all-MiniLM-L6-v2"
+    def test_default_chunk_overlap(self, test_config: Settings) -> None:
+        assert test_config.chunk_overlap == 64
 
-    def test_default_chunk_size(self) -> None:
-        cfg = Settings()
-        assert cfg.chunk_size == 512
-
-    def test_default_chunk_overlap(self) -> None:
-        cfg = Settings()
-        assert cfg.chunk_overlap == 64
-
-    def test_optional_fields_are_none(self) -> None:
-        cfg = Settings()
-        assert cfg.pinecone_api_key is None
-        assert cfg.pinecone_index is None
-        assert cfg.pinecone_environment is None
-        assert cfg.openai_api_key is None
-        assert cfg.export_path is None
+    def test_optional_fields_are_none(self, test_config: Settings) -> None:
+        assert test_config.pinecone_api_key is None
+        assert test_config.pinecone_index is None
+        assert test_config.pinecone_environment is None
+        assert test_config.openai_api_key is None
 
 
 class TestEnvOverrides:
     """Environment variable overrides are picked up."""
 
-    def test_override_db_path(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv("AGENT_KB_DB_PATH", "/tmp/custom.db")
-        cfg = Settings()
-        assert cfg.db_path == Path("/tmp/custom.db")
-
-    def test_override_vectorstore(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_override_vectorstore(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         monkeypatch.setenv("AGENT_KB_VECTORSTORE", "pinecone")
-        cfg = Settings()
+        cfg = Settings(saves_dir=tmp_path)
         assert cfg.vectorstore == "pinecone"
 
-    def test_override_chunk_size(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_override_chunk_size(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         monkeypatch.setenv("AGENT_KB_CHUNK_SIZE", "1024")
-        cfg = Settings()
+        cfg = Settings(saves_dir=tmp_path)
         assert cfg.chunk_size == 1024
 
-    def test_override_chunk_overlap(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_override_chunk_overlap(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         monkeypatch.setenv("AGENT_KB_CHUNK_OVERLAP", "128")
-        cfg = Settings()
+        cfg = Settings(saves_dir=tmp_path)
         assert cfg.chunk_overlap == 128
 
-    def test_override_embedding_provider(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_override_embedding_provider(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
         monkeypatch.setenv("AGENT_KB_EMBEDDING_PROVIDER", "openai")
-        cfg = Settings()
+        cfg = Settings(saves_dir=tmp_path)
         assert cfg.embedding_provider == "openai"
 
-    def test_override_embedding_model(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_override_embedding_model(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
         monkeypatch.setenv("AGENT_KB_EMBEDDING_MODEL", "text-embedding-3-small")
-        cfg = Settings()
+        cfg = Settings(saves_dir=tmp_path)
         assert cfg.embedding_model == "text-embedding-3-small"
 
-    def test_override_export_path(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_override_export_path(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         monkeypatch.setenv("AGENT_KB_EXPORT_PATH", "/tmp/export")
-        cfg = Settings()
+        cfg = Settings(saves_dir=tmp_path)
         assert cfg.export_path == Path("/tmp/export")
 
 
 class TestPathExpansion:
     """Tilde paths are expanded via resolve_paths."""
 
-    def test_tilde_expanded_in_db_path(self) -> None:
-        cfg = Settings().resolve_paths()
-        assert "~" not in str(cfg.db_path)
-        assert cfg.db_path.is_absolute()
+    def test_tilde_expanded_in_saves_dir(self, tmp_path: Path) -> None:
+        saves = tmp_path / "tilde_test"
+        saves.mkdir()
+        cfg = Settings(saves_dir=saves).resolve_paths()
+        assert "~" not in str(cfg.saves_dir)
+        assert cfg.saves_dir.is_absolute()
 
-    def test_tilde_expanded_in_chroma_path(self) -> None:
-        cfg = Settings().resolve_paths()
-        assert "~" not in str(cfg.chroma_path)
-        assert cfg.chroma_path.is_absolute()
-
-    def test_none_export_path_stays_none(self) -> None:
-        cfg = Settings().resolve_paths()
+    def test_none_export_path_stays_none(self, tmp_path: Path) -> None:
+        saves = tmp_path / "ep_test"
+        saves.mkdir()
+        cfg = Settings(saves_dir=saves).resolve_paths()
         assert cfg.export_path is None
 
-    def test_set_export_path_expanded(self) -> None:
-        cfg = Settings(export_path=Path("~/my-export")).resolve_paths()
+    def test_set_export_path_expanded(self, tmp_path: Path) -> None:
+        saves = tmp_path / "ep2_test"
+        saves.mkdir()
+        cfg = Settings(saves_dir=saves, export_path=Path("~/my-export")).resolve_paths()
         assert "~" not in str(cfg.export_path)
         assert cfg.export_path.is_absolute()
+
+
+class TestPerKBPaths:
+    """Per-KB path helpers derive from saves_dir."""
+
+    def test_knowledgebases_dir(self, tmp_path: Path) -> None:
+        cfg = Settings(saves_dir=tmp_path)
+        assert cfg.knowledgebases_dir == tmp_path / "agent-knowledgebases"
+
+    def test_kb_data_dir(self, tmp_path: Path) -> None:
+        cfg = Settings(saves_dir=tmp_path)
+        assert cfg.kb_data_dir("my-kb") == tmp_path / "agent-knowledgebases" / "my-kb"
+
+    def test_kb_db_path(self, tmp_path: Path) -> None:
+        cfg = Settings(saves_dir=tmp_path)
+        assert (
+            cfg.kb_db_path("my-kb")
+            == tmp_path / "agent-knowledgebases" / "my-kb" / "knowledgebase.db"
+        )
+
+    def test_kb_chroma_path(self, tmp_path: Path) -> None:
+        cfg = Settings(saves_dir=tmp_path)
+        assert cfg.kb_chroma_path("my-kb") == tmp_path / "agent-knowledgebases" / "my-kb" / "chroma"
+
+
+class TestSanitizeKBDirName:
+    """sanitize_kb_dir_name produces safe directory names."""
+
+    def test_basic(self) -> None:
+        assert sanitize_kb_dir_name("My Research KB") == "my-research-kb"
+
+    def test_special_chars_stripped(self) -> None:
+        assert sanitize_kb_dir_name("Hello! @World#") == "hello-world"
+
+    def test_underscores_become_hyphens(self) -> None:
+        assert sanitize_kb_dir_name("foo_bar_baz") == "foo-bar-baz"
+
+    def test_multiple_spaces_collapsed(self) -> None:
+        assert sanitize_kb_dir_name("  hello   world  ") == "hello-world"
+
+    def test_empty_returns_unnamed(self) -> None:
+        assert sanitize_kb_dir_name("") == "unnamed"
+        assert sanitize_kb_dir_name("!!!") == "unnamed"
+
+    def test_already_clean(self) -> None:
+        assert sanitize_kb_dir_name("clean-name") == "clean-name"
+
+
+class TestChunkOverlapValidation:
+    """chunk_overlap must be < chunk_size."""
+
+    def test_overlap_too_large_raises(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match="chunk_overlap"):
+            Settings(saves_dir=tmp_path, chunk_overlap=512, chunk_size=512)
 
 
 class TestFixtures:
     """Verify the shared fixtures from conftest work."""
 
-    def test_tmp_db_path_is_in_tmp(self, tmp_db_path: Path) -> None:
-        assert tmp_db_path.name == "test_knowledgebase.db"
+    def test_test_config_has_saves_dir(self, test_config: Settings) -> None:
+        assert test_config.saves_dir is not None
+        assert test_config.saves_dir.is_dir()
 
-    def test_test_config_uses_tmp_paths(self, test_config: Settings, tmp_path: Path) -> None:
-        assert test_config.db_path.parent == tmp_path
-        assert test_config.chroma_path.parent == tmp_path
+    def test_test_config_export_path(self, test_config: Settings) -> None:
         assert test_config.export_path is not None
-        assert test_config.export_path.parent == tmp_path

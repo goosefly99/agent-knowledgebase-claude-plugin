@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from agent_knowledgebase.config import Settings
-from agent_knowledgebase.database import Database
 from agent_knowledgebase.models import (
     Chunk,
     PageType,
@@ -49,42 +49,21 @@ def mock_vectorstore() -> MagicMock:
 @pytest.fixture()
 def service(
     test_config: Settings,
-    test_db: Database,
     mock_embedder: MagicMock,
     mock_vectorstore: MagicMock,
 ) -> KnowledgebaseService:
     """Build a KnowledgebaseService with mocked embedder and vectorstore.
 
-    Uses real Database, WikiManager, PipelineManager, WikiLinter, MarkdownExporter
-    and a mocked IngestionOrchestrator (to avoid real file I/O).
+    Uses real per-KB SQLite databases (in tmp dirs), a mocked embedder,
+    a mocked vectorstore, and a mocked IngestionOrchestrator.
     """
-    with (
-        patch(
-            "agent_knowledgebase.services.knowledgebase.create_embedder",
-            return_value=mock_embedder,
-        ),
-        patch(
-            "agent_knowledgebase.services.knowledgebase.create_vectorstore",
-            return_value=mock_vectorstore,
-        ),
+    with patch(
+        "agent_knowledgebase.services.knowledgebase.create_embedder",
+        return_value=mock_embedder,
     ):
         svc = KnowledgebaseService(test_config)
 
-    # Replace the DB with the test_db so everything shares the same connection
-    svc._db = test_db
-    # Rebuild sub-services that depend on DB
-    from agent_knowledgebase.services.wiki import WikiManager
-    from agent_knowledgebase.services.pipeline import PipelineManager
-    from agent_knowledgebase.services.lint import WikiLinter
-    from agent_knowledgebase.services.export import MarkdownExporter
-
-    svc._wiki = WikiManager(test_db)
-    svc._pipeline = PipelineManager(test_db)
-    svc._linter = WikiLinter(svc._wiki, test_db)
-    svc._exporter = MarkdownExporter(svc._wiki)
-
-    # Inject the mock vectorstore so _get_vectorstore returns it
-    svc._vectorstores = {}
+    # Override _get_vectorstore to always return the mock
     svc._get_vectorstore = lambda kb_id: mock_vectorstore  # type: ignore[assignment]
 
     # Mock the ingestion orchestrator to return controlled chunks
@@ -119,6 +98,12 @@ class TestCreateAndGetKB:
         assert kb.source_count == 0
         assert kb.page_count == 0
 
+    def test_create_kb_creates_directory(self, service: KnowledgebaseService) -> None:
+        service.create_kb("Dir Check KB")
+        kb_dir = service._config.kb_data_dir("dir-check-kb")
+        assert kb_dir.is_dir()
+        assert (kb_dir / "knowledgebase.db").exists()
+
     def test_get_kb_returns_enriched_kb(self, service: KnowledgebaseService) -> None:
         created = service.create_kb("Get Test KB")
         fetched = service.get_kb(created.id)
@@ -129,14 +114,17 @@ class TestCreateAndGetKB:
         assert fetched.source_count == 0
         assert fetched.page_count == 0
 
-    def test_get_kb_returns_none_for_missing(
-        self, service: KnowledgebaseService
-    ) -> None:
+    def test_get_kb_returns_none_for_missing(self, service: KnowledgebaseService) -> None:
         assert service.get_kb("nonexistent-id") is None
 
     def test_create_kb_with_defaults(self, service: KnowledgebaseService) -> None:
         kb = service.create_kb("Minimal KB")
         assert kb.description == ""
+
+    def test_create_kb_duplicate_dir_name_raises(self, service: KnowledgebaseService) -> None:
+        service.create_kb("My KB")
+        with pytest.raises(ValueError, match="already exists"):
+            service.create_kb("My KB")
 
 
 # ---------------------------------------------------------------------------
@@ -188,13 +176,16 @@ class TestDeleteKB:
 
         # Verify cascade
         assert service.get_kb(kb.id) is None
-        assert service.list_sources(kb.id) == []
-        assert service.list_pages(kb.id) == []
-        assert service.get_pipeline_status(kb.id) == []
 
-    def test_delete_nonexistent_kb_does_not_raise(
-        self, service: KnowledgebaseService
-    ) -> None:
+    def test_delete_kb_removes_directory(self, service: KnowledgebaseService) -> None:
+        kb = service.create_kb("Dir Delete KB")
+        kb_dir = service._config.kb_data_dir("dir-delete-kb")
+        assert kb_dir.is_dir()
+
+        service.delete_kb(kb.id)
+        assert not kb_dir.exists()
+
+    def test_delete_nonexistent_kb_does_not_raise(self, service: KnowledgebaseService) -> None:
         """Deleting a missing KB is a no-op (idempotent)."""
         service.delete_kb("does-not-exist")  # should not raise
 
@@ -234,24 +225,18 @@ class TestIngestSource:
         assert len(summary_pages) == 1
         assert "Source: /tmp/test.txt" in summary_pages[0].title
 
-    def test_ingest_creates_pipeline_runs(
-        self, service: KnowledgebaseService
-    ) -> None:
+    def test_ingest_creates_pipeline_runs(self, service: KnowledgebaseService) -> None:
         kb = service.create_kb("Pipeline KB")
         service.ingest_source(kb.id, SourceType.file, "/tmp/test.txt")
 
         runs = service.get_pipeline_status(kb.id)
         assert len(runs) >= 1
 
-    def test_ingest_nonexistent_kb_raises(
-        self, service: KnowledgebaseService
-    ) -> None:
+    def test_ingest_nonexistent_kb_raises(self, service: KnowledgebaseService) -> None:
         with pytest.raises(ValueError, match="not found"):
             service.ingest_source("no-such-kb", SourceType.file, "/tmp/f.txt")
 
-    def test_ingest_with_metadata(
-        self, service: KnowledgebaseService
-    ) -> None:
+    def test_ingest_with_metadata(self, service: KnowledgebaseService) -> None:
         kb = service.create_kb("Meta KB")
         source = service.ingest_source(
             kb.id,
@@ -261,9 +246,7 @@ class TestIngestSource:
         )
         assert source.metadata == {"author": "test"}
 
-    def test_ingest_failure_marks_source_failed(
-        self, service: KnowledgebaseService
-    ) -> None:
+    def test_ingest_failure_marks_source_failed(self, service: KnowledgebaseService) -> None:
         """If ingestion raises, the source should be marked as failed."""
         kb = service.create_kb("Fail KB")
 
@@ -316,9 +299,7 @@ class TestRemoveSource:
         # Vectorstore.delete should have been called with chunk IDs
         mock_vectorstore.delete.assert_called_once()
 
-    def test_remove_nonexistent_source_raises(
-        self, service: KnowledgebaseService
-    ) -> None:
+    def test_remove_nonexistent_source_raises(self, service: KnowledgebaseService) -> None:
         with pytest.raises(ValueError, match="not found"):
             service.remove_source("no-such-source")
 
@@ -343,9 +324,7 @@ class TestQuery:
         mock_embedder.embed_query.assert_called_with("test question")
         assert isinstance(results, list)
 
-    def test_search_delegates(
-        self, service: KnowledgebaseService
-    ) -> None:
+    def test_search_delegates(self, service: KnowledgebaseService) -> None:
         kb = service.create_kb("Search KB")
         results = service.search(kb.id, "test")
         assert isinstance(results, list)
@@ -397,8 +376,6 @@ class TestWikiOperations:
         service.ingest_source(kb.id, SourceType.file, "/tmp/a.txt")
 
         sources = service.list_sources(kb.id)
-        # There are 2 source records: original + re-created during ingest flow
-        # Actually, ingest_source creates exactly one source for the KB
         assert len(sources) >= 1
         assert sources[0].kb_id == kb.id
 
@@ -428,9 +405,7 @@ class TestLint:
         assert isinstance(report.issues, list)
         assert report.checked_at is not None
 
-    def test_lint_fix_returns_fixed_issues(
-        self, service: KnowledgebaseService
-    ) -> None:
+    def test_lint_fix_returns_fixed_issues(self, service: KnowledgebaseService) -> None:
         kb = service.create_kb("Lint Fix KB")
         fixed = service.lint_fix(kb.id)
 
@@ -443,9 +418,7 @@ class TestLint:
 
 
 class TestRebuildIndex:
-    def test_rebuild_creates_index_page(
-        self, service: KnowledgebaseService
-    ) -> None:
+    def test_rebuild_creates_index_page(self, service: KnowledgebaseService) -> None:
         kb = service.create_kb("Index KB")
         service.ingest_source(kb.id, SourceType.file, "/tmp/test.txt")
 
@@ -461,9 +434,7 @@ class TestRebuildIndex:
 
 
 class TestExport:
-    def test_export_creates_files(
-        self, service: KnowledgebaseService, tmp_path: Path
-    ) -> None:
+    def test_export_creates_files(self, service: KnowledgebaseService, tmp_path: Path) -> None:
         kb = service.create_kb("Export KB")
         service.ingest_source(kb.id, SourceType.file, "/tmp/test.txt")
 
@@ -474,9 +445,7 @@ class TestExport:
         assert all(p.exists() for p in paths)
         assert all(p.suffix == ".md" for p in paths)
 
-    def test_export_empty_kb(
-        self, service: KnowledgebaseService, tmp_path: Path
-    ) -> None:
+    def test_export_empty_kb(self, service: KnowledgebaseService, tmp_path: Path) -> None:
         kb = service.create_kb("Empty Export KB")
         output_dir = tmp_path / "empty_export"
         paths = service.export(kb.id, output_dir)
@@ -508,9 +477,7 @@ class TestPipelineStatus:
 
 
 class TestEnrichKB:
-    def test_counts_reflect_ingested_data(
-        self, service: KnowledgebaseService
-    ) -> None:
+    def test_counts_reflect_ingested_data(self, service: KnowledgebaseService) -> None:
         kb = service.create_kb("Enrich KB")
         service.ingest_source(kb.id, SourceType.file, "/tmp/a.txt")
 
@@ -519,11 +486,45 @@ class TestEnrichKB:
         assert enriched.source_count >= 1
         assert enriched.page_count >= 1
 
-    def test_counts_zero_for_empty_kb(
-        self, service: KnowledgebaseService
-    ) -> None:
+    def test_counts_zero_for_empty_kb(self, service: KnowledgebaseService) -> None:
         kb = service.create_kb("Empty Enrich KB")
         enriched = service.get_kb(kb.id)
         assert enriched is not None
         assert enriched.source_count == 0
         assert enriched.page_count == 0
+
+
+# ---------------------------------------------------------------------------
+# 13. Per-KB directory isolation
+# ---------------------------------------------------------------------------
+
+
+class TestPerKBIsolation:
+    def test_two_kbs_have_separate_directories(self, service: KnowledgebaseService) -> None:
+        service.create_kb("Alpha KB")
+        service.create_kb("Beta KB")
+
+        dir1 = service._config.kb_data_dir("alpha-kb")
+        dir2 = service._config.kb_data_dir("beta-kb")
+
+        assert dir1.is_dir()
+        assert dir2.is_dir()
+        assert dir1 != dir2
+
+    def test_deleting_one_kb_preserves_others(self, service: KnowledgebaseService) -> None:
+        kb1 = service.create_kb("Keep KB")
+        kb2 = service.create_kb("Remove KB")
+        service.ingest_source(kb1.id, SourceType.file, "/tmp/a.txt")
+
+        service.delete_kb(kb2.id)
+
+        # kb1 should still be fully intact
+        assert service.get_kb(kb1.id) is not None
+        assert len(service.list_sources(kb1.id)) >= 1
+
+    def test_index_file_persisted(self, service: KnowledgebaseService) -> None:
+        kb = service.create_kb("Index File KB")
+        index_path = service._base_dir / ".index.json"
+        assert index_path.exists()
+        data = json.loads(index_path.read_text())
+        assert kb.id in data

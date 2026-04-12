@@ -263,9 +263,7 @@ class PineconeStore:
             if vec is not None:
                 metadata = dict(vec.get("metadata", {}))
                 document = metadata.pop(_PINECONE_DOCUMENT_KEY, "")
-                stored.append(
-                    StoredDocument(id=doc_id, document=document, metadata=metadata)
-                )
+                stored.append(StoredDocument(id=doc_id, document=document, metadata=metadata))
         return stored
 
     def count(self) -> int:
@@ -280,16 +278,31 @@ class PineconeStore:
 # ---------------------------------------------------------------------------
 
 
-def create_vectorstore(config: Settings, collection_name: str) -> VectorStore:
+def create_vectorstore(
+    config: Settings,
+    collection_name: str,
+    chroma_path: Path | None = None,
+) -> VectorStore:
     """Instantiate the appropriate :class:`VectorStore` based on *config*.
 
+    Parameters
+    ----------
+    config:
+        Application settings (vectorstore backend selection + Pinecone creds).
+    collection_name:
+        Name of the vector collection (typically the KB UUID).
+    chroma_path:
+        Filesystem path for ChromaDB persistence.  Required when the
+        ``chromadb`` backend is selected.
+
     Raises:
-        ValueError: If the Pinecone provider is selected but required config is missing.
+        ValueError: If required configuration is missing for the chosen backend.
     """
     if config.vectorstore == "chromadb":
-        resolved = config.resolve_paths()
+        if chroma_path is None:
+            raise ValueError("chroma_path is required for the chromadb backend")
         return ChromaDBStore(
-            persist_path=resolved.chroma_path,
+            persist_path=chroma_path,
             collection_name=collection_name,
         )
     elif config.vectorstore == "pinecone":

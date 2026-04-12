@@ -558,7 +558,7 @@ class TestIngestionOrchestrator:
         f = tmp_path / "test.txt"
         f.write_text("Hello orchestrator!", encoding="utf-8")
 
-        settings = Settings()
+        settings = Settings(saves_dir=tmp_path)
         orchestrator = IngestionOrchestrator(settings)
         chunks = orchestrator.ingest(SourceType.file, str(f))
         assert len(chunks) >= 1
@@ -568,7 +568,7 @@ class TestIngestionOrchestrator:
         (tmp_path / "a.txt").write_text("aaa", encoding="utf-8")
         (tmp_path / "b.txt").write_text("bbb", encoding="utf-8")
 
-        settings = Settings()
+        settings = Settings(saves_dir=tmp_path)
         orchestrator = IngestionOrchestrator(settings)
         chunks = orchestrator.ingest(SourceType.directory, str(tmp_path))
         assert len(chunks) >= 2
@@ -577,14 +577,14 @@ class TestIngestionOrchestrator:
         f = tmp_path / "big.txt"
         f.write_text("word " * 500, encoding="utf-8")
 
-        settings = Settings()
+        settings = Settings(saves_dir=tmp_path)
         orchestrator = IngestionOrchestrator(settings)
         custom = ChunkConfig(chunk_size=50, chunk_overlap=5)
         chunks = orchestrator.ingest(SourceType.file, str(f), chunk_config=custom)
         assert len(chunks) > 1
 
-    def test_unknown_source_type(self):
-        settings = Settings()
+    def test_unknown_source_type(self, tmp_path: Path):
+        settings = Settings(saves_dir=tmp_path)
         orchestrator = IngestionOrchestrator(settings)
         # Create a fake source type value to trigger the error.
         with pytest.raises(ValueError, match="No ingestor registered"):
@@ -594,7 +594,7 @@ class TestIngestionOrchestrator:
         f = tmp_path / "test.txt"
         f.write_text("short", encoding="utf-8")
 
-        settings = Settings(chunk_size=512, chunk_overlap=64)
+        settings = Settings(saves_dir=tmp_path, chunk_size=512, chunk_overlap=64)
         orchestrator = IngestionOrchestrator(settings)
         chunks = orchestrator.ingest(SourceType.file, str(f))
         assert len(chunks) == 1
