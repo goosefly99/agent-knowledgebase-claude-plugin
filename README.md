@@ -56,7 +56,12 @@ These must always come from the environment. Setting them in a JSON config file 
     }
   },
   "ingest": {
-    "excluded_dirs": ["__pycache__", "node_modules", ".git", ".venv", ".mypy_cache", ".pytest_cache", "dist", "build"]
+    "excluded_dirs": [
+      "__pycache__", "node_modules", ".git", ".venv",
+      ".mypy_cache", ".pytest_cache", "dist", "build",
+      "venv", ".tox", ".ruff_cache", ".eggs",
+      ".idea", ".vscode", ".hg", ".svn"
+    ]
   }
 }
 ```
