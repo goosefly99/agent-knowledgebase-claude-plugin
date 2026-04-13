@@ -934,3 +934,69 @@ class TestKbConfigValidate:
         assert result["user"]["status"] == "error"
         assert "json" in result["user"]["error"].lower() or "parse" in result["user"]["error"].lower()
         assert "merged" not in result
+
+    def test_project_error_suppresses_merged(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Even one 'error' status must suppress the merged block."""
+        from agent_knowledgebase import server as srv
+        saves = tmp_path / "saves"
+        saves.mkdir()
+        user_cfg = tmp_path / "user.json"
+        user_cfg.write_text("{}")
+        bad_proj = tmp_path / "proj.json"
+        bad_proj.write_text("{invalid")
+        monkeypatch.setenv("AGENT_KB_SAVES_DIR", str(saves))
+        monkeypatch.setenv("AGENT_KB_USER_CONFIG", str(user_cfg))
+        monkeypatch.setenv("AGENT_KB_PROJECT_CONFIG", str(bad_proj))
+        result = json.loads(srv.kb_config_validate())
+        assert result["user"]["status"] == "ok"
+        assert result["project"]["status"] == "error"
+        assert "merged" not in result
+
+    def test_merged_error_on_cross_field_violation(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Per-file shape is valid, but cross-field validation fails at merge."""
+        from agent_knowledgebase import server as srv
+        saves = tmp_path / "saves"
+        saves.mkdir()
+        # overlap (300) >= size (256) — fails _validate_chunk_overlap on merge
+        user_cfg = tmp_path / "user.json"
+        user_cfg.write_text(json.dumps({"chunk": {"size": 256, "overlap": 300}}))
+        monkeypatch.setenv("AGENT_KB_SAVES_DIR", str(saves))
+        monkeypatch.setenv("AGENT_KB_USER_CONFIG", str(user_cfg))
+        monkeypatch.setenv("AGENT_KB_PROJECT_CONFIG", str(tmp_path / "none.json"))
+        result = json.loads(srv.kb_config_validate())
+        # Per-file shape is valid so both statuses are 'ok'/'missing'
+        assert result["user"]["status"] == "ok"
+        assert result["project"]["status"] == "missing"
+        # Merged tried, failed — merged_error present, merged absent
+        assert "merged_error" in result
+        assert "chunk_overlap" in result["merged_error"]
+        assert "merged" not in result
+
+    def test_merged_structure_has_values_and_provenance(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """When both files are ok/missing, merged includes values and provenance."""
+        from agent_knowledgebase import server as srv
+        saves = tmp_path / "saves"
+        saves.mkdir()
+        user_cfg = tmp_path / "user.json"
+        user_cfg.write_text(json.dumps({"embedding": {"model": "my-model"}}))
+        monkeypatch.setenv("AGENT_KB_SAVES_DIR", str(saves))
+        monkeypatch.setenv("AGENT_KB_USER_CONFIG", str(user_cfg))
+        monkeypatch.setenv("AGENT_KB_PROJECT_CONFIG", str(tmp_path / "none.json"))
+        result = json.loads(srv.kb_config_validate())
+        merged = result["merged"]
+        # values is a nested dict keyed by the dotted parents
+        assert merged["values"]["embedding"]["model"] == "my-model"
+        # every DOT_TO_FLAT key must appear in provenance with a classification
+        prov = merged["provenance"]
+        assert prov["embedding.model"] == "user_json"
+        assert prov["vectorstore"] == "default"  # no override
+        # Provenance must cover every known dotted key
+        from agent_knowledgebase.config_files import DOT_TO_FLAT
+        for dotted_key in DOT_TO_FLAT:
+            assert dotted_key in prov, f"missing provenance for {dotted_key}"
