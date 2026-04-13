@@ -389,7 +389,7 @@ class TestKbQuery:
     def test_default_top_k(self, mock_service):
         mock_service.query.return_value = []
         kb_query("kb-1", "test")
-        mock_service.query.assert_called_once_with("kb-1", "test", 10)
+        mock_service.query.assert_called_once_with("kb-1", "test", None)
 
 
 class TestKbSearch:

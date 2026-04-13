@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 import tiktoken
 
 from agent_knowledgebase.models import Chunk, SourceType
+
+if TYPE_CHECKING:
+    from agent_knowledgebase.config import Settings
 
 
 # ---------------------------------------------------------------------------
@@ -29,26 +32,35 @@ class ChunkConfig:
 
     chunk_size: int = 512  # tokens
     chunk_overlap: int = 64  # tokens
+    token_encoding: str = "cl100k_base"
+
+    @classmethod
+    def from_settings(cls, settings: "Settings") -> "ChunkConfig":
+        """Construct a ChunkConfig from a Settings instance."""
+        return cls(
+            chunk_size=settings.chunk_size,
+            chunk_overlap=settings.chunk_overlap,
+            token_encoding=settings.chunk_token_encoding,
+        )
 
 
 # ---------------------------------------------------------------------------
 # Token-based chunking helper
 # ---------------------------------------------------------------------------
 
-_ENCODING = tiktoken.get_encoding("cl100k_base")
-
 
 def token_chunk(contents: list[RawContent], config: ChunkConfig) -> list[Chunk]:
     """Split *contents* into overlapping token-window :class:`Chunk` objects.
 
-    Uses the ``cl100k_base`` tiktoken encoding to measure token counts.
+    Uses the tiktoken encoding specified in *config* to measure token counts.
     Each chunk inherits the metadata of the :class:`RawContent` it was
     derived from.
     """
+    encoding = tiktoken.get_encoding(config.token_encoding)
     chunks: list[Chunk] = []
     for raw in contents:
         text = raw.text
-        tokens = _ENCODING.encode(text)
+        tokens = encoding.encode(text)
         if len(tokens) == 0:
             continue
 
@@ -56,7 +68,7 @@ def token_chunk(contents: list[RawContent], config: ChunkConfig) -> list[Chunk]:
         while start < len(tokens):
             end = start + config.chunk_size
             window = tokens[start:end]
-            chunk_text = _ENCODING.decode(window)
+            chunk_text = encoding.decode(window)
             chunks.append(
                 Chunk(
                     source_id="",

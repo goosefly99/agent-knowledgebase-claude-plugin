@@ -31,7 +31,12 @@ from agent_knowledgebase.services.export import MarkdownExporter
 from agent_knowledgebase.services.ingestion import IngestionOrchestrator
 from agent_knowledgebase.services.lint import LintIssue, LintReport, WikiLinter
 from agent_knowledgebase.services.pipeline import PipelineManager
-from agent_knowledgebase.services.query import QueryOrchestrator, SearchResult
+from agent_knowledgebase.services.query import (
+    QueryOrchestrator,
+    SearchResult,
+    default_top_k,
+    hybrid_weights_from,
+)
 from agent_knowledgebase.services.vectorstore import VectorStore, create_vectorstore
 from agent_knowledgebase.services.wiki import WikiManager
 
@@ -364,26 +369,40 @@ class KnowledgebaseService:
     # Query (No Pipeline Required)
     # ------------------------------------------------------------------
 
-    def query(self, kb_id: str, text: str, top_k: int = 10) -> list[SearchResult]:
+    def query(self, kb_id: str, text: str, top_k: int | None = None) -> list[SearchResult]:
         """Semantic query across a KB."""
+        if top_k is None:
+            top_k = default_top_k(self._config)
         ctx = self._ctx(kb_id)
         vs = self._get_vectorstore(kb_id)
         orchestrator = QueryOrchestrator(vs, self._embedder, ctx.wiki)
         return orchestrator.query(text, kb_id, top_k=top_k)
 
-    def search(self, kb_id: str, text: str, top_k: int = 10) -> list[SearchResult]:
+    def search(self, kb_id: str, text: str, top_k: int | None = None) -> list[SearchResult]:
         """Keyword search across a KB."""
+        if top_k is None:
+            top_k = default_top_k(self._config)
         ctx = self._ctx(kb_id)
         vs = self._get_vectorstore(kb_id)
         orchestrator = QueryOrchestrator(vs, self._embedder, ctx.wiki)
         return orchestrator.search(text, kb_id, top_k=top_k)
 
-    def hybrid_query(self, kb_id: str, text: str, top_k: int = 10) -> list[SearchResult]:
+    def hybrid_query(self, kb_id: str, text: str, top_k: int | None = None) -> list[SearchResult]:
         """Combined semantic + keyword search."""
+        if top_k is None:
+            top_k = default_top_k(self._config)
+        vector_weight, fts_weight, fetch_mult = hybrid_weights_from(self._config)
         ctx = self._ctx(kb_id)
         vs = self._get_vectorstore(kb_id)
         orchestrator = QueryOrchestrator(vs, self._embedder, ctx.wiki)
-        return orchestrator.hybrid_query(text, kb_id, top_k=top_k)
+        return orchestrator.hybrid_query(
+            text,
+            kb_id,
+            top_k=top_k,
+            vector_weight=vector_weight,
+            fts_weight=fts_weight,
+            fetch_multiplier=fetch_mult,
+        )
 
     # ------------------------------------------------------------------
     # Wiki Operations

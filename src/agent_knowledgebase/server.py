@@ -260,13 +260,13 @@ def kb_info(kb_id: str) -> str:
 
 
 @mcp.tool()
-def kb_query(kb_id: str, text: str, top_k: int = 10) -> str:
+def kb_query(kb_id: str, text: str, top_k: int | None = None) -> str:
     """Semantic (vector similarity) query across a knowledgebase.
 
     Parameters:
         kb_id: ID of the knowledgebase to search.
         text: The query text.
-        top_k: Maximum number of results to return.
+        top_k: Maximum number of results to return; defaults to ``query_default_top_k`` if omitted.
 
     Returns a JSON array of search results.
     """
@@ -276,13 +276,13 @@ def kb_query(kb_id: str, text: str, top_k: int = 10) -> str:
 
 
 @mcp.tool()
-def kb_search(kb_id: str, text: str, top_k: int = 10) -> str:
+def kb_search(kb_id: str, text: str, top_k: int | None = None) -> str:
     """Keyword search across a knowledgebase.
 
     Parameters:
         kb_id: ID of the knowledgebase to search.
         text: The search text.
-        top_k: Maximum number of results to return.
+        top_k: Maximum number of results to return; defaults to ``query_default_top_k`` if omitted.
 
     Returns a JSON array of search results.
     """

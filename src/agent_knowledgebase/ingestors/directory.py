@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import fnmatch
+from typing import TYPE_CHECKING
 from pathlib import Path
 
 from agent_knowledgebase.ingestors import ChunkConfig, Chunk, RawContent, token_chunk
 from agent_knowledgebase.ingestors.file import FileIngestor
+
+if TYPE_CHECKING:
+    from agent_knowledgebase.config import Settings
 
 # Directories that are always excluded from traversal.
 _ALWAYS_EXCLUDE_DIRS: set[str] = {
@@ -29,6 +33,11 @@ _ALWAYS_EXCLUDE_DIRS: set[str] = {
 }
 
 
+def excluded_dirs_for(settings: "Settings") -> set[str]:
+    """Return the set of directory names to exclude, derived from settings."""
+    return set(settings.ingest_excluded_dirs)
+
+
 class DirectoryIngestor:
     """Recursively ingest all files in a directory tree.
 
@@ -37,8 +46,9 @@ class DirectoryIngestor:
     * Skips common non-source directories (``__pycache__``, ``node_modules``, etc.).
     """
 
-    def __init__(self) -> None:
+    def __init__(self, excluded_dirs: set[str] | None = None) -> None:
         self._file_ingestor = FileIngestor()
+        self._excluded_dirs = excluded_dirs if excluded_dirs is not None else _ALWAYS_EXCLUDE_DIRS
 
     # ------------------------------------------------------------------
     # Ingestor interface
@@ -53,7 +63,7 @@ class DirectoryIngestor:
         ignore_patterns = self._load_gitignore(root)
         results: list[RawContent] = []
 
-        for file_path in self._walk(root, root, ignore_patterns):
+        for file_path in self._walk_tree(root, root, ignore_patterns):
             contents = self._file_ingestor.read(str(file_path), metadata)
             results.extend(contents)
 
@@ -97,9 +107,8 @@ class DirectoryIngestor:
                 return True
         return False
 
-    @classmethod
-    def _walk(
-        cls,
+    def _walk_tree(
+        self,
         current: Path,
         root: Path,
         ignore_patterns: list[str],
@@ -120,13 +129,13 @@ class DirectoryIngestor:
             rel = entry.relative_to(root).as_posix()
 
             if entry.is_dir():
-                if name in _ALWAYS_EXCLUDE_DIRS:
+                if name in self._excluded_dirs:
                     continue
-                if cls._is_ignored(rel, ignore_patterns):
+                if self._is_ignored(rel, ignore_patterns):
                     continue
-                files.extend(cls._walk(entry, root, ignore_patterns))
+                files.extend(self._walk_tree(entry, root, ignore_patterns))
             elif entry.is_file():
-                if cls._is_ignored(rel, ignore_patterns):
+                if self._is_ignored(rel, ignore_patterns):
                     continue
                 files.append(entry)
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from agent_knowledgebase.config import Settings
 from agent_knowledgebase.ingestors import INGESTOR_REGISTRY, ChunkConfig
+from agent_knowledgebase.ingestors.directory import DirectoryIngestor, excluded_dirs_for
 from agent_knowledgebase.models import Chunk, SourceType
 
 
@@ -31,12 +32,12 @@ class IngestionOrchestrator:
         if ingestor_cls is None:
             raise ValueError(f"No ingestor registered for source type: {source_type}")
 
-        ingestor = ingestor_cls()
+        if ingestor_cls is DirectoryIngestor:
+            ingestor = DirectoryIngestor(excluded_dirs=excluded_dirs_for(self._config))
+        else:
+            ingestor = ingestor_cls()
         contents = ingestor.read(uri, metadata)
 
-        effective_config = chunk_config or ChunkConfig(
-            chunk_size=self._config.chunk_size,
-            chunk_overlap=self._config.chunk_overlap,
-        )
+        effective_config = chunk_config or ChunkConfig.from_settings(self._config)
 
         return ingestor.chunk(contents, effective_config)

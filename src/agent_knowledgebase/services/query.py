@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from agent_knowledgebase.models import WikiPage
 from agent_knowledgebase.services.embeddings import Embedder
 from agent_knowledgebase.services.vectorstore import QueryResult, VectorStore
 from agent_knowledgebase.services.wiki import WikiManager
+
+if TYPE_CHECKING:
+    from agent_knowledgebase.config import Settings
 
 
 # ---------------------------------------------------------------------------
@@ -49,6 +53,25 @@ def _normalize_scores(results: list[SearchResult]) -> list[SearchResult]:
         result.score = (result.score - min_score) / span if span > 0 else 1.0
 
     return results
+
+
+# ---------------------------------------------------------------------------
+# Settings-derived helpers
+# ---------------------------------------------------------------------------
+
+
+def hybrid_weights_from(settings: "Settings") -> tuple[float, float, int]:
+    """Return ``(vector_weight, fts_weight, fetch_multiplier)`` from settings."""
+    return (
+        settings.query_hybrid_vector_weight,
+        settings.query_hybrid_fts_weight,
+        settings.query_hybrid_fetch_multiplier,
+    )
+
+
+def default_top_k(settings: "Settings") -> int:
+    """Return the default top-k value from settings."""
+    return settings.query_default_top_k
 
 
 # ---------------------------------------------------------------------------
@@ -150,6 +173,7 @@ class QueryOrchestrator:
         top_k: int = 10,
         vector_weight: float = 0.7,
         fts_weight: float = 0.3,
+        fetch_multiplier: int = 2,
     ) -> list[SearchResult]:
         """Combined semantic + keyword search.
 
@@ -160,7 +184,7 @@ class QueryOrchestrator:
         5. Return *top_k* results sorted by combined score (descending).
         """
         # Over-fetch to get better merge candidates.
-        fetch_k = top_k * 2
+        fetch_k = top_k * fetch_multiplier
 
         vector_results = self.query(text, kb_id, top_k=fetch_k)
         fts_results = self.search(text, kb_id, top_k=fetch_k)
