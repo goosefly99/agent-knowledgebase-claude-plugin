@@ -645,3 +645,59 @@ class TestKbConfigPath:
         result = json.loads(srv.kb_config_path())
         assert result["user"]["resolved_via"] == "default"
         assert result["project"]["resolved_via"] == "default"
+
+
+class TestKbConfigShow:
+    def _env(self, monkeypatch, tmp_path, *, user_payload=None, project_payload=None):
+        saves = tmp_path / "saves"
+        saves.mkdir()
+        user_cfg = tmp_path / "user.json"
+        proj_cfg = tmp_path / "proj.json"
+        user_cfg.write_text(json.dumps(user_payload) if user_payload is not None else "{}")
+        proj_cfg.write_text(json.dumps(project_payload) if project_payload is not None else "{}")
+        monkeypatch.setenv("AGENT_KB_SAVES_DIR", str(saves))
+        monkeypatch.setenv("AGENT_KB_USER_CONFIG", str(user_cfg))
+        monkeypatch.setenv("AGENT_KB_PROJECT_CONFIG", str(proj_cfg))
+
+    def test_show_merged(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from agent_knowledgebase import server as srv
+        self._env(
+            monkeypatch, tmp_path,
+            user_payload={"embedding": {"model": "from-user"}},
+            project_payload={"chunk": {"size": 256}},
+        )
+        result = json.loads(srv.kb_config_show("merged"))
+        assert result["values"]["embedding"]["model"] == "from-user"
+        assert result["values"]["chunk"]["size"] == 256
+        assert result["provenance"]["embedding.model"] == "user_json"
+        assert result["provenance"]["chunk.size"] == "project_json"
+        # A value no one set comes from default
+        assert result["provenance"]["embedding.provider"] == "default"
+
+    def test_show_user_only(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from agent_knowledgebase import server as srv
+        self._env(monkeypatch, tmp_path, user_payload={"embedding": {"model": "user-only"}})
+        result = json.loads(srv.kb_config_show("user"))
+        assert result == {"embedding": {"model": "user-only"}}
+
+    def test_show_env_only(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from agent_knowledgebase import server as srv
+        self._env(monkeypatch, tmp_path)
+        monkeypatch.setenv("AGENT_KB_CHUNK_SIZE", "777")
+        result = json.loads(srv.kb_config_show("env"))
+        # `chunk_size` is in env; others absent → not returned in env scope
+        assert result["chunk"]["size"] == 777
+
+    def test_show_invalid_scope(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from agent_knowledgebase import server as srv
+        self._env(monkeypatch, tmp_path)
+        with pytest.raises(ValueError, match="scope"):
+            srv.kb_config_show("bogus")

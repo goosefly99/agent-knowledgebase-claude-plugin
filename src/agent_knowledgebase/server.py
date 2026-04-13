@@ -388,6 +388,62 @@ def _resolved_via(env_name: str) -> str:
     return "env_override" if os.environ.get(env_name) else "default"
 
 
+def _unflatten(flat: dict[str, object]) -> dict[str, object]:
+    """Inverse of _flatten_dotted — restore a nested dict from dotted keys."""
+    from agent_knowledgebase.config_files import DOT_TO_FLAT
+
+    flat_to_dot = {v: k for k, v in DOT_TO_FLAT.items()}
+    out: dict[str, object] = {}
+    for flat_name, value in flat.items():
+        dotted = flat_to_dot.get(flat_name, flat_name)
+        segments = dotted.split(".")
+        cursor = out
+        for segment in segments[:-1]:
+            cursor = cursor.setdefault(segment, {})  # type: ignore[assignment]
+        cursor[segments[-1]] = value
+    return out
+
+
+def _provenance() -> dict[str, str]:
+    """Determine which layer won for each configurable field.
+
+    Returns a dict keyed by dotted path → one of
+    ``"env"``, ``"project_json"``, ``"user_json"``, ``"default"``.
+    """
+    from agent_knowledgebase.config_files import (
+        DOT_TO_FLAT,
+        NestedJsonConfigSettingsSource,
+        resolve_project_config_path,
+        resolve_user_config_path,
+    )
+    from agent_knowledgebase.config import Settings
+
+    env_prefix = "AGENT_KB_"
+    env_keys_present = {
+        name[len(env_prefix):].lower()
+        for name in os.environ
+        if name.startswith(env_prefix)
+    }
+    user_dict = NestedJsonConfigSettingsSource(
+        Settings, path=resolve_user_config_path()
+    )()
+    project_dict = NestedJsonConfigSettingsSource(
+        Settings, path=resolve_project_config_path()
+    )()
+
+    result: dict[str, str] = {}
+    for dotted, flat_name in DOT_TO_FLAT.items():
+        if flat_name in env_keys_present:
+            result[dotted] = "env"
+        elif flat_name in project_dict:
+            result[dotted] = "project_json"
+        elif flat_name in user_dict:
+            result[dotted] = "user_json"
+        else:
+            result[dotted] = "default"
+    return result
+
+
 @mcp.tool()
 def kb_config_path() -> str:
     """Return the on-disk paths used for user- and project-level config.
@@ -411,6 +467,78 @@ def kb_config_path() -> str:
         },
     }
     return json.dumps(payload)
+
+
+@mcp.tool()
+def kb_config_show(scope: str = "merged") -> str:
+    """Return configured values.
+
+    Parameters:
+        scope: One of "merged", "user", "project", "env", "defaults".
+
+    ``merged`` also returns a ``provenance`` map naming which layer won for
+    each key.
+    """
+    from agent_knowledgebase.config_files import (
+        DOT_TO_FLAT,
+        NestedJsonConfigSettingsSource,
+        load_settings,
+        resolve_project_config_path,
+        resolve_user_config_path,
+    )
+    from agent_knowledgebase.config import Settings
+
+    valid = {"merged", "user", "project", "env", "defaults"}
+    if scope not in valid:
+        raise ValueError(f"scope must be one of {sorted(valid)}, got {scope!r}")
+
+    if scope == "merged":
+        cfg = load_settings()
+        values = {flat_name: getattr(cfg, flat_name) for flat_name in DOT_TO_FLAT.values()}
+        return json.dumps({
+            "values": _unflatten(values),
+            "provenance": _provenance(),
+        }, default=str)
+
+    if scope == "user":
+        return json.dumps(
+            _unflatten(NestedJsonConfigSettingsSource(Settings, path=resolve_user_config_path())()),
+            default=str,
+        )
+    if scope == "project":
+        return json.dumps(
+            _unflatten(NestedJsonConfigSettingsSource(Settings, path=resolve_project_config_path())()),
+            default=str,
+        )
+    if scope == "env":
+        from pydantic import TypeAdapter
+
+        env_prefix = "AGENT_KB_"
+        env_map: dict[str, object] = {}
+        for flat_name in DOT_TO_FLAT.values():
+            env_key = env_prefix + flat_name.upper()
+            if env_key in os.environ:
+                raw = os.environ[env_key]
+                field = Settings.model_fields.get(flat_name)
+                if field is not None and field.annotation is not None:
+                    try:
+                        env_map[flat_name] = TypeAdapter(field.annotation).validate_python(raw)
+                    except Exception:
+                        env_map[flat_name] = raw
+                else:
+                    env_map[flat_name] = raw
+        return json.dumps(_unflatten(env_map), default=str)
+    # scope == "defaults"
+    defaults_flat: dict[str, object] = {}
+    for flat_name in DOT_TO_FLAT.values():
+        field = Settings.model_fields.get(flat_name)
+        if field is None:
+            continue
+        default = field.default
+        if field.default_factory is not None:
+            default = field.default_factory()
+        defaults_flat[flat_name] = default
+    return json.dumps(_unflatten(defaults_flat), default=str)
 
 
 # ---------------------------------------------------------------------------
