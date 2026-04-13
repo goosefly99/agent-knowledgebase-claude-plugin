@@ -169,3 +169,73 @@ class TestNestedJsonConfigSettingsSourceLoad:
         f.write_text(json.dumps(forbidden_container))
         with pytest.raises(ValueError, match=forbidden_key):
             _load(f)
+
+
+class TestLayeringPrecedence:
+    """default < user JSON < project JSON < env."""
+
+    def _write(self, path: Path, content: dict) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(content))
+
+    def test_default_only(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from agent_knowledgebase.config import Settings
+        saves = tmp_path / "saves"
+        saves.mkdir()
+        monkeypatch.setenv("AGENT_KB_SAVES_DIR", str(saves))
+        monkeypatch.setenv("AGENT_KB_USER_CONFIG", str(tmp_path / "no_user.json"))
+        monkeypatch.setenv("AGENT_KB_PROJECT_CONFIG", str(tmp_path / "no_proj.json"))
+        cfg = Settings()
+        assert cfg.embedding_model == "all-MiniLM-L6-v2"
+        assert cfg.chunk_size == 512
+
+    def test_user_file_overrides_default(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from agent_knowledgebase.config import Settings
+        saves = tmp_path / "saves"
+        saves.mkdir()
+        monkeypatch.setenv("AGENT_KB_SAVES_DIR", str(saves))
+        user_file = tmp_path / "user.json"
+        self._write(user_file, {"embedding": {"model": "from-user"}, "chunk": {"size": 128}})
+        monkeypatch.setenv("AGENT_KB_USER_CONFIG", str(user_file))
+        monkeypatch.setenv("AGENT_KB_PROJECT_CONFIG", str(tmp_path / "no_proj.json"))
+        cfg = Settings()
+        assert cfg.embedding_model == "from-user"
+        assert cfg.chunk_size == 128
+
+    def test_project_file_overrides_user(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from agent_knowledgebase.config import Settings
+        saves = tmp_path / "saves"
+        saves.mkdir()
+        monkeypatch.setenv("AGENT_KB_SAVES_DIR", str(saves))
+        user_file = tmp_path / "user.json"
+        proj_file = tmp_path / "proj.json"
+        self._write(user_file, {"embedding": {"model": "from-user"}, "chunk": {"size": 128}})
+        self._write(proj_file, {"embedding": {"model": "from-project"}})
+        monkeypatch.setenv("AGENT_KB_USER_CONFIG", str(user_file))
+        monkeypatch.setenv("AGENT_KB_PROJECT_CONFIG", str(proj_file))
+        cfg = Settings()
+        # project wins for embedding.model
+        assert cfg.embedding_model == "from-project"
+        # user still wins over default for chunk.size
+        assert cfg.chunk_size == 128
+
+    def test_env_overrides_project(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from agent_knowledgebase.config import Settings
+        saves = tmp_path / "saves"
+        saves.mkdir()
+        monkeypatch.setenv("AGENT_KB_SAVES_DIR", str(saves))
+        proj_file = tmp_path / "proj.json"
+        self._write(proj_file, {"embedding": {"model": "from-project"}})
+        monkeypatch.setenv("AGENT_KB_USER_CONFIG", str(tmp_path / "no_user.json"))
+        monkeypatch.setenv("AGENT_KB_PROJECT_CONFIG", str(proj_file))
+        monkeypatch.setenv("AGENT_KB_EMBEDDING_MODEL", "from-env")
+        cfg = Settings()
+        assert cfg.embedding_model == "from-env"

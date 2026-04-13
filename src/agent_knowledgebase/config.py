@@ -7,7 +7,13 @@ from pathlib import Path
 from typing import Literal, Optional
 
 from pydantic import Field, field_validator, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict
+
+from agent_knowledgebase.config_files import (
+    NestedJsonConfigSettingsSource,
+    resolve_project_config_path,
+    resolve_user_config_path,
+)
 
 
 def sanitize_kb_dir_name(name: str) -> str:
@@ -204,3 +210,29 @@ class Settings(BaseSettings):
     def kb_chroma_path(self, dir_name: str) -> Path:
         """ChromaDB persistence directory for a single knowledgebase."""
         return self.kb_data_dir(dir_name) / "chroma"
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
+        user_source = NestedJsonConfigSettingsSource(
+            settings_cls, path=resolve_user_config_path()
+        )
+        project_source = NestedJsonConfigSettingsSource(
+            settings_cls, path=resolve_project_config_path()
+        )
+        # Left-to-right is highest-to-lowest priority in pydantic-settings.
+        # Order yields: init > env > dotenv > project JSON > user JSON > defaults.
+        return (
+            init_settings,
+            env_settings,
+            dotenv_settings,
+            project_source,
+            user_source,
+            file_secret_settings,
+        )
