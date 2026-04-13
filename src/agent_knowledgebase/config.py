@@ -96,6 +96,18 @@ class Settings(BaseSettings):
             raise ValueError(msg)
         return self
 
+    @model_validator(mode="after")
+    def _validate_hybrid_weights(self) -> Settings:
+        total = self.query_hybrid_vector_weight + self.query_hybrid_fts_weight
+        if abs(total - 1.0) > 1e-6:
+            msg = (
+                f"query_hybrid_vector_weight ({self.query_hybrid_vector_weight}) + "
+                f"query_hybrid_fts_weight ({self.query_hybrid_fts_weight}) must sum to 1.0, "
+                f"got {total}"
+            )
+            raise ValueError(msg)
+        return self
+
     # --- Query ---
     query_default_top_k: int = Field(
         default=10,

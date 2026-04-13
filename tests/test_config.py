@@ -243,6 +243,35 @@ class TestChunkOverlapValidation:
             Settings(saves_dir=tmp_path, chunk_overlap=512, chunk_size=512)
 
 
+class TestHybridWeightValidation:
+    """query_hybrid_vector_weight + query_hybrid_fts_weight must sum to 1.0 ±1e-6."""
+
+    def test_weights_summing_to_one_pass(self, tmp_path: Path) -> None:
+        cfg = Settings(
+            saves_dir=tmp_path,
+            query_hybrid_vector_weight=0.6,
+            query_hybrid_fts_weight=0.4,
+        )
+        assert cfg.query_hybrid_vector_weight == 0.6
+        assert cfg.query_hybrid_fts_weight == 0.4
+
+    def test_weights_not_summing_to_one_raises(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match="query_hybrid"):
+            Settings(
+                saves_dir=tmp_path,
+                query_hybrid_vector_weight=0.8,
+                query_hybrid_fts_weight=0.3,
+            )
+
+    def test_weights_within_epsilon_pass(self, tmp_path: Path) -> None:
+        # Floating-point safe: 0.7 + 0.3 is sometimes 0.9999999...
+        Settings(
+            saves_dir=tmp_path,
+            query_hybrid_vector_weight=0.7,
+            query_hybrid_fts_weight=0.3,
+        )
+
+
 class TestFixtures:
     """Verify the shared fixtures from conftest work."""
 
