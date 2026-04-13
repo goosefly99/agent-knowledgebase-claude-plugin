@@ -900,3 +900,37 @@ class TestKbConfigSet:
         # No tmp file left
         tmp = user_cfg.with_suffix(user_cfg.suffix + ".tmp")
         assert not tmp.exists()
+
+
+class TestKbConfigValidate:
+    def test_both_ok(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from agent_knowledgebase import server as srv
+        saves = tmp_path / "saves"
+        saves.mkdir()
+        user_cfg = tmp_path / "user.json"
+        user_cfg.write_text(json.dumps({"embedding": {"model": "foo"}}))
+        monkeypatch.setenv("AGENT_KB_SAVES_DIR", str(saves))
+        monkeypatch.setenv("AGENT_KB_USER_CONFIG", str(user_cfg))
+        monkeypatch.setenv("AGENT_KB_PROJECT_CONFIG", str(tmp_path / "none.json"))
+        result = json.loads(srv.kb_config_validate())
+        assert result["user"]["status"] == "ok"
+        assert result["project"]["status"] == "missing"
+        assert "merged" in result
+
+    def test_error_on_malformed_file(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from agent_knowledgebase import server as srv
+        saves = tmp_path / "saves"
+        saves.mkdir()
+        bad = tmp_path / "bad.json"
+        bad.write_text("{not json")
+        monkeypatch.setenv("AGENT_KB_SAVES_DIR", str(saves))
+        monkeypatch.setenv("AGENT_KB_USER_CONFIG", str(bad))
+        monkeypatch.setenv("AGENT_KB_PROJECT_CONFIG", str(tmp_path / "none.json"))
+        result = json.loads(srv.kb_config_validate())
+        assert result["user"]["status"] == "error"
+        assert "json" in result["user"]["error"].lower() or "parse" in result["user"]["error"].lower()
+        assert "merged" not in result

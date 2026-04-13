@@ -602,6 +602,47 @@ def kb_config_set(scope: str, key: str, value: object) -> str:
     return kb_config_get(key)
 
 
+@mcp.tool()
+def kb_config_validate() -> str:
+    """Dry-run config resolution and report per-file status.
+
+    Does not mutate server state.  Returns ``status`` = ``"ok"``,
+    ``"missing"``, or ``"error"`` for each file.  When both are
+    ``"ok"``/``"missing"``, also returns the merged values + provenance.
+    """
+    def _check(path: Path) -> dict[str, object]:
+        if not path.exists():
+            return {"status": "missing", "path": str(path)}
+        try:
+            NestedJsonConfigSettingsSource(Settings, path=path)()
+        except Exception as e:  # noqa: BLE001 — we want the full error text
+            return {"status": "error", "path": str(path), "error": str(e)}
+        return {"status": "ok", "path": str(path)}
+
+    user_path = resolve_user_config_path()
+    project_path = resolve_project_config_path()
+    user_status = _check(user_path)
+    project_status = _check(project_path)
+
+    payload: dict[str, object] = {
+        "user": user_status,
+        "project": project_status,
+    }
+
+    if user_status["status"] != "error" and project_status["status"] != "error":
+        try:
+            cfg = load_settings()
+            values = {flat: getattr(cfg, flat) for flat in DOT_TO_FLAT.values()}
+            payload["merged"] = {
+                "values": _unflatten(values),
+                "provenance": _provenance(),
+            }
+        except Exception as e:  # noqa: BLE001
+            payload["merged_error"] = str(e)
+
+    return json.dumps(payload, default=str)
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
