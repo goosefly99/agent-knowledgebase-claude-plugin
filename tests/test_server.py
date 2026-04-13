@@ -617,7 +617,6 @@ class TestKbConfigPath:
     def test_returns_both_paths(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        import json as _json
         from agent_knowledgebase import server as srv
         saves = tmp_path / "saves"
         saves.mkdir()
@@ -626,9 +625,23 @@ class TestKbConfigPath:
         monkeypatch.setenv("AGENT_KB_SAVES_DIR", str(saves))
         monkeypatch.setenv("AGENT_KB_USER_CONFIG", str(user_cfg))
         monkeypatch.setenv("AGENT_KB_PROJECT_CONFIG", str(tmp_path / "proj.json"))
-        result = _json.loads(srv.kb_config_path())
+        result = json.loads(srv.kb_config_path())
         assert result["user"]["path"] == str(user_cfg)
         assert result["user"]["exists"] is True
         assert result["user"]["resolved_via"] == "env_override"
         assert result["project"]["exists"] is False
         assert result["project"]["resolved_via"] == "env_override"
+
+    def test_default_when_env_vars_unset(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """When no AGENT_KB_*_CONFIG env var is set, resolved_via is 'default'."""
+        saves = tmp_path / "saves"
+        saves.mkdir()
+        monkeypatch.setenv("AGENT_KB_SAVES_DIR", str(saves))
+        monkeypatch.delenv("AGENT_KB_USER_CONFIG", raising=False)
+        monkeypatch.delenv("AGENT_KB_PROJECT_CONFIG", raising=False)
+        from agent_knowledgebase import server as srv
+        result = json.loads(srv.kb_config_path())
+        assert result["user"]["resolved_via"] == "default"
+        assert result["project"]["resolved_via"] == "default"
