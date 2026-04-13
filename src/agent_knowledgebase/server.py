@@ -535,7 +535,10 @@ def kb_config_get(key: str) -> str:
     """Return one setting by dotted path (e.g. ``embedding.model``).
 
     Response includes ``value``, ``provenance`` (which layer won), and
-    ``effective_type``.
+    ``effective_type`` — the runtime type name from
+    ``type(value).__name__``. For unset optional fields (``export_path``,
+    ``pinecone.index``, etc.) this is ``"NoneType"``, which lets callers
+    distinguish a missing value from an empty string or zero.
     """
     if key not in DOT_TO_FLAT:
         valid_list = ", ".join(sorted(DOT_TO_FLAT))

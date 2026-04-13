@@ -751,3 +751,51 @@ class TestKbConfigGet:
         monkeypatch.setenv("AGENT_KB_SAVES_DIR", str(saves))
         with pytest.raises(ValueError, match="unknown_key"):
             srv.kb_config_get("unknown_key.path")
+
+    def test_returns_int_type(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Integer-typed fields round-trip with effective_type='int'."""
+        from agent_knowledgebase import server as srv
+        saves = tmp_path / "saves"
+        saves.mkdir()
+        monkeypatch.setenv("AGENT_KB_SAVES_DIR", str(saves))
+        monkeypatch.delenv("AGENT_KB_USER_CONFIG", raising=False)
+        monkeypatch.delenv("AGENT_KB_PROJECT_CONFIG", raising=False)
+        monkeypatch.setenv("AGENT_KB_CHUNK_SIZE", "1024")
+        result = json.loads(srv.kb_config_get("chunk.size"))
+        assert result["value"] == 1024
+        assert result["effective_type"] == "int"
+        assert result["provenance"] == "env"
+
+    def test_returns_list_type_with_default_provenance(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """List-typed field from defaults returns list with default provenance."""
+        from agent_knowledgebase import server as srv
+        saves = tmp_path / "saves"
+        saves.mkdir()
+        monkeypatch.setenv("AGENT_KB_SAVES_DIR", str(saves))
+        monkeypatch.delenv("AGENT_KB_USER_CONFIG", raising=False)
+        monkeypatch.delenv("AGENT_KB_PROJECT_CONFIG", raising=False)
+        monkeypatch.delenv("AGENT_KB_INGEST_EXCLUDED_DIRS", raising=False)
+        result = json.loads(srv.kb_config_get("ingest.excluded_dirs"))
+        assert result["effective_type"] == "list"
+        assert "__pycache__" in result["value"]
+        assert result["provenance"] == "default"
+
+    def test_unknown_key_lists_valid_keys(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Error message must list valid keys so callers can recover."""
+        from agent_knowledgebase import server as srv
+        saves = tmp_path / "saves"
+        saves.mkdir()
+        monkeypatch.setenv("AGENT_KB_SAVES_DIR", str(saves))
+        with pytest.raises(ValueError) as exc:
+            srv.kb_config_get("bogus.path")
+        msg = str(exc.value)
+        # Several representative valid keys must appear in the error
+        assert "embedding.model" in msg
+        assert "chunk.size" in msg
+        assert "vectorstore" in msg
