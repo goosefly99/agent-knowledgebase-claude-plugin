@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from agent_knowledgebase.config import Settings
 from agent_knowledgebase.ingestors import INGESTOR_REGISTRY, ChunkConfig
+from agent_knowledgebase.ingestors.codebase import CodebaseIngestor
 from agent_knowledgebase.ingestors.directory import DirectoryIngestor, excluded_dirs_for
 from agent_knowledgebase.models import Chunk, SourceType
 
@@ -34,6 +35,8 @@ class IngestionOrchestrator:
 
         if ingestor_cls is DirectoryIngestor:
             ingestor = DirectoryIngestor(excluded_dirs=excluded_dirs_for(self._config))
+        elif ingestor_cls is CodebaseIngestor:
+            ingestor = CodebaseIngestor(excluded_dirs=excluded_dirs_for(self._config))
         else:
             ingestor = ingestor_cls()
         contents = ingestor.read(uri, metadata)

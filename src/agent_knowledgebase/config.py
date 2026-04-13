@@ -143,6 +143,8 @@ class Settings(BaseSettings):
         default_factory=lambda: [
             "__pycache__", "node_modules", ".git", ".venv",
             ".mypy_cache", ".pytest_cache", "dist", "build",
+            "venv", ".tox", ".ruff_cache", ".eggs",
+            ".idea", ".vscode", ".hg", ".svn",
         ],
         description="Directory names to skip during recursive ingestion. "
         "This is a full replacement of the default list when set.",

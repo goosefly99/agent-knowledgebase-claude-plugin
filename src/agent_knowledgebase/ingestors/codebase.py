@@ -75,8 +75,8 @@ class CodebaseIngestor:
     chunking for other languages.
     """
 
-    def __init__(self) -> None:
-        self._dir_ingestor = DirectoryIngestor()
+    def __init__(self, excluded_dirs: set[str]) -> None:
+        self._dir_ingestor = DirectoryIngestor(excluded_dirs=excluded_dirs)
 
     # ------------------------------------------------------------------
     # Ingestor interface

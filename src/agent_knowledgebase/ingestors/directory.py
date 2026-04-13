@@ -6,31 +6,12 @@ import fnmatch
 from typing import TYPE_CHECKING
 from pathlib import Path
 
-from agent_knowledgebase.ingestors import ChunkConfig, Chunk, RawContent, token_chunk
+from agent_knowledgebase.ingestors import ChunkConfig, RawContent, token_chunk
+from agent_knowledgebase.models import Chunk
 from agent_knowledgebase.ingestors.file import FileIngestor
 
 if TYPE_CHECKING:
     from agent_knowledgebase.config import Settings
-
-# Directories that are always excluded from traversal.
-_ALWAYS_EXCLUDE_DIRS: set[str] = {
-    "__pycache__",
-    "node_modules",
-    ".git",
-    ".venv",
-    "venv",
-    ".tox",
-    ".mypy_cache",
-    ".pytest_cache",
-    ".ruff_cache",
-    ".eggs",
-    "dist",
-    "build",
-    ".idea",
-    ".vscode",
-    ".hg",
-    ".svn",
-}
 
 
 def excluded_dirs_for(settings: "Settings") -> set[str]:
@@ -46,9 +27,9 @@ class DirectoryIngestor:
     * Skips common non-source directories (``__pycache__``, ``node_modules``, etc.).
     """
 
-    def __init__(self, excluded_dirs: set[str] | None = None) -> None:
+    def __init__(self, excluded_dirs: set[str]) -> None:
         self._file_ingestor = FileIngestor()
-        self._excluded_dirs = excluded_dirs if excluded_dirs is not None else _ALWAYS_EXCLUDE_DIRS
+        self._excluded_dirs = excluded_dirs
 
     # ------------------------------------------------------------------
     # Ingestor interface
