@@ -218,3 +218,58 @@ def load_settings(
 
     with _path_overrides(user_path, project_path):
         return Settings()
+
+
+def _nested_set(raw: dict[str, Any], dotted_key: str, value: Any) -> dict[str, Any]:
+    """Return a copy of ``raw`` with ``dotted_key`` set to ``value``.
+
+    Non-destructive for sibling keys: ``{"a": {"b": 1}}`` with
+    ``set("a.c", 2)`` → ``{"a": {"b": 1, "c": 2}}``.
+    """
+    import copy
+    out = copy.deepcopy(raw)
+    segments = dotted_key.split(".")
+    cursor = out
+    for segment in segments[:-1]:
+        if segment not in cursor or not isinstance(cursor[segment], dict):
+            cursor[segment] = {}
+        cursor = cursor[segment]
+    cursor[segments[-1]] = value
+    return out
+
+
+def atomic_write_json(path: Path, data: dict[str, Any]) -> None:
+    """Write ``data`` to ``path`` atomically (same-dir tmp + os.replace)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def write_candidate_and_validate(
+    target_path: Path, dotted_key: str, value: Any, *, scope: str
+) -> None:
+    """Write a candidate update to ``<target>.tmp``, validate via
+    :func:`load_settings`, then atomically replace the real file on success.
+
+    On any validation failure, removes the tmp file and re-raises.
+    """
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    current: dict[str, Any] = {}
+    if target_path.exists() and target_path.read_text(encoding="utf-8").strip():
+        current = json.loads(target_path.read_text(encoding="utf-8"))
+
+    updated = _nested_set(current, dotted_key, value)
+    tmp = target_path.with_suffix(target_path.suffix + ".tmp")
+    tmp.write_text(json.dumps(updated, indent=2), encoding="utf-8")
+
+    try:
+        if scope == "user":
+            load_settings(user_path=tmp)
+        else:
+            load_settings(project_path=tmp)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
+
+    os.replace(tmp, target_path)

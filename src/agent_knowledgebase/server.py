@@ -14,10 +14,12 @@ from pydantic_core import PydanticUndefined
 from agent_knowledgebase.config import Settings
 from agent_knowledgebase.config_files import (
     DOT_TO_FLAT,
+    FORBIDDEN_KEYS,
     NestedJsonConfigSettingsSource,
     load_settings,
     resolve_project_config_path,
     resolve_user_config_path,
+    write_candidate_and_validate,
 )
 from agent_knowledgebase.models import PageType, SourceType
 from agent_knowledgebase.services.knowledgebase import KnowledgebaseService
@@ -556,6 +558,42 @@ def kb_config_get(key: str) -> str:
         "effective_type": type(value).__name__,
     }
     return json.dumps(payload, default=str)
+
+
+@mcp.tool()
+def kb_config_set(scope: str, key: str, value: object) -> str:
+    """Write a single setting to the user- or project-level config file.
+
+    Parameters:
+        scope: ``"user"`` or ``"project"``.
+        key: Dotted path, e.g. ``"embedding.model"``.
+        value: New value (type validated by pydantic on the dry-run).
+
+    Behavior: writes ``<file>.tmp`` beside the target, runs validation on
+    the candidate, then atomically replaces the real file on success.  On
+    validation failure, the real file is untouched and the tmp is deleted.
+    """
+    if scope not in {"user", "project"}:
+        raise ValueError(f"scope must be 'user' or 'project', got {scope!r}")
+    if key not in DOT_TO_FLAT:
+        valid = ", ".join(sorted(DOT_TO_FLAT))
+        raise ValueError(f"unknown config key '{key}'. Valid: {valid}")
+    for segment in key.split("."):
+        if segment in FORBIDDEN_KEYS:
+            raise ValueError(
+                f"key '{key}' contains forbidden segment '{segment}' — "
+                f"secrets must be set via env, never written to disk."
+            )
+
+    target = resolve_user_config_path() if scope == "user" else resolve_project_config_path()
+    write_candidate_and_validate(target, key, value, scope=scope)
+
+    # Refresh the service/settings after the successful write so the next
+    # tool call sees the new value.
+    global _service
+    _service = None
+
+    return kb_config_get(key)
 
 
 # ---------------------------------------------------------------------------

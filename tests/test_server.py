@@ -799,3 +799,80 @@ class TestKbConfigGet:
         assert "embedding.model" in msg
         assert "chunk.size" in msg
         assert "vectorstore" in msg
+
+
+class TestKbConfigSet:
+    def _env(self, monkeypatch, tmp_path):
+        saves = tmp_path / "saves"
+        saves.mkdir()
+        user_cfg = tmp_path / "user.json"
+        proj_cfg = tmp_path / ".agent-kb" / "config.json"
+        monkeypatch.setenv("AGENT_KB_SAVES_DIR", str(saves))
+        monkeypatch.setenv("AGENT_KB_USER_CONFIG", str(user_cfg))
+        monkeypatch.setenv("AGENT_KB_PROJECT_CONFIG", str(proj_cfg))
+        return user_cfg, proj_cfg
+
+    def test_set_user_creates_file(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from agent_knowledgebase import server as srv
+        user_cfg, _ = self._env(monkeypatch, tmp_path)
+        assert not user_cfg.exists()
+        result = json.loads(srv.kb_config_set("user", "embedding.model", "new-model"))
+        assert user_cfg.exists()
+        on_disk = json.loads(user_cfg.read_text())
+        assert on_disk == {"embedding": {"model": "new-model"}}
+        assert result["value"] == "new-model"
+        assert result["provenance"] == "user_json"
+
+    def test_set_project_creates_dotdir(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from agent_knowledgebase import server as srv
+        _, proj_cfg = self._env(monkeypatch, tmp_path)
+        assert not proj_cfg.exists()
+        srv.kb_config_set("project", "chunk.size", 256)
+        assert proj_cfg.exists()
+        assert json.loads(proj_cfg.read_text()) == {"chunk": {"size": 256}}
+
+    def test_set_rejects_invalid_scope(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from agent_knowledgebase import server as srv
+        self._env(monkeypatch, tmp_path)
+        with pytest.raises(ValueError, match="scope"):
+            srv.kb_config_set("global", "embedding.model", "x")
+
+    def test_set_rejects_unknown_key(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from agent_knowledgebase import server as srv
+        self._env(monkeypatch, tmp_path)
+        with pytest.raises(ValueError, match="unknown"):
+            srv.kb_config_set("user", "nonsense.key", "x")
+
+    def test_set_rejects_forbidden_key(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from agent_knowledgebase import server as srv
+        self._env(monkeypatch, tmp_path)
+        # Fake forbidden — the writeable API shouldn't expose it at all,
+        # but guard anyway
+        with pytest.raises(ValueError):
+            srv.kb_config_set("user", "openai_api_key", "sk-...")
+
+    def test_set_rollback_on_validation_fail(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from agent_knowledgebase import server as srv
+        user_cfg, _ = self._env(monkeypatch, tmp_path)
+        user_cfg.parent.mkdir(parents=True, exist_ok=True)
+        user_cfg.write_text(json.dumps({"chunk": {"size": 512}}))
+        # overlap >= size → fails _validate_chunk_overlap
+        with pytest.raises(Exception):
+            srv.kb_config_set("user", "chunk.overlap", 512)
+        # File must be untouched
+        assert json.loads(user_cfg.read_text()) == {"chunk": {"size": 512}}
+        # No tmp file left behind
+        tmp = user_cfg.with_suffix(user_cfg.suffix + ".tmp")
+        assert not tmp.exists()
