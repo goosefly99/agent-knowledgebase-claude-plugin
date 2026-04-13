@@ -701,3 +701,24 @@ class TestKbConfigShow:
         self._env(monkeypatch, tmp_path)
         with pytest.raises(ValueError, match="scope"):
             srv.kb_config_show("bogus")
+
+    def test_show_defaults(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """defaults scope returns every field's default value, not PydanticUndefined."""
+        from agent_knowledgebase import server as srv
+        self._env(monkeypatch, tmp_path)
+        result = json.loads(srv.kb_config_show("defaults"))
+        # Literal defaults
+        assert result["vectorstore"] == "chromadb"
+        assert result["embedding"]["provider"] == "sentence-transformers"
+        assert result["embedding"]["model"] == "all-MiniLM-L6-v2"
+        assert result["chunk"]["size"] == 512
+        assert result["chunk"]["overlap"] == 64
+        assert result["query"]["default_top_k"] == 10
+        # default_factory field (ingest.excluded_dirs)
+        assert "__pycache__" in result["ingest"]["excluded_dirs"]
+        assert ".git" in result["ingest"]["excluded_dirs"]
+        # No stringified sentinel sneaks through
+        flat_text = json.dumps(result)
+        assert "PydanticUndefined" not in flat_text

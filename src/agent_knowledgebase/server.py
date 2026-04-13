@@ -9,8 +9,13 @@ from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
 
+from pydantic_core import PydanticUndefined
+
 from agent_knowledgebase.config import Settings
 from agent_knowledgebase.config_files import (
+    DOT_TO_FLAT,
+    NestedJsonConfigSettingsSource,
+    load_settings,
     resolve_project_config_path,
     resolve_user_config_path,
 )
@@ -390,8 +395,6 @@ def _resolved_via(env_name: str) -> str:
 
 def _unflatten(flat: dict[str, object]) -> dict[str, object]:
     """Inverse of _flatten_dotted — restore a nested dict from dotted keys."""
-    from agent_knowledgebase.config_files import DOT_TO_FLAT
-
     flat_to_dot = {v: k for k, v in DOT_TO_FLAT.items()}
     out: dict[str, object] = {}
     for flat_name, value in flat.items():
@@ -410,14 +413,6 @@ def _provenance() -> dict[str, str]:
     Returns a dict keyed by dotted path → one of
     ``"env"``, ``"project_json"``, ``"user_json"``, ``"default"``.
     """
-    from agent_knowledgebase.config_files import (
-        DOT_TO_FLAT,
-        NestedJsonConfigSettingsSource,
-        resolve_project_config_path,
-        resolve_user_config_path,
-    )
-    from agent_knowledgebase.config import Settings
-
     env_prefix = "AGENT_KB_"
     env_keys_present = {
         name[len(env_prefix):].lower()
@@ -479,15 +474,6 @@ def kb_config_show(scope: str = "merged") -> str:
     ``merged`` also returns a ``provenance`` map naming which layer won for
     each key.
     """
-    from agent_knowledgebase.config_files import (
-        DOT_TO_FLAT,
-        NestedJsonConfigSettingsSource,
-        load_settings,
-        resolve_project_config_path,
-        resolve_user_config_path,
-    )
-    from agent_knowledgebase.config import Settings
-
     valid = {"merged", "user", "project", "env", "defaults"}
     if scope not in valid:
         raise ValueError(f"scope must be one of {sorted(valid)}, got {scope!r}")
@@ -534,9 +520,12 @@ def kb_config_show(scope: str = "merged") -> str:
         field = Settings.model_fields.get(flat_name)
         if field is None:
             continue
-        default = field.default
         if field.default_factory is not None:
             default = field.default_factory()
+        else:
+            default = field.default
+        if default is PydanticUndefined:
+            continue
         defaults_flat[flat_name] = default
     return json.dumps(_unflatten(defaults_flat), default=str)
 
