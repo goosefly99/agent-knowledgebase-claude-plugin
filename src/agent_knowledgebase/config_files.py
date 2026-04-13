@@ -9,8 +9,10 @@ from __future__ import annotations
 import json
 import logging
 import os
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from pydantic.fields import FieldInfo
 from pydantic_settings import BaseSettings, PydanticBaseSettingsSource
@@ -178,3 +180,41 @@ class NestedJsonConfigSettingsSource(PydanticBaseSettingsSource):
         self, field: FieldInfo, field_name: str
     ) -> tuple[Any, str, bool]:
         return None, field_name, False
+
+
+if TYPE_CHECKING:
+    from agent_knowledgebase.config import Settings
+
+
+@contextmanager
+def _path_overrides(
+    user_path: Path | None, project_path: Path | None
+) -> Iterator[None]:
+    """Temporarily patch module-level overrides for :func:`load_settings`."""
+    global _USER_CONFIG_PATH_OVERRIDE, _PROJECT_CONFIG_PATH_OVERRIDE
+    prev_user = _USER_CONFIG_PATH_OVERRIDE
+    prev_project = _PROJECT_CONFIG_PATH_OVERRIDE
+    if user_path is not None:
+        _USER_CONFIG_PATH_OVERRIDE = user_path
+    if project_path is not None:
+        _PROJECT_CONFIG_PATH_OVERRIDE = project_path
+    try:
+        yield
+    finally:
+        _USER_CONFIG_PATH_OVERRIDE = prev_user
+        _PROJECT_CONFIG_PATH_OVERRIDE = prev_project
+
+
+def load_settings(
+    user_path: Path | None = None, project_path: Path | None = None
+) -> "Settings":
+    """Construct a fresh :class:`Settings` with optional path overrides.
+
+    Used at server startup (no args → normal discovery) and by
+    :func:`kb_config_set` to dry-run a candidate file before committing.
+    """
+    # Local import avoids a circular dependency at module load.
+    from agent_knowledgebase.config import Settings
+
+    with _path_overrides(user_path, project_path):
+        return Settings()

@@ -239,3 +239,52 @@ class TestLayeringPrecedence:
         monkeypatch.setenv("AGENT_KB_EMBEDDING_MODEL", "from-env")
         cfg = Settings()
         assert cfg.embedding_model == "from-env"
+
+
+class TestLoadSettingsHelper:
+    """load_settings() can substitute paths for a dry-run without env mutation."""
+
+    def test_load_with_substituted_user_path(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from agent_knowledgebase.config_files import load_settings
+        saves = tmp_path / "saves"
+        saves.mkdir()
+        monkeypatch.setenv("AGENT_KB_SAVES_DIR", str(saves))
+        # Ensure baseline discovery returns empty files
+        monkeypatch.setenv("AGENT_KB_USER_CONFIG", str(tmp_path / "base.json"))
+        monkeypatch.setenv("AGENT_KB_PROJECT_CONFIG", str(tmp_path / "base_proj.json"))
+
+        # Write a candidate file and pass it explicitly
+        candidate = tmp_path / "candidate_user.json"
+        candidate.write_text(json.dumps({"embedding": {"model": "candidate-model"}}))
+
+        cfg = load_settings(user_path=candidate)
+        assert cfg.embedding_model == "candidate-model"
+
+    def test_load_resets_globals_on_exception(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        import agent_knowledgebase.config_files as cf
+        from agent_knowledgebase.config_files import load_settings
+        saves = tmp_path / "saves"
+        saves.mkdir()
+        monkeypatch.setenv("AGENT_KB_SAVES_DIR", str(saves))
+        bad = tmp_path / "bad.json"
+        bad.write_text("{not json")
+        with pytest.raises(ValueError):
+            load_settings(user_path=bad)
+        assert cf._USER_CONFIG_PATH_OVERRIDE is None
+        assert cf._PROJECT_CONFIG_PATH_OVERRIDE is None
+
+    def test_load_with_no_args_uses_normal_discovery(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from agent_knowledgebase.config_files import load_settings
+        saves = tmp_path / "saves"
+        saves.mkdir()
+        monkeypatch.setenv("AGENT_KB_SAVES_DIR", str(saves))
+        monkeypatch.setenv("AGENT_KB_USER_CONFIG", str(tmp_path / "none.json"))
+        monkeypatch.setenv("AGENT_KB_PROJECT_CONFIG", str(tmp_path / "none2.json"))
+        cfg = load_settings()
+        assert cfg.embedding_model == "all-MiniLM-L6-v2"
