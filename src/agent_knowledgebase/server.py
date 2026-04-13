@@ -530,6 +530,31 @@ def kb_config_show(scope: str = "merged") -> str:
     return json.dumps(_unflatten(defaults_flat), default=str)
 
 
+@mcp.tool()
+def kb_config_get(key: str) -> str:
+    """Return one setting by dotted path (e.g. ``embedding.model``).
+
+    Response includes ``value``, ``provenance`` (which layer won), and
+    ``effective_type``.
+    """
+    if key not in DOT_TO_FLAT:
+        valid_list = ", ".join(sorted(DOT_TO_FLAT))
+        raise ValueError(
+            f"unknown_key: '{key}' is not a valid config key. Valid keys: {valid_list}"
+        )
+
+    cfg = load_settings()
+    flat = DOT_TO_FLAT[key]
+    value = getattr(cfg, flat)
+    payload = {
+        "key": key,
+        "value": value,
+        "provenance": _provenance().get(key, "default"),
+        "effective_type": type(value).__name__,
+    }
+    return json.dumps(payload, default=str)
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------

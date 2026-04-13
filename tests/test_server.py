@@ -722,3 +722,32 @@ class TestKbConfigShow:
         # No stringified sentinel sneaks through
         flat_text = json.dumps(result)
         assert "PydanticUndefined" not in flat_text
+
+
+class TestKbConfigGet:
+    def test_returns_value_and_provenance(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from agent_knowledgebase import server as srv
+        saves = tmp_path / "saves"
+        saves.mkdir()
+        user_cfg = tmp_path / "user.json"
+        user_cfg.write_text(json.dumps({"embedding": {"model": "x-from-user"}}))
+        monkeypatch.setenv("AGENT_KB_SAVES_DIR", str(saves))
+        monkeypatch.setenv("AGENT_KB_USER_CONFIG", str(user_cfg))
+        monkeypatch.setenv("AGENT_KB_PROJECT_CONFIG", str(tmp_path / "no.json"))
+        result = json.loads(srv.kb_config_get("embedding.model"))
+        assert result["key"] == "embedding.model"
+        assert result["value"] == "x-from-user"
+        assert result["provenance"] == "user_json"
+        assert result["effective_type"] == "str"
+
+    def test_unknown_key_errors(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from agent_knowledgebase import server as srv
+        saves = tmp_path / "saves"
+        saves.mkdir()
+        monkeypatch.setenv("AGENT_KB_SAVES_DIR", str(saves))
+        with pytest.raises(ValueError, match="unknown_key"):
+            srv.kb_config_get("unknown_key.path")
