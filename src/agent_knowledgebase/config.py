@@ -6,7 +6,7 @@ import re
 from pathlib import Path
 from typing import Literal, Optional
 
-from pydantic import Field, model_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -84,6 +84,10 @@ class Settings(BaseSettings):
         ge=0,
         description="Chunk overlap in tokens",
     )
+    chunk_token_encoding: str = Field(
+        default="cl100k_base",
+        description="tiktoken encoding name used for token-based chunking",
+    )
 
     @model_validator(mode="after")
     def _validate_chunk_overlap(self) -> Settings:
@@ -91,6 +95,52 @@ class Settings(BaseSettings):
             msg = f"chunk_overlap ({self.chunk_overlap}) must be less than chunk_size ({self.chunk_size})"
             raise ValueError(msg)
         return self
+
+    # --- Query ---
+    query_default_top_k: int = Field(
+        default=10,
+        gt=0,
+        description="Default number of results returned by kb_query and kb_search",
+    )
+    query_hybrid_vector_weight: float = Field(
+        default=0.7,
+        ge=0.0,
+        le=1.0,
+        description="Weight of vector scores in hybrid search (must sum to 1.0 with fts_weight)",
+    )
+    query_hybrid_fts_weight: float = Field(
+        default=0.3,
+        ge=0.0,
+        le=1.0,
+        description="Weight of full-text-search scores in hybrid search",
+    )
+    query_hybrid_fetch_multiplier: int = Field(
+        default=2,
+        ge=1,
+        description="Over-fetch multiplier used to merge hybrid results before trimming to top_k",
+    )
+
+    # --- Ingest ---
+    ingest_excluded_dirs: list[str] | str = Field(
+        default_factory=lambda: [
+            "__pycache__", "node_modules", ".git", ".venv",
+            ".mypy_cache", ".pytest_cache", "dist", "build",
+        ],
+        description="Directory names to skip during recursive ingestion. "
+        "This is a full replacement of the default list when set.",
+    )
+
+    @field_validator("ingest_excluded_dirs", mode="before")
+    @classmethod
+    def _parse_excluded_dirs(cls, value: object) -> object:
+        # pydantic-settings treats pure list[str] as complex and JSON-decodes the env string,
+        # rejecting non-JSON input.  Declaring the type as list[str] | str tells pydantic-settings
+        # to allow parse failure and pass the raw string through to this validator, which then
+        # splits on commas.  At runtime the return value is always list[str].
+        if isinstance(value, str):
+            parts = [p.strip() for p in value.split(",")]
+            return [p for p in parts if p]
+        return value
 
     # --- Export ---
     export_path: Optional[Path] = Field(

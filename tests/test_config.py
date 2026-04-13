@@ -70,6 +70,27 @@ class TestDefaults:
         assert test_config.pinecone_environment is None
         assert test_config.openai_api_key is None
 
+    def test_default_chunk_token_encoding(self, test_config: Settings) -> None:
+        assert test_config.chunk_token_encoding == "cl100k_base"
+
+    def test_default_query_default_top_k(self, test_config: Settings) -> None:
+        assert test_config.query_default_top_k == 10
+
+    def test_default_query_hybrid_vector_weight(self, test_config: Settings) -> None:
+        assert test_config.query_hybrid_vector_weight == 0.7
+
+    def test_default_query_hybrid_fts_weight(self, test_config: Settings) -> None:
+        assert test_config.query_hybrid_fts_weight == 0.3
+
+    def test_default_query_hybrid_fetch_multiplier(self, test_config: Settings) -> None:
+        assert test_config.query_hybrid_fetch_multiplier == 2
+
+    def test_default_ingest_excluded_dirs(self, test_config: Settings) -> None:
+        assert test_config.ingest_excluded_dirs == [
+            "__pycache__", "node_modules", ".git", ".venv",
+            ".mypy_cache", ".pytest_cache", "dist", "build",
+        ]
+
 
 class TestEnvOverrides:
     """Environment variable overrides are picked up."""
@@ -107,6 +128,43 @@ class TestEnvOverrides:
         monkeypatch.setenv("AGENT_KB_EXPORT_PATH", "/tmp/export")
         cfg = Settings(saves_dir=tmp_path)
         assert cfg.export_path == Path("/tmp/export")
+
+    def test_override_chunk_token_encoding(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setenv("AGENT_KB_CHUNK_TOKEN_ENCODING", "o200k_base")
+        cfg = Settings(saves_dir=tmp_path)
+        assert cfg.chunk_token_encoding == "o200k_base"
+
+    def test_override_query_default_top_k(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setenv("AGENT_KB_QUERY_DEFAULT_TOP_K", "25")
+        cfg = Settings(saves_dir=tmp_path)
+        assert cfg.query_default_top_k == 25
+
+    def test_override_query_hybrid_weights(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setenv("AGENT_KB_QUERY_HYBRID_VECTOR_WEIGHT", "0.6")
+        monkeypatch.setenv("AGENT_KB_QUERY_HYBRID_FTS_WEIGHT", "0.4")
+        cfg = Settings(saves_dir=tmp_path)
+        assert cfg.query_hybrid_vector_weight == 0.6
+        assert cfg.query_hybrid_fts_weight == 0.4
+
+    def test_override_query_hybrid_fetch_multiplier(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setenv("AGENT_KB_QUERY_HYBRID_FETCH_MULTIPLIER", "3")
+        cfg = Settings(saves_dir=tmp_path)
+        assert cfg.query_hybrid_fetch_multiplier == 3
+
+    def test_override_ingest_excluded_dirs(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setenv("AGENT_KB_INGEST_EXCLUDED_DIRS", "foo, bar,baz")
+        cfg = Settings(saves_dir=tmp_path)
+        assert cfg.ingest_excluded_dirs == ["foo", "bar", "baz"]
 
 
 class TestPathExpansion:
