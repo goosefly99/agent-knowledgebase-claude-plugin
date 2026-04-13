@@ -590,6 +590,12 @@ def kb_config_set(scope: str, key: str, value: object) -> str:
 
     # Refresh the service/settings after the successful write so the next
     # tool call sees the new value.
+    #
+    # NOTE: This invalidates only the server.py module-level `_service`
+    # cache.  Any `Settings` object cached in another module (e.g., held
+    # by a test fixture or a caller outside server.py) is NOT refreshed.
+    # The existing callers all go through `_get_service()` or
+    # `load_settings()`, which both re-read on demand, so this is safe.
     global _service
     _service = None
 

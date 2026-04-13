@@ -876,3 +876,27 @@ class TestKbConfigSet:
         # No tmp file left behind
         tmp = user_cfg.with_suffix(user_cfg.suffix + ".tmp")
         assert not tmp.exists()
+
+    def test_set_succeeds_after_failed_rollback(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """After a failed-then-rolled-back set, the next valid set still works."""
+        from agent_knowledgebase import server as srv
+        user_cfg, _ = self._env(monkeypatch, tmp_path)
+        user_cfg.parent.mkdir(parents=True, exist_ok=True)
+        user_cfg.write_text(json.dumps({"chunk": {"size": 512}}))
+
+        # Attempt invalid write (overlap >= size) — must raise, leave file intact
+        with pytest.raises(Exception):
+            srv.kb_config_set("user", "chunk.overlap", 512)
+        assert json.loads(user_cfg.read_text()) == {"chunk": {"size": 512}}
+
+        # Now perform a valid write — should succeed
+        result = json.loads(srv.kb_config_set("user", "chunk.overlap", 32))
+        assert result["value"] == 32
+        on_disk = json.loads(user_cfg.read_text())
+        assert on_disk == {"chunk": {"size": 512, "overlap": 32}}
+
+        # No tmp file left
+        tmp = user_cfg.with_suffix(user_cfg.suffix + ".tmp")
+        assert not tmp.exists()

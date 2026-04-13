@@ -6,6 +6,7 @@ circular imports — :class:`Settings` imports from here, not vice-versa.
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import os
@@ -223,10 +224,15 @@ def load_settings(
 def _nested_set(raw: dict[str, Any], dotted_key: str, value: Any) -> dict[str, Any]:
     """Return a copy of ``raw`` with ``dotted_key`` set to ``value``.
 
-    Non-destructive for sibling keys: ``{"a": {"b": 1}}`` with
-    ``set("a.c", 2)`` → ``{"a": {"b": 1, "c": 2}}``.
+    Non-destructive for sibling keys at the same depth: ``{"a": {"b": 1}}``
+    with ``set("a.c", 2)`` → ``{"a": {"b": 1, "c": 2}}``.
+
+    If an intermediate segment exists in ``raw`` but is not a dict (e.g., a
+    scalar left over from a hand-edited config), it is silently replaced
+    with an empty dict so the nested assignment can proceed. Callers that
+    care about such malformed input should validate the returned dict via
+    ``load_settings`` — the normal Task 10 flow already does this.
     """
-    import copy
     out = copy.deepcopy(raw)
     segments = dotted_key.split(".")
     cursor = out
@@ -256,8 +262,10 @@ def write_candidate_and_validate(
     """
     target_path.parent.mkdir(parents=True, exist_ok=True)
     current: dict[str, Any] = {}
-    if target_path.exists() and target_path.read_text(encoding="utf-8").strip():
-        current = json.loads(target_path.read_text(encoding="utf-8"))
+    if target_path.exists():
+        text = target_path.read_text(encoding="utf-8")
+        if text.strip():
+            current = json.loads(text)
 
     updated = _nested_set(current, dotted_key, value)
     tmp = target_path.with_suffix(target_path.suffix + ".tmp")
