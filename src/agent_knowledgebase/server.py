@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import asdict
 from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
 
 from agent_knowledgebase.config import Settings
+from agent_knowledgebase.config_files import (
+    resolve_project_config_path,
+    resolve_user_config_path,
+)
 from agent_knowledgebase.models import PageType, SourceType
 from agent_knowledgebase.services.knowledgebase import KnowledgebaseService
 
@@ -372,6 +377,40 @@ def kb_pipeline_status(kb_id: str) -> str:
     svc = _get_service()
     runs = svc.get_pipeline_status(kb_id)
     return _serialize_model_list(runs)
+
+
+# ===================================================================
+# Config tools
+# ===================================================================
+
+
+def _resolved_via(env_name: str) -> str:
+    return "env_override" if os.environ.get(env_name) else "default"
+
+
+@mcp.tool()
+def kb_config_path() -> str:
+    """Return the on-disk paths used for user- and project-level config.
+
+    Paths are returned whether or not the files exist. ``resolved_via`` is
+    ``"env_override"`` when an ``AGENT_KB_*_CONFIG`` env var supplied the path,
+    otherwise ``"default"``.
+    """
+    user = resolve_user_config_path()
+    project = resolve_project_config_path()
+    payload = {
+        "user": {
+            "path": str(user),
+            "exists": user.exists(),
+            "resolved_via": _resolved_via("AGENT_KB_USER_CONFIG"),
+        },
+        "project": {
+            "path": str(project),
+            "exists": project.exists(),
+            "resolved_via": _resolved_via("AGENT_KB_PROJECT_CONFIG"),
+        },
+    }
+    return json.dumps(payload)
 
 
 # ---------------------------------------------------------------------------

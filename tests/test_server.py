@@ -611,3 +611,24 @@ class TestResponseFormat:
             result = call()
             assert isinstance(result, str), f"Tool #{i} did not return str"
             json.loads(result)  # must be valid JSON
+
+
+class TestKbConfigPath:
+    def test_returns_both_paths(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        import json as _json
+        from agent_knowledgebase import server as srv
+        saves = tmp_path / "saves"
+        saves.mkdir()
+        user_cfg = tmp_path / "user.json"
+        user_cfg.write_text("{}")
+        monkeypatch.setenv("AGENT_KB_SAVES_DIR", str(saves))
+        monkeypatch.setenv("AGENT_KB_USER_CONFIG", str(user_cfg))
+        monkeypatch.setenv("AGENT_KB_PROJECT_CONFIG", str(tmp_path / "proj.json"))
+        result = _json.loads(srv.kb_config_path())
+        assert result["user"]["path"] == str(user_cfg)
+        assert result["user"]["exists"] is True
+        assert result["user"]["resolved_via"] == "env_override"
+        assert result["project"]["exists"] is False
+        assert result["project"]["resolved_via"] == "env_override"
