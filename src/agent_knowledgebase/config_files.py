@@ -6,9 +6,14 @@ circular imports — :class:`Settings` imports from here, not vice-versa.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from pathlib import Path
+from typing import Any
+
+from pydantic.fields import FieldInfo
+from pydantic_settings import BaseSettings, PydanticBaseSettingsSource
 
 logger = logging.getLogger("agent_knowledgebase.config")
 
@@ -58,3 +63,118 @@ def resolve_project_config_path() -> Path:
             return Path(value).expanduser() / ".agent-kb" / "config.json"
 
     return Path(os.getcwd()) / ".agent-kb" / "config.json"
+
+
+# Dotted JSON paths → flat Settings field names.  See design spec §5.2.
+DOT_TO_FLAT: dict[str, str] = {
+    "vectorstore": "vectorstore",
+    "embedding.provider": "embedding_provider",
+    "embedding.model": "embedding_model",
+    "pinecone.index": "pinecone_index",
+    "pinecone.environment": "pinecone_environment",
+    "export_path": "export_path",
+    "chunk.size": "chunk_size",
+    "chunk.overlap": "chunk_overlap",
+    "chunk.token_encoding": "chunk_token_encoding",
+    "query.default_top_k": "query_default_top_k",
+    "query.hybrid.vector_weight": "query_hybrid_vector_weight",
+    "query.hybrid.fts_weight": "query_hybrid_fts_weight",
+    "query.hybrid.fetch_multiplier": "query_hybrid_fetch_multiplier",
+    "ingest.excluded_dirs": "ingest_excluded_dirs",
+}
+
+# Keys (at any depth or any flat form) that must never appear in a JSON config.
+# The JSON source rejects them loudly because they belong in env (secrets or
+# required+validated file paths).
+FORBIDDEN_KEYS: frozenset[str] = frozenset({
+    "openai_api_key", "pinecone_api_key", "saves_dir", "api_key",
+})
+
+
+def _flatten_dotted(raw: dict[str, Any], prefix: str = "") -> dict[str, Any]:
+    """Walk a nested dict, return a flat dict keyed by dotted paths.
+
+    ``{"embedding": {"model": "x"}}`` → ``{"embedding.model": "x"}``.
+    """
+    out: dict[str, Any] = {}
+    for key, value in raw.items():
+        path = f"{prefix}.{key}" if prefix else key
+        if isinstance(value, dict):
+            out.update(_flatten_dotted(value, prefix=path))
+        else:
+            out[path] = value
+    return out
+
+
+class NestedJsonConfigSettingsSource(PydanticBaseSettingsSource):
+    """Pydantic-settings source that reads a single nested JSON config file.
+
+    Responsibilities:
+      * Return ``{}`` with a warning if the file is missing or empty ``{}``.
+      * Raise on malformed JSON, unknown keys, forbidden (secret) keys.
+      * Flatten dotted paths into :class:`Settings` flat field names.
+    """
+
+    def __init__(self, settings_cls: type[BaseSettings], path: Path) -> None:
+        super().__init__(settings_cls)
+        self._path = path
+
+    # pydantic-settings calls __call__ to get the dict of values.
+    def __call__(self) -> dict[str, Any]:
+        if not self._path.exists():
+            logger.warning(
+                "agent-knowledgebase: config file not found at %s — using defaults + env.",
+                self._path,
+            )
+            return {}
+
+        text = self._path.read_text(encoding="utf-8").strip()
+        if not text or text == "{}":
+            logger.warning(
+                "agent-knowledgebase: config file %s is empty — using defaults + env.",
+                self._path,
+            )
+            return {}
+
+        try:
+            raw = json.loads(text)
+        except json.JSONDecodeError as exc:
+            msg = f"agent-knowledgebase: failed to parse JSON in {self._path}: {exc}"
+            raise ValueError(msg) from exc
+
+        if not isinstance(raw, dict):
+            msg = f"agent-knowledgebase: top-level of {self._path} must be a JSON object."
+            raise ValueError(msg)
+
+        flat = _flatten_dotted(raw)
+
+        # 1. Reject forbidden keys anywhere in the tree.
+        for dotted in flat:
+            # Check leaf name *and* any segment matching a forbidden name.
+            for segment in dotted.split("."):
+                if segment in FORBIDDEN_KEYS:
+                    flat_equiv = dotted.replace(".", "_")
+                    raise ValueError(
+                        f"agent-knowledgebase: config file {self._path} contains forbidden key "
+                        f"'{dotted}' (flat equivalent: '{flat_equiv}', segment '{segment}'). "
+                        f"Secrets and saves_dir must be set via environment variable, never in "
+                        f"a JSON config file."
+                    )
+
+        # 2. Reject unknown dotted keys.
+        unknown = [k for k in flat if k not in DOT_TO_FLAT]
+        if unknown:
+            valid_list = ", ".join(sorted(DOT_TO_FLAT))
+            raise ValueError(
+                f"agent-knowledgebase: config file {self._path} contains unknown keys: "
+                f"{unknown}. Valid keys are: {valid_list}"
+            )
+
+        # 3. Remap dotted → flat and return.
+        return {DOT_TO_FLAT[k]: v for k, v in flat.items()}
+
+    # Required by pydantic-settings but unused for whole-file sources.
+    def get_field_value(
+        self, field: FieldInfo, field_name: str
+    ) -> tuple[Any, str, bool]:
+        return None, field_name, False

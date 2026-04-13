@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import os
+import re
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -86,3 +89,83 @@ class TestProjectConfigPathResolution:
             assert result.parent.parent.resolve() == tmp_path.resolve()
         finally:
             os.chdir(original_cwd)
+
+
+def _make_source(path: Path):
+    """Instantiate the source against a target file path."""
+    from agent_knowledgebase.config import Settings
+    from agent_knowledgebase.config_files import NestedJsonConfigSettingsSource
+    return NestedJsonConfigSettingsSource(Settings, path=path)
+
+
+def _load(path: Path) -> dict[str, Any]:
+    return _make_source(path)()
+
+
+class TestNestedJsonConfigSettingsSourceLoad:
+    def test_missing_file_returns_empty(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        caplog.set_level("WARNING", logger="agent_knowledgebase.config")
+        result = _load(tmp_path / "no_such.json")
+        assert result == {}
+        assert any("no_such.json" in m for m in caplog.messages)
+
+    def test_empty_dict_returns_empty(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        caplog.set_level("WARNING", logger="agent_knowledgebase.config")
+        f = tmp_path / "cfg.json"
+        f.write_text("{}")
+        result = _load(f)
+        assert result == {}
+        assert any(str(f) in m for m in caplog.messages)
+
+    def test_flattening(self, tmp_path: Path) -> None:
+        f = tmp_path / "cfg.json"
+        f.write_text(json.dumps({
+            "embedding": {"provider": "openai", "model": "text-embedding-3-small"},
+            "chunk": {"size": 256},
+            "query": {"hybrid": {"vector_weight": 0.6}},
+        }))
+        result = _load(f)
+        assert result["embedding_provider"] == "openai"
+        assert result["embedding_model"] == "text-embedding-3-small"
+        assert result["chunk_size"] == 256
+        assert result["query_hybrid_vector_weight"] == 0.6
+
+    def test_flat_keys_also_accepted(self, tmp_path: Path) -> None:
+        """Top-level keys like `vectorstore` and `export_path` pass through unchanged."""
+        f = tmp_path / "cfg.json"
+        f.write_text(json.dumps({"vectorstore": "pinecone", "export_path": "/tmp/out"}))
+        result = _load(f)
+        assert result["vectorstore"] == "pinecone"
+        assert result["export_path"] == "/tmp/out"
+
+    def test_malformed_json_raises(self, tmp_path: Path) -> None:
+        f = tmp_path / "cfg.json"
+        f.write_text("{not json")
+        with pytest.raises(ValueError, match=re.escape(str(f))):
+            _load(f)
+
+    def test_unknown_key_raises(self, tmp_path: Path) -> None:
+        f = tmp_path / "cfg.json"
+        f.write_text(json.dumps({"embedding": {"typo_key": "x"}}))
+        with pytest.raises(ValueError, match="embedding.typo_key"):
+            _load(f)
+
+    @pytest.mark.parametrize(
+        "forbidden_key,forbidden_container",
+        [
+            ("openai_api_key", {"openai_api_key": "sk-..."}),
+            ("pinecone_api_key", {"pinecone": {"api_key": "..."}}),
+            ("saves_dir", {"saves_dir": "/some/path"}),
+        ],
+    )
+    def test_forbidden_keys_rejected(
+        self, tmp_path: Path, forbidden_key: str, forbidden_container: dict
+    ) -> None:
+        f = tmp_path / "cfg.json"
+        f.write_text(json.dumps(forbidden_container))
+        with pytest.raises(ValueError, match=forbidden_key):
+            _load(f)
