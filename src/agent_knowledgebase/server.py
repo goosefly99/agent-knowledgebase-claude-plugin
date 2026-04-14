@@ -22,6 +22,7 @@ from agent_knowledgebase.config_files import (
     write_candidate_and_validate,
 )
 from agent_knowledgebase.models import PageType, SourceType
+from agent_knowledgebase.services.kb_ingest_service import validate_batch_size
 from agent_knowledgebase.services.knowledgebase import KnowledgebaseService
 
 mcp = FastMCP(
@@ -126,9 +127,20 @@ def kb_ingest_batch(kb_id: str, sources: str) -> str:
         sources: JSON array of objects, each with keys: source_type, uri, metadata (optional).
 
     Returns a JSON array of created source objects.
+
+    Raises:
+        BatchSizeExceededError: If more than 50 rows with
+            ``source_type='sql_database'`` are submitted in a single
+            call.  No source record is created and no ingestor runs
+            when this error is raised.
     """
-    svc = _get_service()
     source_defs = json.loads(sources)
+    # Hard-reject oversized sql_database batches BEFORE any DB write or
+    # ingestor dispatch -- the release-1 guardrail mandated by the
+    # round-3 debate synthesizer (overturning the spec's soft-warn).
+    validate_batch_size(source_defs)
+
+    svc = _get_service()
     results = []
     for item in source_defs:
         st = SourceType(item["source_type"])
