@@ -4,12 +4,31 @@ Each knowledgebase is stored in its own subdirectory under
 ``<saves_dir>/<sanitized-name>/``, containing a per-KB SQLite database
 and ChromaDB directory.  A lightweight ``.index.json`` at the
 ``saves_dir`` level maps ``kb_id -> dir_name`` for fast lookups.
+
+Concurrency model
+-----------------
+FastMCP runs synchronous tool handlers in a thread pool.  To prevent
+races when multiple tool calls target the *same* kb_id concurrently
+(e.g., two ``kb_ingest_batch`` calls for the same KB), :meth:`ingest_source`
+holds a per-kb_id ``threading.Lock`` for the entire pipeline duration.
+
+This is **single-process-only** serialization — it does not coordinate
+across multiple Python processes.  Cross-process isolation (e.g.,
+Postgres advisory locks, filesystem ``flock``) is future work.
+
+Why ``threading.Lock`` and not ``asyncio.Lock``?
+Because this codebase is entirely synchronous — no ``async def``
+anywhere in ``src/agent_knowledgebase/``.  ``asyncio.Lock`` requires a
+running event loop and only provides mutual exclusion within a single
+event loop, so it would be wrong here.
 """
 
 from __future__ import annotations
 
 import json
 import shutil
+import sys
+import threading
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -108,12 +127,35 @@ class KnowledgebaseService:
         self._contexts: dict[str, _KBContext] = {}
         self._index: dict[str, str] = _load_index(self._base_dir)
 
+        # Per-kb_id ingestion locks (threading, not asyncio — see module docstring).
+        # _kb_locks maps kb_id -> Lock; _kb_locks_guard serialises dict insertion
+        # so two threads discovering the same kb_id for the first time don't race.
+        self._kb_locks: dict[str, threading.Lock] = {}
+        self._kb_locks_guard: threading.Lock = threading.Lock()
+
     @property
     def _embedder(self) -> Embedder:
         """Lazily instantiate the embedder on first use."""
         if self._embedder_instance is None:
             self._embedder_instance = create_embedder(self._config)
         return self._embedder_instance
+
+    def _get_kb_lock(self, kb_id: str) -> threading.Lock:
+        """Return (creating lazily) the per-kb_id ingestion lock.
+
+        The guard lock ensures that two threads discovering the same
+        kb_id simultaneously both see the *same* Lock object and don't
+        accidentally create two separate locks for the same kb_id.
+        """
+        # Fast path: lock already exists (no guard needed).
+        lock = self._kb_locks.get(kb_id)
+        if lock is not None:
+            return lock
+        # Slow path: atomically insert via guard.
+        with self._kb_locks_guard:
+            # Re-check under the guard to handle the race where two threads
+            # both passed the fast-path check simultaneously.
+            return self._kb_locks.setdefault(kb_id, threading.Lock())
 
     # ------------------------------------------------------------------
     # Per-KB context management
@@ -251,7 +293,36 @@ class KnowledgebaseService:
         dedup_key: str | None = None,
         dedup_policy: DedupPolicy = DEFAULT_DEDUP_POLICY,
     ) -> Source:
-        """Full ingestion pipeline for a new source."""
+        """Full ingestion pipeline for a new source.
+
+        Concurrent calls targeting the *same* kb_id are serialised by a
+        per-kb_id ``threading.Lock``.  Calls against *different* kb_ids
+        run concurrently — there is no global lock.
+
+        This is single-process serialisation only.  Cross-process
+        isolation (e.g., Postgres advisory locks, filesystem flock) is
+        future work.
+        """
+        sys.stderr.write(f"[kb-lock] acquiring kb_id={kb_id}\n")
+        with self._get_kb_lock(kb_id):
+            sys.stderr.write(f"[kb-lock] acquired kb_id={kb_id}\n")
+            try:
+                return self._ingest_source_locked(
+                    kb_id, source_type, uri, metadata, dedup_key, dedup_policy
+                )
+            finally:
+                sys.stderr.write(f"[kb-lock] released kb_id={kb_id}\n")
+
+    def _ingest_source_locked(
+        self,
+        kb_id: str,
+        source_type: SourceType,
+        uri: str,
+        metadata: dict | None = None,
+        dedup_key: str | None = None,
+        dedup_policy: DedupPolicy = DEFAULT_DEDUP_POLICY,
+    ) -> Source:
+        """Inner pipeline body — called only while the kb_id lock is held."""
         ctx = self._ctx(kb_id)
 
         # Verify KB exists
