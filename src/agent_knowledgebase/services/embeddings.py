@@ -32,6 +32,11 @@ class Embedder(Protocol):
         """Return the dimensionality of the embedding vectors."""
         ...
 
+    @property
+    def model_name(self) -> str:
+        """Return the name of the embedding model."""
+        ...
+
 
 # ---------------------------------------------------------------------------
 # SentenceTransformers provider
@@ -44,6 +49,7 @@ class SentenceTransformerEmbedder:
     def __init__(self, model_name: str = "all-MiniLM-L6-v2") -> None:
         from sentence_transformers import SentenceTransformer
 
+        self._model_name = model_name
         self._model = SentenceTransformer(model_name)
 
     def embed(self, texts: list[str]) -> list[list[float]]:
@@ -59,6 +65,11 @@ class SentenceTransformerEmbedder:
     def dimension(self) -> int:
         """Return the embedding dimension reported by the loaded model."""
         return int(self._model.get_embedding_dimension())
+
+    @property
+    def model_name(self) -> str:
+        """Return the name of the loaded SentenceTransformer model."""
+        return self._model_name
 
 
 # ---------------------------------------------------------------------------
@@ -109,6 +120,11 @@ class OpenAIEmbedder:
         Falls back to 1536 for unknown model names.
         """
         return _OPENAI_DIMENSIONS.get(self._model_name, 1536)
+
+    @property
+    def model_name(self) -> str:
+        """Return the name of the OpenAI embedding model."""
+        return self._model_name
 
 
 # ---------------------------------------------------------------------------

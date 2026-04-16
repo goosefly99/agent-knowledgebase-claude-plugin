@@ -720,3 +720,24 @@ class Database:
             "SELECT COUNT(*) AS cnt FROM wiki_pages WHERE kb_id = ?", (kb_id,)
         ).fetchone()
         return row["cnt"]
+
+    def count_chunks_by_embedding_model(self, kb_id: str) -> dict[str, int]:
+        """Return a mapping of embedding model name -> chunk count for *kb_id*.
+
+        Reads only the ``metadata`` JSON column from the chunks table and
+        tallies the ``"embedding_model"`` key.  Chunks whose metadata lacks
+        the key (e.g. ingested before this feature was added) are skipped.
+        """
+        rows = self._conn.execute(
+            "SELECT metadata FROM chunks WHERE kb_id = ?", (kb_id,)
+        ).fetchall()
+        counts: dict[str, int] = {}
+        for row in rows:
+            meta = _json_loads(row["metadata"])
+            if not isinstance(meta, dict):
+                continue
+            model = meta.get("embedding_model")
+            if model is None:
+                continue
+            counts[model] = counts.get(model, 0) + 1
+        return counts

@@ -31,6 +31,7 @@ def mock_embedder() -> MagicMock:
     embedder.embed.return_value = [[0.1, 0.2, 0.3]]
     embedder.embed_query.return_value = [0.1, 0.2, 0.3]
     embedder.dimension = 3
+    embedder.model_name = "mock-embedder"
     return embedder
 
 

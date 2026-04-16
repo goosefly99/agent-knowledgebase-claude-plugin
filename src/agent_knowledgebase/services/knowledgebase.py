@@ -378,6 +378,9 @@ class KnowledgebaseService:
             texts = [c.content for c in chunks]
             embeddings = self._embedder.embed(texts) if texts else []
             vs = self._get_vectorstore(kb_id)
+            # Stamp the embedding model name on each chunk before persistence.
+            for chunk in chunks:
+                chunk.metadata["embedding_model"] = self._embedder.model_name
             if chunks:
                 vs.add(
                     ids=[c.id for c in chunks],
@@ -595,7 +598,13 @@ class KnowledgebaseService:
     # ------------------------------------------------------------------
 
     def _enrich_kb(self, kb: Knowledgebase, ctx: _KBContext) -> Knowledgebase:
-        """Add source_count and page_count from DB."""
+        """Add source_count, page_count, and embedding model stats from DB."""
         kb.source_count = ctx.db.count_sources(kb.id)
         kb.page_count = ctx.db.count_wiki_pages(kb.id)
+        model_counts = ctx.db.count_chunks_by_embedding_model(kb.id)
+        kb.embedding_model_counts = model_counts
+        if model_counts:
+            kb.dominant_embedding_model = max(model_counts, key=lambda m: model_counts[m])
+        else:
+            kb.dominant_embedding_model = None
         return kb

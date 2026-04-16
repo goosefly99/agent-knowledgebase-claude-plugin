@@ -213,6 +213,7 @@ def dedup_service(test_config: Settings) -> KnowledgebaseService:
     svc = KnowledgebaseService(test_config)
     svc._embedder_instance = MagicMock()
     svc._embedder_instance.embed.side_effect = lambda texts: [[0.1, 0.2, 0.3]] * len(texts)
+    svc._embedder_instance.model_name = "test-embedder"
     svc._get_vectorstore = lambda kb_id: MagicMock(  # type: ignore[assignment]
         add=MagicMock(return_value=None),
         delete=MagicMock(return_value=None),

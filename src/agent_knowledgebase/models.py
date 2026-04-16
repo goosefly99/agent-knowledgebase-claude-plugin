@@ -93,6 +93,14 @@ class Knowledgebase(BaseModel):
     source_count: int = Field(default=0, description="Computed — not stored in DB")
     page_count: int = Field(default=0, description="Computed — not stored in DB")
     config: dict = Field(default_factory=dict)
+    dominant_embedding_model: Optional[str] = Field(
+        default=None,
+        description="Populated by kb_info from chunk metadata; not persisted.",
+    )
+    embedding_model_counts: dict[str, int] = Field(
+        default_factory=dict,
+        description="Populated by kb_info from chunk metadata; not persisted.",
+    )
 
 
 class Source(BaseModel):
