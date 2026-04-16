@@ -26,6 +26,7 @@ from agent_knowledgebase.models import (
     SourceType,
     WikiPage,
 )
+from agent_knowledgebase.services.dedup_service import DEFAULT_DEDUP_POLICY, DedupPolicy, resolve_dedup_action
 from agent_knowledgebase.services.embeddings import Embedder, create_embedder
 from agent_knowledgebase.services.export import MarkdownExporter
 from agent_knowledgebase.services.ingestion import IngestionOrchestrator
@@ -247,6 +248,8 @@ class KnowledgebaseService:
         source_type: SourceType,
         uri: str,
         metadata: dict | None = None,
+        dedup_key: str | None = None,
+        dedup_policy: DedupPolicy = DEFAULT_DEDUP_POLICY,
     ) -> Source:
         """Full ingestion pipeline for a new source."""
         ctx = self._ctx(kb_id)
@@ -256,6 +259,13 @@ class KnowledgebaseService:
         if kb is None:
             raise ValueError(f"KB {kb_id} not found")
 
+        # Dedup check
+        action, existing = resolve_dedup_action(ctx.db, kb_id, dedup_key, dedup_policy)
+        if action == "skip":
+            return existing  # type: ignore[return-value]
+        if action == "replace":
+            self.remove_source(existing.id)  # type: ignore[union-attr]
+
         # Create source record
         source = Source(
             kb_id=kb_id,
@@ -263,6 +273,7 @@ class KnowledgebaseService:
             uri=uri,
             metadata=metadata or {},
             status=SourceStatus.ingesting,
+            dedup_key=dedup_key or None,
         )
         ctx.db.insert_source(source)
 

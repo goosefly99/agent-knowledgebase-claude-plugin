@@ -22,7 +22,7 @@ from agent_knowledgebase.config_files import (
     write_candidate_and_validate,
 )
 from agent_knowledgebase.models import PageType, SourceType
-from agent_knowledgebase.services.kb_ingest_service import validate_batch_size
+from agent_knowledgebase.services.kb_ingest_service import normalize_dedup_policy, validate_batch_size
 from agent_knowledgebase.services.knowledgebase import KnowledgebaseService
 
 mcp = FastMCP(
@@ -100,7 +100,14 @@ def kb_delete(kb_id: str) -> str:
 
 
 @mcp.tool()
-def kb_ingest(kb_id: str, source_type: str, uri: str, metadata: str = "{}") -> str:
+def kb_ingest(
+    kb_id: str,
+    source_type: str,
+    uri: str,
+    metadata: str = "{}",
+    dedup_key: str | None = None,
+    dedup_policy: str = "skip",
+) -> str:
     """Ingest a source into a knowledgebase.
 
     Parameters:
@@ -108,25 +115,31 @@ def kb_ingest(kb_id: str, source_type: str, uri: str, metadata: str = "{}") -> s
         source_type: Type of source (file, directory, codebase, website, sql_database, git_history, api_endpoint).
         uri: Location or path of the source.
         metadata: JSON string of additional metadata.
+        dedup_key: Optional stable identifier. When provided, dedup_policy controls behaviour on collision.
+        dedup_policy: One of "skip" (default), "replace", "force-add". Ignored when dedup_key is absent.
 
-    Returns a JSON object of the created source.
+    Returns a JSON object of the created (or existing) source.
     """
     svc = _get_service()
     st = SourceType(source_type)
     meta = json.loads(metadata)
-    source = svc.ingest_source(kb_id, st, uri, meta)
+    policy = normalize_dedup_policy(dedup_policy)
+    source = svc.ingest_source(kb_id, st, uri, meta, dedup_key=dedup_key, dedup_policy=policy)
     return source.model_dump_json()
 
 
 @mcp.tool()
-def kb_ingest_batch(kb_id: str, sources: str) -> str:
+def kb_ingest_batch(kb_id: str, sources: str, dedup_policy: str = "skip") -> str:
     """Batch ingest multiple sources into a knowledgebase.
 
     Parameters:
         kb_id: ID of the target knowledgebase.
-        sources: JSON array of objects, each with keys: source_type, uri, metadata (optional).
+        sources: JSON array of objects, each with keys: source_type, uri, metadata (optional),
+            dedup_key (optional), dedup_policy (optional per-row override).
+        dedup_policy: Top-level default policy — "skip" (default), "replace", or "force-add".
+            Each row in sources may carry its own dedup_policy to override this default.
 
-    Returns a JSON array of created source objects.
+    Returns a JSON array of created (or existing) source objects.
 
     Raises:
         BatchSizeExceededError: If more than 50 rows with
@@ -140,13 +153,17 @@ def kb_ingest_batch(kb_id: str, sources: str) -> str:
     # round-3 debate synthesizer (overturning the spec's soft-warn).
     validate_batch_size(source_defs)
 
+    default_policy = normalize_dedup_policy(dedup_policy)
     svc = _get_service()
     results = []
     for item in source_defs:
         st = SourceType(item["source_type"])
         uri = item["uri"]
         meta = item.get("metadata", {})
-        source = svc.ingest_source(kb_id, st, uri, meta)
+        row_dedup_key = item.get("dedup_key") or None
+        row_policy_raw = item.get("dedup_policy")
+        row_policy = normalize_dedup_policy(row_policy_raw) if row_policy_raw else default_policy
+        source = svc.ingest_source(kb_id, st, uri, meta, dedup_key=row_dedup_key, dedup_policy=row_policy)
         results.append(source)
     return _serialize_model_list(results)
 

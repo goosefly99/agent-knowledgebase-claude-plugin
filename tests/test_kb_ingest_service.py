@@ -9,8 +9,7 @@ this module as the acceptance surface:
       -- (b) per-kb_id serialization via overlapping async calls,
       -- (c) each of skip/replace/force-add dedup policies.
 
-Only (a) lands in this commit -- the sequential-exec and dedup
-items are separate blocking roadmap lines.
+Items (a) and (c) are covered here.
 """
 
 from __future__ import annotations
@@ -20,13 +19,18 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from agent_knowledgebase.config import Settings
+from agent_knowledgebase.models import Chunk, SourceType
 from agent_knowledgebase.server import kb_ingest_batch
 from agent_knowledgebase.services.kb_ingest_service import (
     CODE_BATCH_SIZE_EXCEEDED,
     MAX_SQL_DATABASE_BATCH_SIZE,
     BatchSizeExceededError,
+    normalize_dedup_policy,
     validate_batch_size,
 )
+from agent_knowledgebase.services.dedup_service import DedupPolicy
+from agent_knowledgebase.services.knowledgebase import KnowledgebaseService
 
 
 # ---------------------------------------------------------------------------
@@ -170,3 +174,95 @@ def test_kb_ingest_batch_accepts_exactly_50_sql_database_rows(
     assert mock_service.ingest_source.call_count == 50
     # Result is a valid JSON array string.
     assert result.startswith("[") and result.endswith("]")
+
+
+# ---------------------------------------------------------------------------
+# normalize_dedup_policy unit tests
+# ---------------------------------------------------------------------------
+
+
+def test_normalize_dedup_policy_accepts_hyphen_form() -> None:
+    assert normalize_dedup_policy("force-add") == DedupPolicy.force_add
+
+
+def test_normalize_dedup_policy_accepts_underscore_form() -> None:
+    assert normalize_dedup_policy("force_add") == DedupPolicy.force_add
+
+
+def test_normalize_dedup_policy_returns_default_for_none() -> None:
+    assert normalize_dedup_policy(None) == DedupPolicy.skip
+
+
+def test_normalize_dedup_policy_rejects_unknown() -> None:
+    with pytest.raises(ValueError, match="Unknown dedup_policy"):
+        normalize_dedup_policy("garbage")
+
+
+# ---------------------------------------------------------------------------
+# (c) Dedup policy acceptance tests
+#
+# Each test uses a real KnowledgebaseService backed by tmp SQLite databases
+# (no network, no sentence-transformers) and asserts the resulting source
+# count after a re-ingest with the same dedup_key.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def dedup_service(test_config: Settings) -> KnowledgebaseService:
+    """KnowledgebaseService with mocked embedder, vectorstore, and ingestion."""
+    svc = KnowledgebaseService(test_config)
+    svc._embedder_instance = MagicMock()
+    svc._embedder_instance.embed.side_effect = lambda texts: [[0.1, 0.2, 0.3]] * len(texts)
+    svc._get_vectorstore = lambda kb_id: MagicMock(  # type: ignore[assignment]
+        add=MagicMock(return_value=None),
+        delete=MagicMock(return_value=None),
+    )
+    mock_ingestion = MagicMock()
+    # Return a fresh Chunk on every call so force_add (two inserts) produces
+    # distinct chunk IDs and doesn't hit a UNIQUE constraint on the second insert.
+    mock_ingestion.ingest.side_effect = lambda *_, **__: [
+        Chunk(source_id="", kb_id="", content="hello world", metadata={})
+    ]
+    svc._ingestion = mock_ingestion
+    return svc
+
+
+def test_dedup_policy_skip(dedup_service: KnowledgebaseService) -> None:
+    """skip: second ingest with same dedup_key returns existing source; total = 1."""
+    kb = dedup_service.create_kb("dedup-skip-kb")
+    first = dedup_service.ingest_source(
+        kb.id, SourceType.file, "/tmp/a.txt", dedup_key="X"
+    )
+    second = dedup_service.ingest_source(
+        kb.id, SourceType.file, "/tmp/b.txt", dedup_key="X", dedup_policy=DedupPolicy.skip
+    )
+    sources = dedup_service.list_sources(kb.id)
+    assert len(sources) == 1
+    assert second.id == first.id
+
+
+def test_dedup_policy_replace(dedup_service: KnowledgebaseService) -> None:
+    """replace: second ingest removes old source and inserts a new one; total = 1."""
+    kb = dedup_service.create_kb("dedup-replace-kb")
+    first = dedup_service.ingest_source(
+        kb.id, SourceType.file, "/tmp/a.txt", dedup_key="X"
+    )
+    second = dedup_service.ingest_source(
+        kb.id, SourceType.file, "/tmp/b.txt", dedup_key="X", dedup_policy=DedupPolicy.replace
+    )
+    sources = dedup_service.list_sources(kb.id)
+    assert len(sources) == 1
+    assert second.id != first.id
+
+
+def test_dedup_policy_force_add(dedup_service: KnowledgebaseService) -> None:
+    """force_add: second ingest ignores existing source and inserts another; total = 2."""
+    kb = dedup_service.create_kb("dedup-force-add-kb")
+    dedup_service.ingest_source(
+        kb.id, SourceType.file, "/tmp/a.txt", dedup_key="X"
+    )
+    dedup_service.ingest_source(
+        kb.id, SourceType.file, "/tmp/b.txt", dedup_key="X", dedup_policy=DedupPolicy.force_add
+    )
+    sources = dedup_service.list_sources(kb.id)
+    assert len(sources) == 2

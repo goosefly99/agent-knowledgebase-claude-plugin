@@ -106,6 +106,7 @@ class Source(BaseModel):
     ingested_at: Optional[datetime] = None
     chunk_count: int = 0
     status: SourceStatus = SourceStatus.pending
+    dedup_key: Optional[str] = None
 
 
 class WikiPage(BaseModel):

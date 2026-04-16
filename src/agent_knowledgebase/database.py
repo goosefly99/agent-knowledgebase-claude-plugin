@@ -38,7 +38,8 @@ CREATE TABLE IF NOT EXISTS sources (
     metadata TEXT,
     ingested_at TEXT,
     chunk_count INTEGER DEFAULT 0,
-    status TEXT NOT NULL DEFAULT 'pending'
+    status TEXT NOT NULL DEFAULT 'pending',
+    dedup_key TEXT
 );
 
 CREATE TABLE IF NOT EXISTS wiki_pages (
@@ -153,6 +154,12 @@ class Database:
         # SQLite builds, so we run it separately.
         cur.executescript(_FTS_SQL)
         self._conn.commit()
+        # Additive migration: add dedup_key column to pre-existing databases
+        # that were created before this column was added to the schema DDL.
+        cols = {row[1] for row in self._conn.execute("PRAGMA table_info(sources)").fetchall()}
+        if "dedup_key" not in cols:
+            self._conn.execute("ALTER TABLE sources ADD COLUMN dedup_key TEXT")
+            self._conn.commit()
 
     # ------------------------------------------------------------------
     # Connection lifecycle
@@ -217,8 +224,8 @@ class Database:
     def insert_source(self, source: Source) -> None:
         self._conn.execute(
             "INSERT INTO sources "
-            "(id, kb_id, source_type, uri, metadata, ingested_at, chunk_count, status) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "(id, kb_id, source_type, uri, metadata, ingested_at, chunk_count, status, dedup_key) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 source.id,
                 source.kb_id,
@@ -228,6 +235,7 @@ class Database:
                 _iso(source.ingested_at),
                 source.chunk_count,
                 source.status.value,
+                source.dedup_key,
             ),
         )
         self._conn.commit()
@@ -259,7 +267,18 @@ class Database:
             ingested_at=row["ingested_at"],
             chunk_count=row["chunk_count"],
             status=row["status"],
+            dedup_key=row["dedup_key"],
         )
+
+    def find_source_by_dedup_key(self, kb_id: str, dedup_key: str) -> Optional[Source]:
+        """Return the first Source in *kb_id* whose dedup_key matches, or None."""
+        row = self._conn.execute(
+            "SELECT * FROM sources WHERE kb_id = ? AND dedup_key = ? LIMIT 1",
+            (kb_id, dedup_key),
+        ).fetchone()
+        if row is None:
+            return None
+        return self._row_to_source(row)
 
     # ------------------------------------------------------------------
     # WikiPage CRUD
@@ -614,7 +633,7 @@ class Database:
         """Update an existing source record."""
         self._conn.execute(
             "UPDATE sources SET kb_id=?, source_type=?, uri=?, metadata=?, "
-            "ingested_at=?, chunk_count=?, status=? WHERE id=?",
+            "ingested_at=?, chunk_count=?, status=?, dedup_key=? WHERE id=?",
             (
                 source.kb_id,
                 source.source_type.value,
@@ -623,6 +642,7 @@ class Database:
                 _iso(source.ingested_at),
                 source.chunk_count,
                 source.status.value,
+                source.dedup_key,
                 source.id,
             ),
         )

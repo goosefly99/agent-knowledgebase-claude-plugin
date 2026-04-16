@@ -24,7 +24,9 @@ split into batches of at most :data:`MAX_SQL_DATABASE_BATCH_SIZE`.
 
 from __future__ import annotations
 
-from typing import Any, Iterable
+from typing import Any, Iterable, Optional
+
+from agent_knowledgebase.services.dedup_service import DEFAULT_DEDUP_POLICY, DedupPolicy
 
 # ---------------------------------------------------------------------------
 # Public constants
@@ -107,6 +109,29 @@ def _count_sql_database_rows(sources: Iterable[Any]) -> int:
         if item.get("source_type") == "sql_database":
             count += 1
     return count
+
+
+def normalize_dedup_policy(raw: Optional[str]) -> DedupPolicy:
+    """Parse and normalise a raw dedup-policy string.
+
+    Accepts ``"force-add"`` (hyphen) as an alias for ``"force_add"``
+    (underscore) so callers don't need to remember which separator is
+    canonical.  Returns :data:`DEFAULT_DEDUP_POLICY` when *raw* is
+    ``None`` or empty.
+
+    Raises:
+        ValueError: If *raw* is a non-empty string that names no known policy.
+    """
+    if not raw:
+        return DEFAULT_DEDUP_POLICY
+    normalised = raw.replace("-", "_")
+    try:
+        return DedupPolicy(normalised)
+    except ValueError:
+        valid = [p.value for p in DedupPolicy]
+        raise ValueError(
+            f"Unknown dedup_policy {raw!r}. Valid values: {valid} (hyphens accepted for 'force-add')."
+        )
 
 
 def validate_batch_size(sources: Iterable[Any]) -> None:

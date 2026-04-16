@@ -20,6 +20,7 @@ from agent_knowledgebase.models import (
     SourceType,
     WikiPage,
 )
+from agent_knowledgebase.services.dedup_service import DedupPolicy
 from agent_knowledgebase.server import (
     _serialize_dataclass,
     _serialize_dataclass_list,
@@ -220,7 +221,8 @@ class TestKbIngest:
         parsed = json.loads(result)
         assert parsed["source_type"] == "file"
         mock_service.ingest_source.assert_called_once_with(
-            "kb-1", SourceType.file, "/tmp/test.txt", {}
+            "kb-1", SourceType.file, "/tmp/test.txt", {},
+            dedup_key=None, dedup_policy=DedupPolicy.skip,
         )
 
     def test_with_metadata(self, mock_service):
@@ -228,7 +230,8 @@ class TestKbIngest:
         meta = json.dumps({"lang": "python"})
         kb_ingest("kb-1", "file", "/tmp/test.py", meta)
         mock_service.ingest_source.assert_called_once_with(
-            "kb-1", SourceType.file, "/tmp/test.py", {"lang": "python"}
+            "kb-1", SourceType.file, "/tmp/test.py", {"lang": "python"},
+            dedup_key=None, dedup_policy=DedupPolicy.skip,
         )
 
     def test_invalid_source_type(self, mock_service):
