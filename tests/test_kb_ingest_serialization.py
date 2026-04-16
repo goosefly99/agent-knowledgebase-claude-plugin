@@ -34,7 +34,6 @@ import pytest
 
 from agent_knowledgebase.config import Settings
 from agent_knowledgebase.models import Chunk, SourceType
-from agent_knowledgebase.services.dedup_service import DedupPolicy
 from agent_knowledgebase.services.knowledgebase import KnowledgebaseService
 
 
@@ -207,4 +206,111 @@ def test_ingest_logs_lock_acquire_and_release(
     )
     assert f"[kb-lock] released kb_id={kb.id}" in stderr, (
         f"Expected '[kb-lock] released kb_id={kb.id}' in stderr. Got:\n{stderr}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 4 — update_source serializes with concurrent ingest_source
+# ---------------------------------------------------------------------------
+
+
+def test_update_source_serializes_with_ingest() -> None:
+    """update_source and a concurrent ingest_source on the same kb_id must not overlap.
+
+    update_source must hold the kb_id lock for cleanup + re-ingest so that
+    a racing ingest_source cannot observe the torn state between chunk
+    deletion and chunk insertion.
+
+    Mocking strategy: mirror the bare-service approach used by tests 1 and 2.
+    ``_ingest_source_locked`` is mocked to record execution intervals.
+    ``db.delete_chunks_by_source`` and ``vectorstore.delete`` are mocked so
+    the cleanup path in update_source doesn't touch SQLite.
+    """
+    import threading as _threading
+
+    svc = KnowledgebaseService.__new__(KnowledgebaseService)
+    svc._kb_locks: dict = {}
+    svc._kb_locks_guard = _threading.Lock()
+
+    kb_id = "kb-update-test"
+    source_id = "src-001"
+
+    # Build a minimal fake source with the fields update_source reads.
+    from agent_knowledgebase.models import Source, SourceStatus
+
+    fake_source = Source(
+        kb_id=kb_id,
+        source_type=SourceType.file,
+        uri="/tmp/update-test.txt",
+        metadata={},
+        status=SourceStatus.ingested,
+    )
+    fake_source.id = source_id  # fix the id so we can look it up
+
+    # Minimal fake DB: get_source, list_chunks, delete_chunks_by_source
+    mock_db = MagicMock()
+    mock_db.get_source.return_value = fake_source
+    mock_db.list_chunks.return_value = []  # no old chunks to delete from vectorstore
+
+    # Minimal fake context: wrap the mock db in a _KBContext-shaped object.
+    mock_ctx = MagicMock()
+    mock_ctx.db = mock_db
+
+    # _find_context_by_source must return our fake context and the kb_id.
+    svc._find_context_by_source = MagicMock(return_value=(mock_ctx, kb_id))  # type: ignore[assignment]
+
+    # _get_vectorstore — not called because list_chunks returns [] but mock it anyway.
+    svc._get_vectorstore = MagicMock(return_value=MagicMock())  # type: ignore[assignment]
+
+    intervals: list[_Interval] = []
+    errors: list[Exception] = []
+
+    ready = threading.Event()
+    # Gate: thread 2 (ingest) should start just AFTER thread 1 (update) grabs the lock.
+    # We use a separate event to let thread 1 signal that it has acquired the lock.
+    lock_acquired = threading.Event()
+
+    def _slow_locked(kb_id_arg: str, *args: object, **kwargs: object) -> MagicMock:
+        """Mock pipeline body: record interval and sleep."""
+        t0 = time.monotonic()
+        time.sleep(0.15)
+        t1 = time.monotonic()
+        intervals.append(_Interval(t0, t1))
+        # Signal after the first call enters the body (update_source's re-ingest).
+        if not lock_acquired.is_set():
+            lock_acquired.set()
+        return MagicMock()
+
+    with patch.object(svc, "_ingest_source_locked", side_effect=_slow_locked):
+
+        def _run_update() -> None:
+            ready.wait()
+            try:
+                svc.update_source(source_id)
+            except Exception as exc:
+                errors.append(exc)
+
+        def _run_ingest() -> None:
+            # Wait until update_source has grabbed the lock before racing in.
+            lock_acquired.wait(timeout=5)
+            try:
+                svc.ingest_source(kb_id, SourceType.file, "/tmp/race.txt")
+            except Exception as exc:
+                errors.append(exc)
+
+        t1 = threading.Thread(target=_run_update)
+        t2 = threading.Thread(target=_run_ingest)
+        t1.start()
+        t2.start()
+        ready.set()
+        t1.join(timeout=10)
+        t2.join(timeout=10)
+
+    assert not errors, f"Thread errors: {errors}"
+    assert len(intervals) == 2, f"Expected 2 pipeline executions, got {len(intervals)}"
+
+    i0, i1 = intervals
+    assert not i0.overlaps(i1), (
+        f"Intervals overlapped — update_source lock coverage is missing or broken. "
+        f"interval[0]={i0}, interval[1]={i1}"
     )

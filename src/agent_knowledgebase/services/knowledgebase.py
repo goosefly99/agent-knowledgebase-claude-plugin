@@ -280,6 +280,12 @@ class KnowledgebaseService:
         del self._index[kb_id]
         _save_index(self._base_dir, self._index)
 
+        # Release the per-kb_id lock entry so it doesn't drift in long-running
+        # processes.  Safe to pop even if a worker still holds the lock object —
+        # the holder still owns the object; a future re-create will get a fresh one.
+        with self._kb_locks_guard:
+            self._kb_locks.pop(kb_id, None)
+
     # ------------------------------------------------------------------
     # Source Ingestion (Pipeline-Gated)
     # ------------------------------------------------------------------
@@ -415,20 +421,37 @@ class KnowledgebaseService:
             raise
 
     def update_source(self, source_id: str) -> Source:
-        """Re-ingest a source (delete old chunks/vectors, re-run pipeline)."""
+        """Re-ingest a source (delete old chunks/vectors, re-run pipeline).
+
+        The entire operation — cleanup *and* re-ingest — is serialised under the
+        per-kb_id lock so no concurrent ``ingest_source`` call can observe the
+        torn state between "old chunks deleted" and "new chunks inserted".
+        ``_ingest_source_locked`` is called directly (bypassing the lock
+        acquisition in ``ingest_source``) to avoid a self-deadlock, since
+        ``threading.Lock`` is non-reentrant.
+        """
         ctx, _ = self._find_context_by_source(source_id)
         source = ctx.db.get_source(source_id)
         if source is None:
             raise ValueError(f"Source {source_id} not found")
 
-        # Delete old chunks from vectorstore
-        old_chunks = ctx.db.list_chunks(source_id)
-        if old_chunks:
-            vs = self._get_vectorstore(source.kb_id)
-            vs.delete([c.id for c in old_chunks])
-        ctx.db.delete_chunks_by_source(source_id)
+        kb_id = source.kb_id
+        sys.stderr.write(f"[kb-lock] acquiring kb_id={kb_id}\n")
+        with self._get_kb_lock(kb_id):
+            sys.stderr.write(f"[kb-lock] acquired kb_id={kb_id}\n")
+            try:
+                # Delete old chunks from vectorstore
+                old_chunks = ctx.db.list_chunks(source_id)
+                if old_chunks:
+                    vs = self._get_vectorstore(kb_id)
+                    vs.delete([c.id for c in old_chunks])
+                ctx.db.delete_chunks_by_source(source_id)
 
-        return self.ingest_source(source.kb_id, source.source_type, source.uri, source.metadata)
+                return self._ingest_source_locked(
+                    kb_id, source.source_type, source.uri, source.metadata
+                )
+            finally:
+                sys.stderr.write(f"[kb-lock] released kb_id={kb_id}\n")
 
     def remove_source(self, source_id: str) -> None:
         """Remove a source and its chunks/vectors from the KB."""
