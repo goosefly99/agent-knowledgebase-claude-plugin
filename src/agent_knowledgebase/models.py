@@ -128,10 +128,33 @@ class WikiPage(BaseModel):
     updated_at: datetime = Field(default_factory=_utcnow)
     inbound_links: list[str] = Field(default_factory=list)
     outbound_links: list[str] = Field(default_factory=list)
-    # Denormalized from the first source (populated by list_pages, null when no sources).
-    source_type: Optional[str] = Field(default=None, exclude=False)
-    uri: Optional[str] = Field(default=None, exclude=False)
-    dedup_key: Optional[str] = Field(default=None, exclude=False)
+    source_type: Optional[str] = Field(
+        default=None,
+        description=(
+            "Denormalized from page.source_ids[0] (first entry in list order, not "
+            "chronological). Populated by KnowledgebaseService.list_pages only — "
+            "get_page, direct model construction, and direct DB reads leave this None. "
+            "Not persisted on the wiki_pages table."
+        ),
+    )
+    uri: Optional[str] = Field(
+        default=None,
+        description=(
+            "Denormalized from page.source_ids[0] (first entry in list order, not "
+            "chronological). Populated by KnowledgebaseService.list_pages only — "
+            "get_page, direct model construction, and direct DB reads leave this None. "
+            "Not persisted on the wiki_pages table."
+        ),
+    )
+    dedup_key: Optional[str] = Field(
+        default=None,
+        description=(
+            "Denormalized from page.source_ids[0] (first entry in list order, not "
+            "chronological). Populated by KnowledgebaseService.list_pages only — "
+            "get_page, direct model construction, and direct DB reads leave this None. "
+            "Not persisted on the wiki_pages table."
+        ),
+    )
 
     @computed_field  # type: ignore[prop-decorator]
     @property

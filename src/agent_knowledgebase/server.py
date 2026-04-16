@@ -344,6 +344,19 @@ def kb_list_pages(kb_id: str, page_type: str = "") -> str:
         kb_id: ID of the knowledgebase.
         page_type: Filter by page type (entity, concept, summary, index, comparison, synthesis). Empty string for all.
 
+    Each page object includes the standard wiki page fields plus the following
+    additive fields drawn from the first source in source_ids (first entry in
+    list order, not chronological):
+
+      - page_id:    alias of the page's id field (computed)
+      - source_type: source kind (e.g. "file", "website") from source_ids[0]
+      - uri:        source URI from source_ids[0]
+      - dedup_key:  dedup key from source_ids[0]
+
+    These fields are None when source_ids is empty, and are only populated by
+    this endpoint — get_page, direct model construction, and direct DB reads
+    leave them as None.
+
     Returns a JSON array of page objects.
     """
     svc = _get_service()
