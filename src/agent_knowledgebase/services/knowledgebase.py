@@ -431,7 +431,15 @@ class KnowledgebaseService:
     def list_pages(self, kb_id: str, page_type: PageType | None = None) -> list[WikiPage]:
         """List wiki pages in a KB, optionally filtered by type."""
         ctx = self._ctx(kb_id)
-        return ctx.wiki.list_pages(kb_id, page_type)
+        pages = ctx.wiki.list_pages(kb_id, page_type)
+        # Build a source lookup in one query, then stamp first-source fields onto each page.
+        sources = {s.id: s for s in ctx.db.list_sources(kb_id)}
+        for page in pages:
+            first_source = next((sources[sid] for sid in page.source_ids if sid in sources), None)
+            page.source_type = first_source.source_type.value if first_source else None
+            page.uri = first_source.uri if first_source else None
+            page.dedup_key = first_source.dedup_key if first_source else None
+        return pages
 
     def get_source(self, source_id: str) -> Source | None:
         """Get a source by ID (scans all KBs)."""

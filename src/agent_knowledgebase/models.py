@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 from typing import Optional
 from uuid import uuid4
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, computed_field
 
 
 # ---------------------------------------------------------------------------
@@ -108,6 +108,11 @@ class Source(BaseModel):
     status: SourceStatus = SourceStatus.pending
     dedup_key: Optional[str] = None
 
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def source_id(self) -> str:
+        return self.id
+
 
 class WikiPage(BaseModel):
     """A wiki page generated from ingested sources."""
@@ -123,6 +128,15 @@ class WikiPage(BaseModel):
     updated_at: datetime = Field(default_factory=_utcnow)
     inbound_links: list[str] = Field(default_factory=list)
     outbound_links: list[str] = Field(default_factory=list)
+    # Denormalized from the first source (populated by list_pages, null when no sources).
+    source_type: Optional[str] = Field(default=None, exclude=False)
+    uri: Optional[str] = Field(default=None, exclude=False)
+    dedup_key: Optional[str] = Field(default=None, exclude=False)
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def page_id(self) -> str:
+        return self.id
 
 
 class Chunk(BaseModel):
