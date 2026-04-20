@@ -102,3 +102,7 @@ The plugin exposes five tools for inspecting and mutating config at runtime:
 - `kb_config_get(key)` — one key with its resolved value and provenance layer.
 - `kb_config_set(scope, key, value)` — atomic write to user or project file with validation.
 - `kb_config_validate` — dry-run resolver; flags broken files before they break startup.
+
+## Multi-process deployments
+
+The kb server uses a per-`kb_id` `threading.Lock` that serializes ingest within a single Python process. For multi-process deployments, see [`docs/cross-process-lock-recipe.md`](docs/cross-process-lock-recipe.md) for opt-in locking recipes (`filelock`, `portalocker`, Postgres advisory lock, or raw `fcntl` / `msvcrt`). The built-in lock does NOT protect against concurrent ingest from a second server process. Enforcement of one of these recipes as a runtime dependency is tracked as a v0.4.0 planning item; until then, all four recipes are opt-in.

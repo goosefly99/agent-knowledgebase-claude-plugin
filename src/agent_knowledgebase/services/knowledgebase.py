@@ -16,6 +16,11 @@ This is **single-process-only** serialization — it does not coordinate
 across multiple Python processes.  Cross-process isolation (e.g.,
 Postgres advisory locks, filesystem ``flock``) is future work.
 
+Multi-process deployments: see ``docs/cross-process-lock-recipe.md``
+for opt-in ``filelock`` / ``portalocker`` / Postgres-advisory /
+raw-``fcntl`` recipes.  The built-in ``threading.Lock`` does NOT
+protect against concurrent ingest from a second Python process.
+
 Why ``threading.Lock`` and not ``asyncio.Lock``?
 Because this codebase is entirely synchronous — no ``async def``
 anywhere in ``src/agent_knowledgebase/``.  ``asyncio.Lock`` requires a

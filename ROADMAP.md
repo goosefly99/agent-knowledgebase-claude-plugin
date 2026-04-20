@@ -22,7 +22,7 @@ Language: Python 3.11+, uv, pydantic v2, chromadb, sqlalchemy, pytest.
 
 ## Recommended changes (ship if feasible)
 - [ ] Public-facing `docs/safe-where-clause-grammar.md` with the allow-list formally stated and 10 example filters users can copy.
-- [ ] Cross-process lock recipe documented (e.g. Postgres advisory lock or a filesystem `flock`) for future multi-worker deployments — document only in release 1; don't implement.
+- [x] Cross-process lock recipe documented (e.g. Postgres advisory lock or a filesystem `flock`) for future multi-worker deployments — document only in release 1; don't implement. Shipped in v0.6.0 as `docs/cross-process-lock-recipe.md`. Enforcement (graduating one recipe to a runtime dependency) remains unchecked as a v0.4.0 planning item.
 - [x] Structured `kb_pipeline_status` telemetry row per ingest run: `{kb_id, started_at, ended_at, ingested, skipped, replaced, failed, batch_size, dedup_policy}`. Shipped in v0.6.0 with additive `request_id` and `tool_caller_version` fields; `knowledgebase_stderr_log` helper lands alongside for structured stderr emissions.
 
 ## Accepted as-is
