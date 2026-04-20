@@ -8,6 +8,30 @@ Exposes an MCP server (`agent-knowledgebase`) packaged as a Claude Code plugin (
 
 Install the plugin from the marketplace entry `agent-knowledgebase-auto-dev`. See `pyproject.toml` for Python dependencies (Python >=3.11).
 
+## Ecosystem version floor
+
+This plugin ships as **v0.6.0** as the kb-first Stage 1 drop of the v0.3.0 sibling
+ecosystem (kb 0.6.0 + yt 0.5.0 + x-api 0.4.0). The `data-etl-orchestrator`
+contract probe (probe 4, ensemble-contract) refuses to dispatch unless
+`agent-knowledgebase >= 0.6.0`. If you pin an older version, the orchestrator
+will emit a structured upgrade message telling the user to install v0.6.0.
+See `skills/references/contract-probe-protocol.md` in the orchestrator repo
+for the full probe.
+
+## Consumer-side every-call stderr capture (R1 mitigation)
+
+Callers MUST tee the kb server's stderr to a log file per request — never
+fire-and-forget. The v0.6.0 `knowledgebase_stderr_log` helper emits a single
+structured JSON line per lifecycle phase (`kb_id`, `op`, `phase`,
+`elapsed_ms`, `rows_in`, `rows_ok`, `rows_skipped`, `rows_failed`,
+`dedup_policy`, `request_id`, `tool_caller_version`). Dropping these lines
+reopens the silent-DB-failure blind spot that probe 4 assertion (d) was
+designed to close — a composite-PK conflict on `tweets` (or equivalent kb
+write) will surface on stderr within 100 ms, but only if the caller is
+reading stderr. The orchestrator's probe 4 enforces this invariant at
+preflight; direct callers bypassing the orchestrator must replicate the
+stderr-tee discipline.
+
 ## Configuration
 
 The plugin resolves settings in four layers, highest priority last:
