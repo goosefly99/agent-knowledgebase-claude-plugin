@@ -195,18 +195,39 @@ def _log_svc(test_config: Settings) -> KnowledgebaseService:
 def test_ingest_logs_lock_acquire_and_release(
     _log_svc: KnowledgebaseService, capsys: pytest.CaptureFixture
 ) -> None:
-    """ingest_source must write [kb-lock] acquired and released lines to stderr."""
+    """ingest_source must emit structured lock-lifecycle JSON lines to stderr.
+
+    v0.6.0 routes the legacy ``[kb-lock] ...`` diagnostics through
+    ``knowledgebase_stderr_log`` — each line is single-line JSON with at
+    minimum ``kb_id``, ``op`` (``lock_acquired`` / ``lock_release``), and
+    ``phase="lock"``.
+    """
+    import json as _json
+
     kb = _log_svc.create_kb("log-kb")
     _log_svc.ingest_source(kb.id, SourceType.file, "/tmp/log-test.txt")
 
     captured = capsys.readouterr()
     stderr = captured.err
 
-    assert f"[kb-lock] acquired kb_id={kb.id}" in stderr, (
-        f"Expected '[kb-lock] acquired kb_id={kb.id}' in stderr. Got:\n{stderr}"
+    # Parse every JSON line on stderr and look for the acquired + release rows
+    # tagged with our kb id.
+    parsed: list[dict] = []
+    for raw_line in stderr.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            parsed.append(_json.loads(line))
+        except _json.JSONDecodeError:
+            # Not a structured log line (e.g. warning from other subsystems) — skip.
+            continue
+    ops = {(rec.get("kb_id"), rec.get("op")) for rec in parsed}
+    assert (kb.id, "lock_acquired") in ops, (
+        f"Expected lock_acquired JSON line for kb_id={kb.id}. Got stderr:\n{stderr}"
     )
-    assert f"[kb-lock] released kb_id={kb.id}" in stderr, (
-        f"Expected '[kb-lock] released kb_id={kb.id}' in stderr. Got:\n{stderr}"
+    assert (kb.id, "lock_release") in ops, (
+        f"Expected lock_release JSON line for kb_id={kb.id}. Got stderr:\n{stderr}"
     )
 
 

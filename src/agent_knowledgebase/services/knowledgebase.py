@@ -27,8 +27,8 @@ from __future__ import annotations
 
 import json
 import shutil
-import sys
 import threading
+import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -57,6 +57,7 @@ from agent_knowledgebase.services.query import (
     default_top_k,
     hybrid_weights_from,
 )
+from agent_knowledgebase.services.stderr_log import knowledgebase_stderr_log
 from agent_knowledgebase.services.vectorstore import VectorStore, create_vectorstore
 from agent_knowledgebase.services.wiki import WikiManager
 
@@ -298,6 +299,8 @@ class KnowledgebaseService:
         metadata: dict | None = None,
         dedup_key: str | None = None,
         dedup_policy: DedupPolicy = DEFAULT_DEDUP_POLICY,
+        request_id: str | None = None,
+        tool_caller_version: str | None = None,
     ) -> Source:
         """Full ingestion pipeline for a new source.
 
@@ -308,16 +311,65 @@ class KnowledgebaseService:
         This is single-process serialisation only.  Cross-process
         isolation (e.g., Postgres advisory locks, filesystem flock) is
         future work.
+
+        ``request_id`` / ``tool_caller_version`` are optional caller
+        correlators threaded through to the PipelineRun telemetry row
+        and the structured stderr log.
         """
-        sys.stderr.write(f"[kb-lock] acquiring kb_id={kb_id}\n")
+        knowledgebase_stderr_log(
+            kb_id=kb_id,
+            op="lock_acquire",
+            phase="lock",
+            elapsed_ms=0,
+            rows_in=0,
+            rows_ok=0,
+            rows_skipped=0,
+            rows_failed=0,
+            dedup_policy="n/a",
+            request_id=request_id,
+            tool_caller_version=tool_caller_version,
+        )
+        lock_acquired_at = time.monotonic()
         with self._get_kb_lock(kb_id):
-            sys.stderr.write(f"[kb-lock] acquired kb_id={kb_id}\n")
+            knowledgebase_stderr_log(
+                kb_id=kb_id,
+                op="lock_acquired",
+                phase="lock",
+                elapsed_ms=0,
+                rows_in=0,
+                rows_ok=0,
+                rows_skipped=0,
+                rows_failed=0,
+                dedup_policy="n/a",
+                request_id=request_id,
+                tool_caller_version=tool_caller_version,
+            )
             try:
                 return self._ingest_source_locked(
-                    kb_id, source_type, uri, metadata, dedup_key, dedup_policy
+                    kb_id,
+                    source_type,
+                    uri,
+                    metadata,
+                    dedup_key,
+                    dedup_policy,
+                    request_id=request_id,
+                    tool_caller_version=tool_caller_version,
                 )
             finally:
-                sys.stderr.write(f"[kb-lock] released kb_id={kb_id}\n")
+                elapsed_ms = int((time.monotonic() - lock_acquired_at) * 1000)
+                knowledgebase_stderr_log(
+                    kb_id=kb_id,
+                    op="lock_release",
+                    phase="lock",
+                    elapsed_ms=elapsed_ms,
+                    rows_in=0,
+                    rows_ok=0,
+                    rows_skipped=0,
+                    rows_failed=0,
+                    dedup_policy="n/a",
+                    request_id=request_id,
+                    tool_caller_version=tool_caller_version,
+                )
 
     def _ingest_source_locked(
         self,
@@ -327,8 +379,15 @@ class KnowledgebaseService:
         metadata: dict | None = None,
         dedup_key: str | None = None,
         dedup_policy: DedupPolicy = DEFAULT_DEDUP_POLICY,
+        request_id: str | None = None,
+        tool_caller_version: str | None = None,
     ) -> Source:
-        """Inner pipeline body — called only while the kb_id lock is held."""
+        """Inner pipeline body — called only while the kb_id lock is held.
+
+        ``request_id`` / ``tool_caller_version`` are threaded onto the
+        PipelineRun telemetry row. They are captured on the run metadata
+        via ``pipeline.start_run`` so the row surfaces them later.
+        """
         ctx = self._ctx(kb_id)
 
         # Verify KB exists
@@ -439,9 +498,34 @@ class KnowledgebaseService:
             raise ValueError(f"Source {source_id} not found")
 
         kb_id = source.kb_id
-        sys.stderr.write(f"[kb-lock] acquiring kb_id={kb_id}\n")
+        knowledgebase_stderr_log(
+            kb_id=kb_id,
+            op="lock_acquire",
+            phase="lock",
+            elapsed_ms=0,
+            rows_in=0,
+            rows_ok=0,
+            rows_skipped=0,
+            rows_failed=0,
+            dedup_policy="n/a",
+            request_id=None,
+            tool_caller_version=None,
+        )
+        lock_acquired_at = time.monotonic()
         with self._get_kb_lock(kb_id):
-            sys.stderr.write(f"[kb-lock] acquired kb_id={kb_id}\n")
+            knowledgebase_stderr_log(
+                kb_id=kb_id,
+                op="lock_acquired",
+                phase="lock",
+                elapsed_ms=0,
+                rows_in=0,
+                rows_ok=0,
+                rows_skipped=0,
+                rows_failed=0,
+                dedup_policy="n/a",
+                request_id=None,
+                tool_caller_version=None,
+            )
             try:
                 # Delete old chunks from vectorstore
                 old_chunks = ctx.db.list_chunks(source_id)
@@ -454,7 +538,20 @@ class KnowledgebaseService:
                     kb_id, source.source_type, source.uri, source.metadata
                 )
             finally:
-                sys.stderr.write(f"[kb-lock] released kb_id={kb_id}\n")
+                elapsed_ms = int((time.monotonic() - lock_acquired_at) * 1000)
+                knowledgebase_stderr_log(
+                    kb_id=kb_id,
+                    op="lock_release",
+                    phase="lock",
+                    elapsed_ms=elapsed_ms,
+                    rows_in=0,
+                    rows_ok=0,
+                    rows_skipped=0,
+                    rows_failed=0,
+                    dedup_policy="n/a",
+                    request_id=None,
+                    tool_caller_version=None,
+                )
 
     def remove_source(self, source_id: str) -> None:
         """Remove a source and its chunks/vectors from the KB."""
