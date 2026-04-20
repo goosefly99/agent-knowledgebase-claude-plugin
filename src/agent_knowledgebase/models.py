@@ -182,7 +182,14 @@ class Chunk(BaseModel):
 
 
 class PipelineRun(BaseModel):
-    """A single pipeline execution record."""
+    """A single pipeline execution record.
+
+    The v0.6.0 kb-pipeline-status telemetry row adds 9 additive fields
+    carried through from :class:`KnowledgebaseService` to the
+    ``kb_pipeline_status`` MCP tool's JSON response. All are ``Optional``
+    with ``None`` default so existing rows (ingested before the schema
+    migration ran) remain readable unchanged.
+    """
 
     id: str = Field(default_factory=_uuid)
     kb_id: str
@@ -193,3 +200,13 @@ class PipelineRun(BaseModel):
     completed_at: Optional[datetime] = None
     error: Optional[str] = None
     metadata: dict = Field(default_factory=dict)
+    # v0.6.0 telemetry row additions (all additive / optional):
+    ended_at: Optional[datetime] = None
+    ingested: Optional[int] = None
+    skipped: Optional[int] = None
+    replaced: Optional[int] = None
+    failed: Optional[int] = None
+    batch_size: Optional[int] = None
+    dedup_policy: Optional[str] = None
+    request_id: Optional[str] = None
+    tool_caller_version: Optional[str] = None

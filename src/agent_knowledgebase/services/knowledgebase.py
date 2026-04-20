@@ -40,6 +40,7 @@ from agent_knowledgebase.models import (
     Knowledgebase,
     PageType,
     PipelineRun,
+    RunStatus,
     Source,
     SourceStatus,
     SourceType,
@@ -301,6 +302,7 @@ class KnowledgebaseService:
         dedup_policy: DedupPolicy = DEFAULT_DEDUP_POLICY,
         request_id: str | None = None,
         tool_caller_version: str | None = None,
+        batch_size: int | None = None,
     ) -> Source:
         """Full ingestion pipeline for a new source.
 
@@ -312,9 +314,9 @@ class KnowledgebaseService:
         isolation (e.g., Postgres advisory locks, filesystem flock) is
         future work.
 
-        ``request_id`` / ``tool_caller_version`` are optional caller
-        correlators threaded through to the PipelineRun telemetry row
-        and the structured stderr log.
+        ``request_id`` / ``tool_caller_version`` / ``batch_size`` are
+        optional caller correlators threaded through to the
+        PipelineRun telemetry row and the structured stderr log.
         """
         knowledgebase_stderr_log(
             kb_id=kb_id,
@@ -354,6 +356,7 @@ class KnowledgebaseService:
                     dedup_policy,
                     request_id=request_id,
                     tool_caller_version=tool_caller_version,
+                    batch_size=batch_size,
                 )
             finally:
                 elapsed_ms = int((time.monotonic() - lock_acquired_at) * 1000)
@@ -381,12 +384,17 @@ class KnowledgebaseService:
         dedup_policy: DedupPolicy = DEFAULT_DEDUP_POLICY,
         request_id: str | None = None,
         tool_caller_version: str | None = None,
+        batch_size: int | None = None,
     ) -> Source:
         """Inner pipeline body — called only while the kb_id lock is held.
 
-        ``request_id`` / ``tool_caller_version`` are threaded onto the
-        PipelineRun telemetry row. They are captured on the run metadata
-        via ``pipeline.start_run`` so the row surfaces them later.
+        ``request_id`` / ``tool_caller_version`` / ``batch_size`` are
+        captured on the PipelineRun v0.6.0 telemetry row along with the
+        resolved dedup counters (``ingested`` / ``skipped`` / ``replaced``
+        / ``failed``) and the ``ended_at`` wall-clock timestamp.
+
+        A telemetry row is written for every outcome including ``skip``
+        so callers can see the skip via ``kb_pipeline_status``.
         """
         ctx = self._ctx(kb_id)
 
@@ -395,12 +403,34 @@ class KnowledgebaseService:
         if kb is None:
             raise ValueError(f"KB {kb_id} not found")
 
+        policy_value = (
+            dedup_policy.value if isinstance(dedup_policy, DedupPolicy) else str(dedup_policy)
+        )
+
         # Dedup check
         action, existing = resolve_dedup_action(ctx.db, kb_id, dedup_key, dedup_policy)
+
+        # Skip outcome: emit a telemetry row and return the existing source.
         if action == "skip":
+            skip_run = ctx.pipeline.start_run(kb_id, existing.id if existing else None)  # type: ignore[union-attr]
+            skip_run.status = RunStatus.completed
+            skip_run.completed_at = datetime.now(UTC)
+            skip_run.ended_at = skip_run.completed_at
+            skip_run.ingested = 0
+            skip_run.skipped = 1
+            skip_run.replaced = 0
+            skip_run.failed = 0
+            skip_run.batch_size = batch_size
+            skip_run.dedup_policy = policy_value
+            skip_run.request_id = request_id
+            skip_run.tool_caller_version = tool_caller_version
+            ctx.db.update_pipeline_run(skip_run)
             return existing  # type: ignore[return-value]
+
+        replaced_count = 0
         if action == "replace":
             self.remove_source(existing.id)  # type: ignore[union-attr]
+            replaced_count = 1
 
         # Create source record
         source = Source(
@@ -415,6 +445,14 @@ class KnowledgebaseService:
 
         # Start pipeline
         run = ctx.pipeline.start_run(kb_id, source.id)
+        # Stamp the telemetry-row capture fields early so they survive
+        # a mid-pipeline failure.
+        run.batch_size = batch_size
+        run.dedup_policy = policy_value
+        run.request_id = request_id
+        run.tool_caller_version = tool_caller_version
+        run.replaced = replaced_count
+        ctx.db.update_pipeline_run(run)
 
         try:
             # Phase 1: initialize
@@ -474,12 +512,39 @@ class KnowledgebaseService:
             ctx.db.update_source(source)
             ctx.pipeline.complete_phase(run.id)
 
+            # v0.6.0 telemetry row — final counters & ended_at.
+            final_run = ctx.pipeline.get_run(run.id)
+            if final_run is not None:
+                final_run.ended_at = datetime.now(UTC)
+                final_run.ingested = 1
+                final_run.skipped = 0
+                final_run.replaced = replaced_count
+                final_run.failed = 0
+                final_run.batch_size = batch_size
+                final_run.dedup_policy = policy_value
+                final_run.request_id = request_id
+                final_run.tool_caller_version = tool_caller_version
+                ctx.db.update_pipeline_run(final_run)
+
             return source
 
         except Exception as e:
             ctx.pipeline.fail_phase(run.id, str(e))
             source.status = SourceStatus.failed
             ctx.db.update_source(source)
+            # v0.6.0 telemetry row — record failure counters.
+            fail_run = ctx.pipeline.get_run(run.id)
+            if fail_run is not None:
+                fail_run.ended_at = datetime.now(UTC)
+                fail_run.ingested = 0
+                fail_run.skipped = 0
+                fail_run.replaced = replaced_count
+                fail_run.failed = 1
+                fail_run.batch_size = batch_size
+                fail_run.dedup_policy = policy_value
+                fail_run.request_id = request_id
+                fail_run.tool_caller_version = tool_caller_version
+                ctx.db.update_pipeline_run(fail_run)
             raise
 
     def update_source(self, source_id: str) -> Source:

@@ -160,6 +160,34 @@ class Database:
         if "dedup_key" not in cols:
             self._conn.execute("ALTER TABLE sources ADD COLUMN dedup_key TEXT")
             self._conn.commit()
+        # v0.6.0 additive migration: the kb-pipeline-status telemetry row
+        # adds 9 new columns to `pipeline_runs`. Additive-only; running
+        # _init_schema twice is a no-op (guarded by PRAGMA column probe).
+        # Rollback SQL is documented in CHANGELOG.md.
+        run_cols = {
+            row[1]
+            for row in self._conn.execute("PRAGMA table_info(pipeline_runs)").fetchall()
+        }
+        _PIPELINE_RUN_MIGRATION_COLUMNS: list[tuple[str, str]] = [
+            ("ended_at", "TEXT"),
+            ("ingested", "INTEGER"),
+            ("skipped", "INTEGER"),
+            ("replaced", "INTEGER"),
+            ("failed", "INTEGER"),
+            ("batch_size", "INTEGER"),
+            ("dedup_policy", "TEXT"),
+            ("request_id", "TEXT"),
+            ("tool_caller_version", "TEXT"),
+        ]
+        added_any = False
+        for col_name, col_type in _PIPELINE_RUN_MIGRATION_COLUMNS:
+            if col_name not in run_cols:
+                self._conn.execute(
+                    f"ALTER TABLE pipeline_runs ADD COLUMN {col_name} {col_type}"
+                )
+                added_any = True
+        if added_any:
+            self._conn.commit()
 
     # ------------------------------------------------------------------
     # Connection lifecycle
@@ -546,8 +574,10 @@ class Database:
     def insert_pipeline_run(self, run: PipelineRun) -> None:
         self._conn.execute(
             "INSERT INTO pipeline_runs "
-            "(id, kb_id, source_id, phase, status, started_at, completed_at, error, metadata) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "(id, kb_id, source_id, phase, status, started_at, completed_at, error, metadata, "
+            "ended_at, ingested, skipped, replaced, failed, batch_size, dedup_policy, "
+            "request_id, tool_caller_version) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 run.id,
                 run.kb_id,
@@ -558,6 +588,15 @@ class Database:
                 _iso(run.completed_at),
                 run.error,
                 _json_dumps(run.metadata),
+                _iso(run.ended_at),
+                run.ingested,
+                run.skipped,
+                run.replaced,
+                run.failed,
+                run.batch_size,
+                run.dedup_policy,
+                run.request_id,
+                run.tool_caller_version,
             ),
         )
         self._conn.commit()
@@ -579,8 +618,28 @@ class Database:
     def update_pipeline_run(self, run: PipelineRun) -> None:
         """Update an existing pipeline run record."""
         self._conn.execute(
-            "UPDATE pipeline_runs SET phase=?, status=?, started_at=?, completed_at=?, error=?, metadata=? WHERE id=?",
-            (run.phase.value, run.status.value, _iso(run.started_at), _iso(run.completed_at), run.error, _json_dumps(run.metadata), run.id),
+            "UPDATE pipeline_runs SET phase=?, status=?, started_at=?, completed_at=?, "
+            "error=?, metadata=?, ended_at=?, ingested=?, skipped=?, replaced=?, "
+            "failed=?, batch_size=?, dedup_policy=?, request_id=?, tool_caller_version=? "
+            "WHERE id=?",
+            (
+                run.phase.value,
+                run.status.value,
+                _iso(run.started_at),
+                _iso(run.completed_at),
+                run.error,
+                _json_dumps(run.metadata),
+                _iso(run.ended_at),
+                run.ingested,
+                run.skipped,
+                run.replaced,
+                run.failed,
+                run.batch_size,
+                run.dedup_policy,
+                run.request_id,
+                run.tool_caller_version,
+                run.id,
+            ),
         )
         self._conn.commit()
 
@@ -590,6 +649,14 @@ class Database:
 
     @staticmethod
     def _row_to_pipeline_run(row: sqlite3.Row) -> PipelineRun:
+        # The new v0.6.0 columns may not be present on rows inserted before
+        # the migration ran (sqlite3.Row access raises IndexError for absent
+        # keys). Probe the row's keys so this helper keeps working on legacy
+        # databases that haven't been re-opened through `_init_schema` yet.
+        try:
+            keys = set(row.keys())
+        except AttributeError:  # pragma: no cover — defensive for non-Row rows
+            keys = set()
         return PipelineRun(
             id=row["id"],
             kb_id=row["kb_id"],
@@ -600,6 +667,17 @@ class Database:
             completed_at=row["completed_at"],
             error=row["error"],
             metadata=_json_loads(row["metadata"]) or {},
+            ended_at=row["ended_at"] if "ended_at" in keys else None,
+            ingested=row["ingested"] if "ingested" in keys else None,
+            skipped=row["skipped"] if "skipped" in keys else None,
+            replaced=row["replaced"] if "replaced" in keys else None,
+            failed=row["failed"] if "failed" in keys else None,
+            batch_size=row["batch_size"] if "batch_size" in keys else None,
+            dedup_policy=row["dedup_policy"] if "dedup_policy" in keys else None,
+            request_id=row["request_id"] if "request_id" in keys else None,
+            tool_caller_version=(
+                row["tool_caller_version"] if "tool_caller_version" in keys else None
+            ),
         )
 
     # ------------------------------------------------------------------

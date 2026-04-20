@@ -22,7 +22,11 @@ from agent_knowledgebase.config_files import (
     write_candidate_and_validate,
 )
 from agent_knowledgebase.models import PageType, SourceType
-from agent_knowledgebase.services.kb_ingest_service import normalize_dedup_policy, validate_batch_size
+from agent_knowledgebase.services.kb_ingest_service import (
+    normalize_dedup_policy,
+    run_ingest_batch,
+    validate_batch_size,
+)
 from agent_knowledgebase.services.knowledgebase import KnowledgebaseService
 
 mcp = FastMCP(
@@ -155,16 +159,15 @@ def kb_ingest_batch(kb_id: str, sources: str, dedup_policy: str = "skip") -> str
 
     default_policy = normalize_dedup_policy(dedup_policy)
     svc = _get_service()
-    results = []
-    for item in source_defs:
-        st = SourceType(item["source_type"])
-        uri = item["uri"]
-        meta = item.get("metadata", {})
-        row_dedup_key = item.get("dedup_key") or None
-        row_policy_raw = item.get("dedup_policy")
-        row_policy = normalize_dedup_policy(row_policy_raw) if row_policy_raw else default_policy
-        source = svc.ingest_source(kb_id, st, uri, meta, dedup_key=row_dedup_key, dedup_policy=row_policy)
-        results.append(source)
+    # `request_id` / `tool_caller_version` are not surfaced on this MCP
+    # tool's signature (stable contract) — the batch runner synthesizes
+    # a request_id internally so the v0.6.0 telemetry row is populated.
+    results = run_ingest_batch(
+        svc,
+        kb_id,
+        source_defs,
+        default_policy=default_policy,
+    )
     return _serialize_model_list(results)
 
 

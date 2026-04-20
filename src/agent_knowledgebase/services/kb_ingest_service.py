@@ -24,9 +24,16 @@ split into batches of at most :data:`MAX_SQL_DATABASE_BATCH_SIZE`.
 
 from __future__ import annotations
 
-from typing import Any, Iterable, Optional
+import time
+import uuid
+from typing import TYPE_CHECKING, Any, Iterable, Optional
 
+from agent_knowledgebase.models import Source, SourceType
 from agent_knowledgebase.services.dedup_service import DEFAULT_DEDUP_POLICY, DedupPolicy
+from agent_knowledgebase.services.stderr_log import knowledgebase_stderr_log
+
+if TYPE_CHECKING:
+    from agent_knowledgebase.services.knowledgebase import KnowledgebaseService
 
 # ---------------------------------------------------------------------------
 # Public constants
@@ -159,3 +166,179 @@ def validate_batch_size(sources: Iterable[Any]) -> None:
     count = _count_sql_database_rows(sources)
     if count > MAX_SQL_DATABASE_BATCH_SIZE:
         raise BatchSizeExceededError(received=count)
+
+
+# ---------------------------------------------------------------------------
+# Batch entry point (v0.6.0)
+# ---------------------------------------------------------------------------
+
+
+def run_ingest_batch(
+    service: "KnowledgebaseService",
+    kb_id: str,
+    source_defs: list[dict[str, Any]],
+    default_policy: DedupPolicy = DEFAULT_DEDUP_POLICY,
+    request_id: Optional[str] = None,
+    tool_caller_version: Optional[str] = None,
+) -> list[Source]:
+    """Execute a batch ingest with structured stderr telemetry.
+
+    Emits one ``ingest_batch_start`` stderr line before the loop, one
+    ``ingest_source`` line per source outcome, and one
+    ``ingest_batch_end`` line with summed counters after the loop.
+
+    A ``request_id`` is synthesized when not supplied so every
+    PipelineRun telemetry row carries one.
+
+    Args:
+        service: The ``KnowledgebaseService`` that owns the
+            knowledgebase. Used only for its ``ingest_source`` method
+            so this function is trivially mockable in tests.
+        kb_id: Target knowledgebase id.
+        source_defs: Already-decoded list of source specification dicts
+            (each with at minimum ``source_type`` and ``uri`` keys and
+            optionally ``metadata``, ``dedup_key`` and
+            ``dedup_policy``).
+        default_policy: Top-level default dedup policy used when a
+            row-level ``dedup_policy`` is not provided.
+        request_id: Caller-supplied correlation id. A new uuid4 hex is
+            synthesized when this is ``None`` so the telemetry row is
+            always populated.
+        tool_caller_version: Caller-supplied semver string; may be
+            ``None``.
+
+    Returns:
+        List of :class:`Source` results from each ``ingest_source``
+        call, in input order.
+    """
+    if request_id is None:
+        request_id = uuid.uuid4().hex
+
+    default_policy_value = default_policy.value if isinstance(
+        default_policy, DedupPolicy
+    ) else str(default_policy)
+
+    batch_size = len(source_defs)
+    batch_start = time.monotonic()
+    knowledgebase_stderr_log(
+        kb_id=kb_id,
+        op="ingest_batch_start",
+        phase="pre_run",
+        elapsed_ms=0,
+        rows_in=batch_size,
+        rows_ok=0,
+        rows_skipped=0,
+        rows_failed=0,
+        dedup_policy=default_policy_value,
+        request_id=request_id,
+        tool_caller_version=tool_caller_version,
+    )
+
+    results: list[Source] = []
+    rows_ok = 0
+    rows_skipped = 0
+    rows_failed = 0
+
+    for item in source_defs:
+        st = SourceType(item["source_type"])
+        uri = item["uri"]
+        meta = item.get("metadata", {})
+        row_dedup_key = item.get("dedup_key") or None
+        row_policy_raw = item.get("dedup_policy")
+        row_policy = normalize_dedup_policy(row_policy_raw) if row_policy_raw else default_policy
+        row_policy_value = row_policy.value if isinstance(
+            row_policy, DedupPolicy
+        ) else str(row_policy)
+
+        item_start = time.monotonic()
+        # Snapshot existing source id (if any) to detect skip vs. replace vs. insert.
+        ctx = service._ctx(kb_id)  # noqa: SLF001 — internal plumbing by design
+        pre_existing = (
+            ctx.db.find_source_by_dedup_key(kb_id, row_dedup_key)
+            if row_dedup_key
+            else None
+        )
+
+        try:
+            source = service.ingest_source(
+                kb_id,
+                st,
+                uri,
+                meta,
+                dedup_key=row_dedup_key,
+                dedup_policy=row_policy,
+                request_id=request_id,
+                tool_caller_version=tool_caller_version,
+                batch_size=batch_size,
+            )
+            results.append(source)
+            # Classify the outcome for the per-source telemetry line.
+            if (
+                pre_existing is not None
+                and row_policy == DedupPolicy.skip
+                and source.id == pre_existing.id
+            ):
+                op = "ingest_source"
+                phase = "post_run"
+                row_ok_delta = 0
+                row_skipped_delta = 1
+                row_failed_delta = 0
+            else:
+                op = "ingest_source"
+                phase = "finalize"
+                row_ok_delta = 1
+                row_skipped_delta = 0
+                row_failed_delta = 0
+
+            rows_ok += row_ok_delta
+            rows_skipped += row_skipped_delta
+            rows_failed += row_failed_delta
+            elapsed_ms = int((time.monotonic() - item_start) * 1000)
+            knowledgebase_stderr_log(
+                kb_id=kb_id,
+                op=op,
+                phase=phase,
+                elapsed_ms=elapsed_ms,
+                rows_in=1,
+                rows_ok=row_ok_delta,
+                rows_skipped=row_skipped_delta,
+                rows_failed=row_failed_delta,
+                dedup_policy=row_policy_value,
+                request_id=request_id,
+                tool_caller_version=tool_caller_version,
+            )
+        except Exception as exc:
+            rows_failed += 1
+            elapsed_ms = int((time.monotonic() - item_start) * 1000)
+            knowledgebase_stderr_log(
+                kb_id=kb_id,
+                op="ingest_source",
+                phase="post_run",
+                elapsed_ms=elapsed_ms,
+                rows_in=1,
+                rows_ok=0,
+                rows_skipped=0,
+                rows_failed=1,
+                dedup_policy=row_policy_value,
+                request_id=request_id,
+                tool_caller_version=tool_caller_version,
+                error_code="INGEST_SOURCE_FAILED",
+                error_message=str(exc),
+            )
+            raise
+
+    total_elapsed_ms = int((time.monotonic() - batch_start) * 1000)
+    knowledgebase_stderr_log(
+        kb_id=kb_id,
+        op="ingest_batch_end",
+        phase="post_run",
+        elapsed_ms=total_elapsed_ms,
+        rows_in=batch_size,
+        rows_ok=rows_ok,
+        rows_skipped=rows_skipped,
+        rows_failed=rows_failed,
+        dedup_policy=default_policy_value,
+        request_id=request_id,
+        tool_caller_version=tool_caller_version,
+    )
+    return results
