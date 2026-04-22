@@ -124,12 +124,12 @@ class TestNestedJsonConfigSettingsSourceLoad:
     def test_flattening(self, tmp_path: Path) -> None:
         f = tmp_path / "cfg.json"
         f.write_text(json.dumps({
-            "embedding": {"provider": "openai", "model": "text-embedding-3-small"},
+            "embedding": {"provider": "remote", "model": "text-embedding-3-small"},
             "chunk": {"size": 256},
             "query": {"hybrid": {"vector_weight": 0.6}},
         }))
         result = _load(f)
-        assert result["embedding_provider"] == "openai"
+        assert result["embedding_provider"] == "remote"
         assert result["embedding_model"] == "text-embedding-3-small"
         assert result["chunk_size"] == 256
         assert result["query_hybrid_vector_weight"] == 0.6
@@ -157,7 +157,7 @@ class TestNestedJsonConfigSettingsSourceLoad:
     @pytest.mark.parametrize(
         "forbidden_key,forbidden_container",
         [
-            ("openai_api_key", {"openai_api_key": "sk-..."}),
+            ("embed_api_key", {"embed_api_key": "sk-..."}),
             ("pinecone_api_key", {"pinecone": {"api_key": "..."}}),
             ("saves_dir", {"saves_dir": "/some/path"}),
         ],

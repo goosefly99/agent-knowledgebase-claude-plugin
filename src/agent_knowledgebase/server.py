@@ -22,6 +22,7 @@ from agent_knowledgebase.config_files import (
     write_candidate_and_validate,
 )
 from agent_knowledgebase.models import PageType, SourceType
+from agent_knowledgebase.services.embeddings import EmbedderUnavailableError
 from agent_knowledgebase.services.kb_ingest_service import (
     normalize_dedup_policy,
     run_ingest_batch,
@@ -300,10 +301,16 @@ def kb_query(kb_id: str, text: str, top_k: int | None = None) -> str:
         text: The query text.
         top_k: Maximum number of results to return; defaults to ``query_default_top_k`` if omitted.
 
-    Returns a JSON array of search results.
+    Returns a JSON array of search results. When the embedder backend is
+    unreachable or exceeds its wall-clock bound, returns a single JSON
+    object instead: ``{"error": "embed_timeout"|"embed_unreachable",
+    "model": ..., "phase": "embed_query", "latency_ms": ..., "detail": ...}``.
     """
     svc = _get_service()
-    results = svc.query(kb_id, text, top_k)
+    try:
+        results = svc.query(kb_id, text, top_k)
+    except EmbedderUnavailableError as exc:
+        return json.dumps(exc.to_payload())
     return _serialize_dataclass_list(results)
 
 

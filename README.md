@@ -49,7 +49,7 @@ The plugin resolves settings in four layers, highest priority last:
 
 These must always come from the environment. Setting them in a JSON config file is rejected loudly.
 
-- `AGENT_KB_OPENAI_API_KEY` — OpenAI key (only needed for `embedding.provider = "openai"`).
+- `AGENT_KB_EMBED_API_KEY` — Bearer token for the remote embeddings endpoint (only needed for `embedding.provider = "remote"`; use any placeholder for servers that ignore auth such as local Ollama).
 - `AGENT_KB_PINECONE_API_KEY` — Pinecone key (only needed for `vectorstore = "pinecone"`).
 
 ### Example `config.json`
@@ -97,6 +97,9 @@ These must always come from the environment. Setting them in a JSON config file 
 | `vectorstore` | `AGENT_KB_VECTORSTORE` | `"chromadb"` |
 | `embedding.provider` | `AGENT_KB_EMBEDDING_PROVIDER` | `"sentence-transformers"` |
 | `embedding.model` | `AGENT_KB_EMBEDDING_MODEL` | `"all-MiniLM-L6-v2"` |
+| `embedding.base_url` | `AGENT_KB_EMBED_BASE_URL` | `null` (required when `embedding.provider = "remote"`) |
+| `embedding.timeout_seconds` | `AGENT_KB_EMBED_TIMEOUT_SECONDS` | `30.0` |
+| `embedding.max_retries` | `AGENT_KB_EMBED_MAX_RETRIES` | `0` |
 | `pinecone.index` | `AGENT_KB_PINECONE_INDEX` | `null` |
 | `pinecone.environment` | `AGENT_KB_PINECONE_ENVIRONMENT` | `null` |
 | `export_path` | `AGENT_KB_EXPORT_PATH` | `null` |

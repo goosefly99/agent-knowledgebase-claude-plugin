@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.7.0 — 2026-04-21
+
+### Changed (breaking)
+- Remote embedding provider is now a plain `httpx`-based HTTP client
+  talking directly to `{base_url}/embeddings` — there is no longer any
+  third-party SDK dependency. Any server speaking the common embeddings
+  JSON contract (Ollama's `/v1`, vLLM, LocalAI, hosted endpoints) works.
+- Renames (breaking config changes):
+  - `embedding_provider` literal `"openai"` → `"remote"`.
+  - `openai_api_key` → `embed_api_key`; env var
+    `AGENT_KB_OPENAI_API_KEY` → `AGENT_KB_EMBED_API_KEY`.
+  - `openai_base_url` → `embed_base_url`; env var
+    `AGENT_KB_EMBED_BASE_URL` is now **required** for the `remote`
+    provider (no implicit default endpoint).
+  - Python class `OpenAIEmbedder` → `RemoteEmbedder`.
+- The optional `openai` install extra has been removed from
+  `pyproject.toml`. Existing callers should drop the `[openai]` extra
+  from their install line; no replacement extra is required because
+  `httpx` is already a core dependency.
+
+### Preserved
+- `EmbedderUnavailableError` and the FIELD-14 structured-error payload
+  shape (`{error, model, phase, latency_ms, detail}`) are unchanged.
+  `embed_timeout` / `embed_unreachable` tokens, `embed_timeout_seconds`,
+  and `embed_max_retries` semantics are preserved across the migration.
+
 ## 0.6.0 — 2026-04-20
 
 ### Added
@@ -85,7 +111,7 @@ dropped columns. The v0.6.0 code will re-add them on next open.
 
 ### Preserved
 - `AGENT_KB_SAVES_DIR` remains required and env-only.
-- Secrets (`AGENT_KB_OPENAI_API_KEY`, `AGENT_KB_PINECONE_API_KEY`) remain env-only. JSON files reject them.
+- Secrets (`AGENT_KB_EMBED_API_KEY`, `AGENT_KB_PINECONE_API_KEY`) remain env-only. JSON files reject them.
 
 ## 0.1.0 — 2026-04-11
 

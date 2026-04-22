@@ -394,6 +394,46 @@ class TestKbQuery:
         kb_query("kb-1", "test")
         mock_service.query.assert_called_once_with("kb-1", "test", None)
 
+    def test_embedder_timeout_returns_structured_error(self, mock_service):
+        """FIELD-14: when the embedder times out, return a JSON error object
+        instead of blocking the RPC or bubbling a raw exception."""
+        from agent_knowledgebase.services.embeddings import EmbedderUnavailableError
+
+        mock_service.query.side_effect = EmbedderUnavailableError(
+            error="embed_timeout",
+            model="qwen3-embedding:8b",
+            phase="embed_query",
+            latency_ms=30_000,
+            detail="APITimeoutError",
+        )
+
+        result = kb_query("kb-1", "any query")
+        parsed = json.loads(result)
+        assert parsed == {
+            "error": "embed_timeout",
+            "model": "qwen3-embedding:8b",
+            "phase": "embed_query",
+            "latency_ms": 30_000,
+            "detail": "APITimeoutError",
+        }
+
+    def test_embedder_unreachable_returns_structured_error(self, mock_service):
+        """Connection errors (e.g. Ollama offline) surface as JSON, not exceptions."""
+        from agent_knowledgebase.services.embeddings import EmbedderUnavailableError
+
+        mock_service.query.side_effect = EmbedderUnavailableError(
+            error="embed_unreachable",
+            model="qwen3-embedding:8b",
+            phase="embed_query",
+            latency_ms=42,
+        )
+
+        result = kb_query("kb-1", "q")
+        parsed = json.loads(result)
+        assert parsed["error"] == "embed_unreachable"
+        assert parsed["model"] == "qwen3-embedding:8b"
+        assert "detail" not in parsed  # omitted when empty
+
 
 class TestKbSearch:
     def test_returns_search_results(self, mock_service):
@@ -763,8 +803,9 @@ class TestKbConfigGet:
         saves = tmp_path / "saves"
         saves.mkdir()
         monkeypatch.setenv("AGENT_KB_SAVES_DIR", str(saves))
-        monkeypatch.delenv("AGENT_KB_USER_CONFIG", raising=False)
-        monkeypatch.delenv("AGENT_KB_PROJECT_CONFIG", raising=False)
+        # Point at nonexistent files so layered discovery sees "no override".
+        monkeypatch.setenv("AGENT_KB_USER_CONFIG", str(tmp_path / "no_user.json"))
+        monkeypatch.setenv("AGENT_KB_PROJECT_CONFIG", str(tmp_path / "no_proj.json"))
         monkeypatch.setenv("AGENT_KB_CHUNK_SIZE", "1024")
         result = json.loads(srv.kb_config_get("chunk.size"))
         assert result["value"] == 1024
@@ -779,8 +820,8 @@ class TestKbConfigGet:
         saves = tmp_path / "saves"
         saves.mkdir()
         monkeypatch.setenv("AGENT_KB_SAVES_DIR", str(saves))
-        monkeypatch.delenv("AGENT_KB_USER_CONFIG", raising=False)
-        monkeypatch.delenv("AGENT_KB_PROJECT_CONFIG", raising=False)
+        monkeypatch.setenv("AGENT_KB_USER_CONFIG", str(tmp_path / "no_user.json"))
+        monkeypatch.setenv("AGENT_KB_PROJECT_CONFIG", str(tmp_path / "no_proj.json"))
         monkeypatch.delenv("AGENT_KB_INGEST_EXCLUDED_DIRS", raising=False)
         result = json.loads(srv.kb_config_get("ingest.excluded_dirs"))
         assert result["effective_type"] == "list"
@@ -862,7 +903,7 @@ class TestKbConfigSet:
         # Fake forbidden — the writeable API shouldn't expose it at all,
         # but guard anyway
         with pytest.raises(ValueError):
-            srv.kb_config_set("user", "openai_api_key", "sk-...")
+            srv.kb_config_set("user", "embed_api_key", "sk-...")
 
     def test_set_rollback_on_validation_fail(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path

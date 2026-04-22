@@ -90,9 +90,10 @@ All configuration via environment variables with sensible defaults:
 | `AGENT_KB_PINECONE_API_KEY` | (none) | Pinecone API key |
 | `AGENT_KB_PINECONE_INDEX` | (none) | Pinecone index name |
 | `AGENT_KB_PINECONE_ENVIRONMENT` | (none) | Pinecone environment |
-| `AGENT_KB_EMBEDDING_PROVIDER` | `sentence-transformers` | `sentence-transformers` or `openai` |
+| `AGENT_KB_EMBEDDING_PROVIDER` | `sentence-transformers` | `sentence-transformers` or `remote` |
 | `AGENT_KB_EMBEDDING_MODEL` | `all-MiniLM-L6-v2` | Model name for embeddings |
-| `AGENT_KB_OPENAI_API_KEY` | (none) | OpenAI API key (if using openai embeddings) |
+| `AGENT_KB_EMBED_API_KEY` | (none) | Bearer token for the remote embeddings endpoint (if using `remote` provider) |
+| `AGENT_KB_EMBED_BASE_URL` | (none) | Base URL for the remote embeddings endpoint, e.g. `http://localhost:11434/v1` (required for `remote` provider) |
 | `AGENT_KB_CHUNK_SIZE` | `512` | Default chunk size in tokens |
 | `AGENT_KB_CHUNK_OVERLAP` | `64` | Chunk overlap in tokens |
 | `AGENT_KB_EXPORT_PATH` | (none) | Markdown export directory (optional) |
@@ -194,7 +195,7 @@ Combines vectorstore similarity search with wiki FTS:
 Abstraction over embedding models:
 - `embed(texts: list[str]) → list[list[float]]`
 - `embed_query(text: str) → list[float]`
-- Providers: `SentenceTransformerEmbedder`, `OpenAIEmbedder`
+- Providers: `SentenceTransformerEmbedder`, `RemoteEmbedder` (httpx-based)
 - Factory: `create_embedder(config) → Embedder`
 
 ### lint.py — Wiki Health Checks
@@ -370,7 +371,6 @@ dependencies = [
 
 [project.optional-dependencies]
 pinecone = ["pinecone-client>=3.0"]
-openai = ["openai>=1.0"]
 
 [dependency-groups]
 dev = ["pytest>=8.0", "pytest-asyncio>=0.24", "ruff>=0.5"]

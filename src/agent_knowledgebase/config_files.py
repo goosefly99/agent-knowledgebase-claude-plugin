@@ -73,6 +73,9 @@ DOT_TO_FLAT: dict[str, str] = {
     "vectorstore": "vectorstore",
     "embedding.provider": "embedding_provider",
     "embedding.model": "embedding_model",
+    "embedding.base_url": "embed_base_url",
+    "embedding.timeout_seconds": "embed_timeout_seconds",
+    "embedding.max_retries": "embed_max_retries",
     "pinecone.index": "pinecone_index",
     "pinecone.environment": "pinecone_environment",
     "export_path": "export_path",
@@ -90,7 +93,7 @@ DOT_TO_FLAT: dict[str, str] = {
 # The JSON source rejects them loudly because they belong in env (secrets or
 # required+validated file paths).
 FORBIDDEN_KEYS: frozenset[str] = frozenset({
-    "openai_api_key", "pinecone_api_key", "saves_dir", "api_key",
+    "embed_api_key", "pinecone_api_key", "saves_dir", "api_key",
 })
 
 

@@ -68,7 +68,7 @@ class TestDefaults:
         assert test_config.pinecone_api_key is None
         assert test_config.pinecone_index is None
         assert test_config.pinecone_environment is None
-        assert test_config.openai_api_key is None
+        assert test_config.embed_api_key is None
 
     def test_default_chunk_token_encoding(self, test_config: Settings) -> None:
         assert test_config.chunk_token_encoding == "cl100k_base"
@@ -93,6 +93,23 @@ class TestDefaults:
             ".idea", ".vscode", ".hg", ".svn",
         ]
 
+    def test_default_embed_base_url_is_none(self, test_config: Settings) -> None:
+        assert test_config.embed_base_url is None
+
+    def test_default_embed_timeout_seconds(self, test_config: Settings) -> None:
+        assert test_config.embed_timeout_seconds == 30.0
+
+    def test_default_embed_max_retries(self, test_config: Settings) -> None:
+        assert test_config.embed_max_retries == 0
+
+    def test_embed_timeout_must_be_positive(self, tmp_path: Path) -> None:
+        with pytest.raises(Exception):
+            Settings(saves_dir=tmp_path, embed_timeout_seconds=0.0)
+
+    def test_embed_max_retries_must_be_nonnegative(self, tmp_path: Path) -> None:
+        with pytest.raises(Exception):
+            Settings(saves_dir=tmp_path, embed_max_retries=-1)
+
 
 class TestEnvOverrides:
     """Environment variable overrides are picked up."""
@@ -115,9 +132,9 @@ class TestEnvOverrides:
     def test_override_embedding_provider(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        monkeypatch.setenv("AGENT_KB_EMBEDDING_PROVIDER", "openai")
+        monkeypatch.setenv("AGENT_KB_EMBEDDING_PROVIDER", "remote")
         cfg = Settings(saves_dir=tmp_path)
-        assert cfg.embedding_provider == "openai"
+        assert cfg.embedding_provider == "remote"
 
     def test_override_embedding_model(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path

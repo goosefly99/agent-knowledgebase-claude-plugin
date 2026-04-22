@@ -66,17 +66,40 @@ class Settings(BaseSettings):
     )
 
     # --- Embeddings ---
-    embedding_provider: Literal["sentence-transformers", "openai"] = Field(
+    embedding_provider: Literal["sentence-transformers", "remote"] = Field(
         default="sentence-transformers",
-        description="Embedding provider",
+        description="Embedding provider: 'sentence-transformers' (local) or 'remote' "
+        "(HTTP endpoint speaking the /v1/embeddings JSON contract — e.g. Ollama, vLLM).",
     )
     embedding_model: str = Field(
         default="all-MiniLM-L6-v2",
         description="Embedding model name",
     )
-    openai_api_key: Optional[str] = Field(
+    embed_api_key: Optional[str] = Field(
         default=None,
-        description="OpenAI API key",
+        description="API key sent as Bearer auth to the remote embeddings endpoint. "
+        "Can be a placeholder (e.g. 'ollama') for servers that ignore auth.",
+    )
+    embed_base_url: Optional[str] = Field(
+        default=None,
+        description="Base URL for the remote embeddings endpoint, e.g. "
+        "'http://localhost:11434/v1' for a local Ollama server. Required when "
+        "embedding_provider = 'remote'. The '/embeddings' suffix is appended "
+        "automatically.",
+    )
+    embed_timeout_seconds: float = Field(
+        default=30.0,
+        gt=0.0,
+        description="Per-call wall-clock bound in seconds for remote embed requests. "
+        "Prevents kb_query from blocking the MCP RPC when the backend is unreachable "
+        "or cold-loading a model.",
+    )
+    embed_max_retries: int = Field(
+        default=0,
+        ge=0,
+        description="Number of retries after a transport failure (timeout / connection "
+        "error). Default 0 keeps the wall-clock bounded at one embed_timeout_seconds "
+        "window.",
     )
 
     # --- Chunking ---
