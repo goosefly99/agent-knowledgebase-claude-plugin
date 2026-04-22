@@ -10,11 +10,14 @@ import pytest
 
 from agent_knowledgebase.config import Settings
 from agent_knowledgebase.services.embeddings import (
+    DEFAULT_OLLAMA_BASE_URL,
     Embedder,
     EmbedderUnavailableError,
+    OllamaEmbedder,
     RemoteEmbedder,
     SentenceTransformerEmbedder,
     create_embedder,
+    create_embedder_for_model,
 )
 
 
@@ -453,3 +456,195 @@ class TestCreateEmbedder:
         # base_url is stored on the embedder, not the httpx.Client (we pass full URLs).
         assert embedder._base_url == "http://localhost:11434/v1"
         assert embedder._max_retries == 0
+
+
+# ---------------------------------------------------------------------------
+# OllamaEmbedder — native /api/embed endpoint
+# ---------------------------------------------------------------------------
+
+
+def _make_ollama_response(
+    embeddings: list[list[float]], status_code: int = 200
+) -> MagicMock:
+    """Build a mock httpx.Response with Ollama's native embed shape."""
+    response = MagicMock(spec=httpx.Response)
+    response.status_code = status_code
+    response.json.return_value = {
+        "model": "qwen3-embedding:8b",
+        "embeddings": embeddings,
+    }
+    response.raise_for_status.return_value = None
+    return response
+
+
+class TestOllamaEmbedder:
+    """Unit tests for OllamaEmbedder with a mocked httpx client."""
+
+    @pytest.fixture()
+    def mock_client(self) -> MagicMock:
+        return MagicMock(spec=httpx.Client)
+
+    @pytest.fixture()
+    def embedder(self, mock_client: MagicMock) -> OllamaEmbedder:
+        return OllamaEmbedder(
+            model_name="qwen3-embedding:8b",
+            base_url="http://127.0.0.1:11434",
+            _client=mock_client,
+        )
+
+    def test_embed_posts_to_api_embed(self, embedder: OllamaEmbedder) -> None:
+        """Batch embed must POST to /api/embed with Ollama's input shape."""
+        embedder._client.post.return_value = _make_ollama_response(
+            [[0.1, 0.2], [0.3, 0.4]]
+        )
+
+        result = embedder.embed(["a", "b"])
+
+        embedder._client.post.assert_called_once_with(
+            "http://127.0.0.1:11434/api/embed",
+            json={"model": "qwen3-embedding:8b", "input": ["a", "b"]},
+        )
+        assert result == [[0.1, 0.2], [0.3, 0.4]]
+
+    def test_embed_query_returns_single_vector(self, embedder: OllamaEmbedder) -> None:
+        embedder._client.post.return_value = _make_ollama_response([[0.5, 0.6, 0.7]])
+        assert embedder.embed_query("hello") == [0.5, 0.6, 0.7]
+
+    def test_embed_empty_list_returns_empty(self, embedder: OllamaEmbedder) -> None:
+        """Empty input must short-circuit without hitting the wire."""
+        assert embedder.embed([]) == []
+        embedder._client.post.assert_not_called()
+
+    def test_dimension_caches_after_first_call(self, embedder: OllamaEmbedder) -> None:
+        assert embedder.dimension == 0  # no probe yet
+        embedder._client.post.return_value = _make_ollama_response([[0.1] * 4096])
+        embedder.embed_query("probe")
+        assert embedder.dimension == 4096
+
+    def test_timeout_converts_to_unavailable(self) -> None:
+        mock_client = MagicMock(spec=httpx.Client)
+        mock_client.post.side_effect = httpx.ReadTimeout("stalled")
+        embedder = OllamaEmbedder(
+            model_name="qwen3-embedding:8b", _client=mock_client
+        )
+        with pytest.raises(EmbedderUnavailableError) as excinfo:
+            embedder.embed_query("x")
+        payload = excinfo.value.to_payload()
+        assert payload["error"] == "embed_timeout"
+        assert payload["phase"] == "embed_query"
+
+    def test_connection_error_converts_to_unavailable(self) -> None:
+        mock_client = MagicMock(spec=httpx.Client)
+        mock_client.post.side_effect = httpx.ConnectError("refused")
+        embedder = OllamaEmbedder(
+            model_name="qwen3-embedding:8b", _client=mock_client
+        )
+        with pytest.raises(EmbedderUnavailableError) as excinfo:
+            embedder.embed_query("x")
+        assert excinfo.value.to_payload()["error"] == "embed_unreachable"
+
+    def test_trailing_slash_on_base_url_normalized(self) -> None:
+        mock_client = MagicMock(spec=httpx.Client)
+        mock_client.post.return_value = _make_ollama_response([[0.1]])
+        embedder = OllamaEmbedder(
+            model_name="m",
+            base_url="http://127.0.0.1:11434/",
+            _client=mock_client,
+        )
+        embedder.embed(["x"])
+        assert (
+            mock_client.post.call_args[0][0]
+            == "http://127.0.0.1:11434/api/embed"
+        )
+
+    def test_satisfies_protocol(self, embedder: OllamaEmbedder) -> None:
+        assert isinstance(embedder, Embedder)
+
+
+class TestCreateEmbedderOllama:
+    """Factory tests for the 'ollama' provider."""
+
+    def test_creates_ollama_embedder(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        config = Settings(
+            saves_dir=tmp_path,
+            embedding_provider="ollama",
+            embedding_model="qwen3-embedding:8b",
+        )
+        monkeypatch.setattr(httpx, "Client", MagicMock())
+        embedder = create_embedder(config)
+        assert isinstance(embedder, OllamaEmbedder)
+        assert embedder._base_url == DEFAULT_OLLAMA_BASE_URL
+
+    def test_ollama_uses_configured_base_url(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        config = Settings(
+            saves_dir=tmp_path,
+            embedding_provider="ollama",
+            embedding_model="qwen3-embedding:8b",
+            embed_base_url="http://10.0.0.5:11434",
+        )
+        monkeypatch.setattr(httpx, "Client", MagicMock())
+        embedder = create_embedder(config)
+        assert isinstance(embedder, OllamaEmbedder)
+        assert embedder._base_url == "http://10.0.0.5:11434"
+
+    def test_ollama_does_not_require_api_key(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The ollama provider must not fail when embed_api_key is None."""
+        config = Settings(
+            saves_dir=tmp_path,
+            embedding_provider="ollama",
+            embedding_model="qwen3-embedding:8b",
+            embed_api_key=None,
+        )
+        monkeypatch.setattr(httpx, "Client", MagicMock())
+        embedder = create_embedder(config)
+        assert isinstance(embedder, OllamaEmbedder)
+
+
+class TestCreateEmbedderForModel:
+    """Factory tests for create_embedder_for_model (per-KB query builder)."""
+
+    def test_returns_default_when_model_matches(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        config = Settings(
+            saves_dir=tmp_path,
+            embedding_provider="ollama",
+            embedding_model="qwen3-embedding:8b",
+        )
+        monkeypatch.setattr(httpx, "Client", MagicMock())
+        embedder = create_embedder_for_model(config, "qwen3-embedding:8b")
+        assert isinstance(embedder, OllamaEmbedder)
+        assert embedder.model_name == "qwen3-embedding:8b"
+
+    def test_returns_default_when_model_none(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        config = Settings(
+            saves_dir=tmp_path,
+            embedding_provider="ollama",
+            embedding_model="qwen3-embedding:8b",
+        )
+        monkeypatch.setattr(httpx, "Client", MagicMock())
+        embedder = create_embedder_for_model(config, None)
+        assert embedder.model_name == "qwen3-embedding:8b"
+
+    def test_overrides_model_for_different_name(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """When the stored model differs from config, build an embedder
+        for the stored model — otherwise retrieval silently breaks."""
+        config = Settings(
+            saves_dir=tmp_path,
+            embedding_provider="ollama",
+            embedding_model="qwen3-embedding:8b",
+        )
+        monkeypatch.setattr(httpx, "Client", MagicMock())
+        embedder = create_embedder_for_model(config, "bge-m3:latest")
+        assert isinstance(embedder, OllamaEmbedder)
+        assert embedder.model_name == "bge-m3:latest"

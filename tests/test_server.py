@@ -754,8 +754,8 @@ class TestKbConfigShow:
         result = json.loads(srv.kb_config_show("defaults"))
         # Literal defaults
         assert result["vectorstore"] == "chromadb"
-        assert result["embedding"]["provider"] == "sentence-transformers"
-        assert result["embedding"]["model"] == "all-MiniLM-L6-v2"
+        assert result["embedding"]["provider"] == "ollama"
+        assert result["embedding"]["model"] == "qwen3-embedding:8b"
         assert result["chunk"]["size"] == 512
         assert result["chunk"]["overlap"] == 64
         assert result["query"]["default_top_k"] == 10

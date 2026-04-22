@@ -1,9 +1,16 @@
 """Embedding providers behind a common interface.
 
-Supports SentenceTransformers (default, local) and a ``remote`` provider that
-POSTs to an HTTP ``/v1/embeddings`` endpoint directly via :mod:`httpx` — any
-server speaking the common embeddings JSON contract (Ollama, vLLM, LocalAI,
-public hosted APIs, etc.) works.
+Supported providers:
+
+* ``ollama`` (default) — POSTs to Ollama's native ``/api/embed`` endpoint.
+  Requires only ``base_url`` (default ``http://127.0.0.1:11434``); no API
+  key. Parses the Ollama response shape ``{"embeddings": [[...]]}``.
+* ``remote`` — POSTs to an HTTP ``/v1/embeddings`` endpoint speaking the
+  OpenAI-compatible embeddings JSON contract (``{"input": [...], "model":
+  ...}`` → ``{"data": [{"index": N, "embedding": [...]}]}``). Works with
+  vLLM, LocalAI, OpenAI, Azure OpenAI, Ollama's ``/v1`` surface, etc.
+* ``sentence-transformers`` — Local embedder backed by the
+  ``sentence-transformers`` library (offline-capable).
 """
 
 from __future__ import annotations
@@ -247,6 +254,108 @@ class RemoteEmbedder:
 
 
 # ---------------------------------------------------------------------------
+# Ollama native provider (/api/embed)
+# ---------------------------------------------------------------------------
+
+DEFAULT_OLLAMA_BASE_URL = "http://127.0.0.1:11434"
+
+
+class OllamaEmbedder:
+    """Embedder targeting Ollama's native ``/api/embed`` endpoint.
+
+    Unlike :class:`RemoteEmbedder` (which speaks the OpenAI-compatible
+    ``/v1/embeddings`` contract and requires a ``/v1`` suffix plus a
+    Bearer API key), this provider:
+
+    * POSTs to ``<base_url>/api/embed`` with ``{"model": ..., "input":
+      [...]}``;
+    * parses ``{"embeddings": [[...]]}`` responses;
+    * needs **no** API key (Ollama does not authenticate locally).
+
+    Every call is wall-clock bounded by ``timeout_seconds`` with up to
+    ``max_retries`` retries; transport failures surface as
+    :class:`EmbedderUnavailableError` with the same FIELD-14 payload
+    shape used by :class:`RemoteEmbedder`.
+    """
+
+    def __init__(
+        self,
+        model_name: str,
+        *,
+        base_url: str = DEFAULT_OLLAMA_BASE_URL,
+        timeout_seconds: float = 30.0,
+        max_retries: int = 0,
+        _client: Any | None = None,
+    ) -> None:
+        self._model_name = model_name
+        self._timeout_seconds = timeout_seconds
+        self._base_url = base_url.rstrip("/")
+        self._max_retries = max_retries
+        if _client is not None:
+            self._client = _client
+        else:
+            self._client = httpx.Client(timeout=timeout_seconds)
+        self._dimension_cache: int | None = None
+
+    def _call_embed(self, texts: list[str], *, phase: str) -> list[list[float]]:
+        """POST to ``/api/embed`` and decode the Ollama response shape."""
+        url = self._base_url + "/api/embed"
+        body = {"model": self._model_name, "input": texts}
+        started = time.monotonic()
+        total_attempts = self._max_retries + 1
+        for attempt in range(total_attempts):
+            try:
+                response = self._client.post(url, json=body)
+                response.raise_for_status()
+                parsed = response.json()
+                break
+            except BaseException as exc:  # noqa: BLE001 — classify below
+                error_token = _classify_httpx_transport_error(exc)
+                if error_token is None:
+                    raise
+                if attempt + 1 < total_attempts:
+                    continue
+                latency_ms = int((time.monotonic() - started) * 1000)
+                raise EmbedderUnavailableError(
+                    error=error_token,
+                    model=self._model_name,
+                    phase=phase,
+                    latency_ms=latency_ms,
+                    detail=type(exc).__name__,
+                ) from exc
+
+        embeddings = parsed.get("embeddings", [])
+        if embeddings and self._dimension_cache is None:
+            self._dimension_cache = len(embeddings[0])
+        return list(embeddings)
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        """Batch-embed *texts* via Ollama's ``/api/embed`` endpoint."""
+        if not texts:
+            return []
+        return self._call_embed(texts, phase="embed_batch")
+
+    def embed_query(self, text: str) -> list[float]:
+        """Embed a single query string."""
+        return self._call_embed([text], phase="embed_query")[0]
+
+    @property
+    def dimension(self) -> int:
+        """Return the embedding dimension.
+
+        Cached after the first successful embed. Falls back to 0 before
+        any call has succeeded — callers that need the dimension up
+        front should issue a probe embed first.
+        """
+        return self._dimension_cache or 0
+
+    @property
+    def model_name(self) -> str:
+        """Return the Ollama model identifier."""
+        return self._model_name
+
+
+# ---------------------------------------------------------------------------
 # Factory
 # ---------------------------------------------------------------------------
 
@@ -258,23 +367,73 @@ def create_embedder(config: Settings) -> Embedder:
         ValueError: If the remote provider is selected but no API key or
             base URL is set.
     """
-    if config.embedding_provider == "sentence-transformers":
-        return SentenceTransformerEmbedder(model_name=config.embedding_model)
-    elif config.embedding_provider == "remote":
-        if not config.embed_api_key:
+    return _build_embedder(
+        provider=config.embedding_provider,
+        model=config.embedding_model,
+        base_url=config.embed_base_url,
+        api_key=config.embed_api_key,
+        timeout_seconds=config.embed_timeout_seconds,
+        max_retries=config.embed_max_retries,
+    )
+
+
+def create_embedder_for_model(
+    config: Settings, model_name: str | None
+) -> Embedder:
+    """Instantiate an :class:`Embedder` matching *model_name*.
+
+    Used at query time to guarantee the query vector is produced by the
+    same model that originally ingested the vectorstore.  When
+    ``model_name`` is None or equals the configured default, the regular
+    configured embedder is returned; otherwise, a fresh embedder using
+    the same provider/base_url/api_key but overriding the model name
+    is created.
+    """
+    if not model_name or model_name == config.embedding_model:
+        return create_embedder(config)
+    return _build_embedder(
+        provider=config.embedding_provider,
+        model=model_name,
+        base_url=config.embed_base_url,
+        api_key=config.embed_api_key,
+        timeout_seconds=config.embed_timeout_seconds,
+        max_retries=config.embed_max_retries,
+    )
+
+
+def _build_embedder(
+    *,
+    provider: str,
+    model: str,
+    base_url: str | None,
+    api_key: str | None,
+    timeout_seconds: float,
+    max_retries: int,
+) -> Embedder:
+    """Internal builder shared by :func:`create_embedder` variants."""
+    if provider == "sentence-transformers":
+        return SentenceTransformerEmbedder(model_name=model)
+    if provider == "ollama":
+        return OllamaEmbedder(
+            model_name=model,
+            base_url=base_url or DEFAULT_OLLAMA_BASE_URL,
+            timeout_seconds=timeout_seconds,
+            max_retries=max_retries,
+        )
+    if provider == "remote":
+        if not api_key:
             raise ValueError("AGENT_KB_EMBED_API_KEY required for remote embeddings")
-        if not config.embed_base_url:
+        if not base_url:
             raise ValueError(
                 "AGENT_KB_EMBED_BASE_URL required for remote embeddings "
-                "(e.g. http://localhost:11434/v1 for a local Ollama server)"
+                "(e.g. http://localhost:11434/v1 for Ollama's OpenAI-compat endpoint)"
             )
         return RemoteEmbedder(
-            model_name=config.embedding_model,
-            api_key=config.embed_api_key,
-            base_url=config.embed_base_url,
-            timeout_seconds=config.embed_timeout_seconds,
-            max_retries=config.embed_max_retries,
+            model_name=model,
+            api_key=api_key,
+            base_url=base_url,
+            timeout_seconds=timeout_seconds,
+            max_retries=max_retries,
         )
-    else:
-        # Should be unreachable due to the Literal type constraint, but guard anyway.
-        raise ValueError(f"Unknown embedding provider: {config.embedding_provider}")
+    # Should be unreachable due to the Literal type constraint, but guard anyway.
+    raise ValueError(f"Unknown embedding provider: {provider}")

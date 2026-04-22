@@ -53,10 +53,10 @@ class TestDefaults:
         assert test_config.vectorstore == "chromadb"
 
     def test_default_embedding_provider(self, test_config: Settings) -> None:
-        assert test_config.embedding_provider == "sentence-transformers"
+        assert test_config.embedding_provider == "ollama"
 
     def test_default_embedding_model(self, test_config: Settings) -> None:
-        assert test_config.embedding_model == "all-MiniLM-L6-v2"
+        assert test_config.embedding_model == "qwen3-embedding:8b"
 
     def test_default_chunk_size(self, test_config: Settings) -> None:
         assert test_config.chunk_size == 512

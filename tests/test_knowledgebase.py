@@ -340,6 +340,67 @@ class TestQuery:
         results = service.hybrid_query(kb.id, "test")
         assert isinstance(results, list)
 
+    def test_query_uses_per_kb_embedder_when_dominant_model_differs(
+        self,
+        service: KnowledgebaseService,
+        mock_vectorstore: MagicMock,
+        mock_embedder: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """When the KB's chunks were embedded with a different model than
+        the globally configured embedder, query must build an embedder
+        matching that model — otherwise retrieval would embed the query
+        with the wrong model and produce incoherent scores."""
+        kb = service.create_kb("Multi-Model KB")
+        # Ingest one source so chunks exist (they'll be stamped with the
+        # mock embedder's model name "mock-embedder").
+        service.ingest_source(kb.id, SourceType.file, "/tmp/x.txt")
+
+        # Simulate the stored vectorstore having been built with a
+        # *different* embedding model than the service's current default
+        # by patching the DB-side count helper.
+        ctx = service._contexts[kb.id]
+        monkeypatch.setattr(
+            ctx.db,
+            "count_chunks_by_embedding_model",
+            lambda _kb_id: {"legacy-model": 7},
+        )
+
+        captured: dict[str, str] = {}
+
+        def _fake_builder(cfg: object, model_name: str | None) -> MagicMock:
+            captured["model"] = model_name or ""
+            new_embedder = MagicMock()
+            new_embedder.embed_query.return_value = [0.9, 0.9, 0.9]
+            return new_embedder
+
+        monkeypatch.setattr(
+            "agent_knowledgebase.services.knowledgebase.create_embedder_for_model",
+            _fake_builder,
+        )
+        mock_vectorstore.query.return_value = []
+
+        service.query(kb.id, "test question")
+
+        assert captured["model"] == "legacy-model"
+
+    def test_query_reuses_default_embedder_when_model_matches(
+        self,
+        service: KnowledgebaseService,
+        mock_vectorstore: MagicMock,
+        mock_embedder: MagicMock,
+    ) -> None:
+        """When the KB's stored embedding model matches the service's
+        globally configured embedder, query must reuse that embedder
+        (no rebuild) to avoid repeated sentence-transformers model loads."""
+        kb = service.create_kb("Same-Model KB")
+        service.ingest_source(kb.id, SourceType.file, "/tmp/x.txt")
+
+        mock_vectorstore.query.return_value = []
+        service.query(kb.id, "hello")
+
+        mock_embedder.embed_query.assert_called_with("hello")
+
 
 # ---------------------------------------------------------------------------
 # 7. Wiki operations

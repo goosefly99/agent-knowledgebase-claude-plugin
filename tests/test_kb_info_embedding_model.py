@@ -101,3 +101,26 @@ def test_chunk_metadata_records_embedding_model_on_ingest(
             f"chunk {chunk.id} missing 'embedding_model' in metadata: {chunk.metadata}"
         )
         assert chunk.metadata["embedding_model"] == _MODEL_NAME
+
+
+# ---------------------------------------------------------------------------
+# Test 4: chunk metadata also carries ``kb_id`` so the vectorstore's
+# ``where={"kb_id": kb_id}`` filter returns results at query time.
+# Regression — before this was added, kb_query returned zero results even
+# when the per-KB collection held matching chunks.
+# ---------------------------------------------------------------------------
+
+
+def test_chunk_metadata_records_kb_id_for_query_filter(
+    embedding_service: KnowledgebaseService,
+) -> None:
+    kb = embedding_service.create_kb("emb-model-kb-id-stamp")
+    source = embedding_service.ingest_source(kb.id, SourceType.file, "/tmp/source_d.txt")
+
+    ctx = embedding_service._ctx(kb.id)
+    chunks = ctx.db.list_chunks(source.id)
+    assert chunks, "expected at least one chunk"
+    for chunk in chunks:
+        assert chunk.metadata.get("kb_id") == kb.id, (
+            f"chunk {chunk.id} missing 'kb_id' in metadata: {chunk.metadata}"
+        )

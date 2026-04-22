@@ -52,7 +52,11 @@ from agent_knowledgebase.models import (
     WikiPage,
 )
 from agent_knowledgebase.services.dedup_service import DEFAULT_DEDUP_POLICY, DedupPolicy, resolve_dedup_action
-from agent_knowledgebase.services.embeddings import Embedder, create_embedder
+from agent_knowledgebase.services.embeddings import (
+    Embedder,
+    create_embedder,
+    create_embedder_for_model,
+)
 from agent_knowledgebase.services.export import MarkdownExporter
 from agent_knowledgebase.services.ingestion import IngestionOrchestrator
 from agent_knowledgebase.services.lint import LintIssue, LintReport, WikiLinter
@@ -146,6 +150,28 @@ class KnowledgebaseService:
         if self._embedder_instance is None:
             self._embedder_instance = create_embedder(self._config)
         return self._embedder_instance
+
+    def _query_embedder_for(self, kb_id: str) -> Embedder:
+        """Return the :class:`Embedder` to use when querying *kb_id*.
+
+        Retrieval requires the query vector to come from the same model
+        that produced the stored vectors — otherwise similarity scores
+        are meaningless (and dimensions may not even match).  This
+        method resolves the dominant embedding model stamped on the
+        KB's chunks (see
+        :meth:`Database.count_chunks_by_embedding_model`) and builds an
+        embedder targeting that specific model, falling back to the
+        globally configured embedder when the KB has no chunks yet or
+        no ``embedding_model`` metadata (pre-0.7 ingestions).
+        """
+        ctx = self._ctx(kb_id)
+        model_counts = ctx.db.count_chunks_by_embedding_model(kb_id)
+        if not model_counts:
+            return self._embedder
+        dominant = max(model_counts, key=lambda m: model_counts[m])
+        if dominant == self._embedder.model_name:
+            return self._embedder
+        return create_embedder_for_model(self._config, dominant)
 
     def _get_kb_lock(self, kb_id: str) -> threading.Lock:
         """Return (creating lazily) the per-kb_id ingestion lock.
@@ -480,9 +506,14 @@ class KnowledgebaseService:
             texts = [c.content for c in chunks]
             embeddings = self._embedder.embed(texts) if texts else []
             vs = self._get_vectorstore(kb_id)
-            # Stamp the embedding model name on each chunk before persistence.
+            # Stamp per-chunk metadata that the retrieval path depends on:
+            # ``embedding_model`` drives per-KB embedder selection on query,
+            # and ``kb_id`` satisfies the vectorstore's where-filter (which
+            # would otherwise return zero results even though the per-KB
+            # collection holds the right chunks).
             for chunk in chunks:
                 chunk.metadata["embedding_model"] = self._embedder.model_name
+                chunk.metadata["kb_id"] = kb_id
             if chunks:
                 vs.add(
                     ids=[c.id for c in chunks],
@@ -650,7 +681,8 @@ class KnowledgebaseService:
             top_k = default_top_k(self._config)
         ctx = self._ctx(kb_id)
         vs = self._get_vectorstore(kb_id)
-        orchestrator = QueryOrchestrator(vs, self._embedder, ctx.wiki)
+        embedder = self._query_embedder_for(kb_id)
+        orchestrator = QueryOrchestrator(vs, embedder, ctx.wiki)
         return orchestrator.query(text, kb_id, top_k=top_k)
 
     def search(self, kb_id: str, text: str, top_k: int | None = None) -> list[SearchResult]:
@@ -659,7 +691,8 @@ class KnowledgebaseService:
             top_k = default_top_k(self._config)
         ctx = self._ctx(kb_id)
         vs = self._get_vectorstore(kb_id)
-        orchestrator = QueryOrchestrator(vs, self._embedder, ctx.wiki)
+        embedder = self._query_embedder_for(kb_id)
+        orchestrator = QueryOrchestrator(vs, embedder, ctx.wiki)
         return orchestrator.search(text, kb_id, top_k=top_k)
 
     def hybrid_query(self, kb_id: str, text: str, top_k: int | None = None) -> list[SearchResult]:
@@ -669,7 +702,8 @@ class KnowledgebaseService:
         vector_weight, fts_weight, fetch_mult = hybrid_weights_from(self._config)
         ctx = self._ctx(kb_id)
         vs = self._get_vectorstore(kb_id)
-        orchestrator = QueryOrchestrator(vs, self._embedder, ctx.wiki)
+        embedder = self._query_embedder_for(kb_id)
+        orchestrator = QueryOrchestrator(vs, embedder, ctx.wiki)
         return orchestrator.hybrid_query(
             text,
             kb_id,

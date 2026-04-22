@@ -66,26 +66,33 @@ class Settings(BaseSettings):
     )
 
     # --- Embeddings ---
-    embedding_provider: Literal["sentence-transformers", "remote"] = Field(
-        default="sentence-transformers",
-        description="Embedding provider: 'sentence-transformers' (local) or 'remote' "
-        "(HTTP endpoint speaking the /v1/embeddings JSON contract — e.g. Ollama, vLLM).",
+    embedding_provider: Literal["ollama", "sentence-transformers", "remote"] = Field(
+        default="ollama",
+        description="Embedding provider: 'ollama' (default — native /api/embed, "
+        "no API key), 'sentence-transformers' (local, offline), or 'remote' "
+        "(HTTP endpoint speaking the OpenAI-compatible /v1/embeddings JSON "
+        "contract — e.g. vLLM, LocalAI, or Ollama's /v1 surface).",
     )
     embedding_model: str = Field(
-        default="all-MiniLM-L6-v2",
-        description="Embedding model name",
+        default="qwen3-embedding:8b",
+        description="Embedding model name. Default targets the Ollama "
+        "'qwen3-embedding:8b' model; switch to e.g. 'all-MiniLM-L6-v2' "
+        "when embedding_provider = 'sentence-transformers'.",
     )
     embed_api_key: Optional[str] = Field(
         default=None,
-        description="API key sent as Bearer auth to the remote embeddings endpoint. "
-        "Can be a placeholder (e.g. 'ollama') for servers that ignore auth.",
+        description="API key sent as Bearer auth to the remote embeddings "
+        "endpoint. Required for embedding_provider = 'remote'; ignored by "
+        "the 'ollama' and 'sentence-transformers' providers.",
     )
     embed_base_url: Optional[str] = Field(
         default=None,
-        description="Base URL for the remote embeddings endpoint, e.g. "
-        "'http://localhost:11434/v1' for a local Ollama server. Required when "
-        "embedding_provider = 'remote'. The '/embeddings' suffix is appended "
-        "automatically.",
+        description="Base URL for the embeddings endpoint. For "
+        "embedding_provider = 'ollama' the default is 'http://127.0.0.1:11434' "
+        "(the '/api/embed' suffix is appended automatically). For "
+        "embedding_provider = 'remote' this must be the full OpenAI-compatible "
+        "base (e.g. 'http://localhost:11434/v1') — the '/embeddings' suffix is "
+        "appended automatically. Ignored by 'sentence-transformers'.",
     )
     embed_timeout_seconds: float = Field(
         default=30.0,

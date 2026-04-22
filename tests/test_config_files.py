@@ -188,7 +188,7 @@ class TestLayeringPrecedence:
         monkeypatch.setenv("AGENT_KB_USER_CONFIG", str(tmp_path / "no_user.json"))
         monkeypatch.setenv("AGENT_KB_PROJECT_CONFIG", str(tmp_path / "no_proj.json"))
         cfg = Settings()
-        assert cfg.embedding_model == "all-MiniLM-L6-v2"
+        assert cfg.embedding_model == "qwen3-embedding:8b"
         assert cfg.chunk_size == 512
 
     def test_user_file_overrides_default(
@@ -287,4 +287,4 @@ class TestLoadSettingsHelper:
         monkeypatch.setenv("AGENT_KB_USER_CONFIG", str(tmp_path / "none.json"))
         monkeypatch.setenv("AGENT_KB_PROJECT_CONFIG", str(tmp_path / "none2.json"))
         cfg = load_settings()
-        assert cfg.embedding_model == "all-MiniLM-L6-v2"
+        assert cfg.embedding_model == "qwen3-embedding:8b"
