@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import os
+import threading
 from dataclasses import asdict
+from functools import wraps
 from pathlib import Path
+from typing import Callable, TypeVar
 
 from mcp.server.fastmcp import FastMCP
 
@@ -70,12 +74,95 @@ def _serialize_model_list(items: list) -> str:
     return "[" + ", ".join(item.model_dump_json() for item in items) + "]"
 
 
+# ---------------------------------------------------------------------------
+# Wall-clock tool timeout
+# ---------------------------------------------------------------------------
+# A stalled embedder, ingestor, or DB call must not block the MCP RPC
+# forever: instead we enforce a per-tool wall-clock bound by running each
+# call on a dedicated worker thread and timing out via
+# ``future.result(timeout=...)``.  On timeout we abandon the worker
+# (spawning a fresh one for the next call) and also clear the cached
+# ``_service`` so the next call rebuilds SQLite connections in the new
+# thread — sqlite3 connections are thread-affine by default, so reusing
+# the old service from a new worker would ``ProgrammingError``.
+
+_TOOL_TIMEOUT_SECONDS: float = 180.0  # 3 minutes
+
+_tool_executor: concurrent.futures.ThreadPoolExecutor | None = None
+_tool_executor_lock = threading.Lock()
+# Per-thread flag: True when we are already running inside the tool
+# executor's worker thread.  Used to bypass the executor on re-entrant
+# calls (e.g., kb_config_set → kb_config_get) so the inner call does not
+# queue behind the outer one on the single-worker executor.
+_in_tool_worker = threading.local()
+
+_F = TypeVar("_F", bound=Callable[..., str])
+
+
+def _get_tool_executor() -> concurrent.futures.ThreadPoolExecutor:
+    global _tool_executor
+    with _tool_executor_lock:
+        if _tool_executor is None:
+            _tool_executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="kb_tool"
+            )
+        return _tool_executor
+
+
+def _reset_tool_executor() -> None:
+    """Abandon the stuck worker and clear the cached service."""
+    global _tool_executor, _service
+    with _tool_executor_lock:
+        old = _tool_executor
+        _tool_executor = None
+    if old is not None:
+        old.shutdown(wait=False)
+    _service = None
+
+
+def _with_tool_timeout(func: _F) -> _F:
+    """Wrap a tool with a wall-clock timeout and structured failure payload.
+
+    On timeout, returns a JSON string
+    ``{"error": "tool_timeout", "tool": ..., "timeout_seconds": ...}`` so
+    MCP sees a normal tool response instead of a hung RPC.
+    """
+    @wraps(func)
+    def wrapper(*args: object, **kwargs: object) -> str:
+        # Re-entrant call from inside the worker thread: skip the
+        # executor hop to avoid self-deadlock on the single worker.
+        if getattr(_in_tool_worker, "active", False):
+            return func(*args, **kwargs)
+
+        def _run(*a: object, **kw: object) -> str:
+            _in_tool_worker.active = True
+            try:
+                return func(*a, **kw)
+            finally:
+                _in_tool_worker.active = False
+
+        executor = _get_tool_executor()
+        future = executor.submit(_run, *args, **kwargs)
+        try:
+            return future.result(timeout=_TOOL_TIMEOUT_SECONDS)
+        except concurrent.futures.TimeoutError:
+            _reset_tool_executor()
+            return json.dumps({
+                "error": "tool_timeout",
+                "tool": func.__name__,
+                "timeout_seconds": _TOOL_TIMEOUT_SECONDS,
+            })
+
+    return wrapper  # type: ignore[return-value]
+
+
 # ===================================================================
 # Write-Path Tools (Pipeline-Gated)
 # ===================================================================
 
 
 @mcp.tool()
+@_with_tool_timeout
 def kb_create(name: str, description: str = "") -> str:
     """Create a new knowledgebase.
 
@@ -91,6 +178,7 @@ def kb_create(name: str, description: str = "") -> str:
 
 
 @mcp.tool()
+@_with_tool_timeout
 def kb_delete(kb_id: str) -> str:
     """Delete a knowledgebase and all its data (sources, pages, chunks, vectors).
 
@@ -105,6 +193,7 @@ def kb_delete(kb_id: str) -> str:
 
 
 @mcp.tool()
+@_with_tool_timeout
 def kb_ingest(
     kb_id: str,
     source_type: str,
@@ -134,6 +223,7 @@ def kb_ingest(
 
 
 @mcp.tool()
+@_with_tool_timeout
 def kb_ingest_batch(kb_id: str, sources: str, dedup_policy: str = "skip") -> str:
     """Batch ingest multiple sources into a knowledgebase.
 
@@ -173,6 +263,7 @@ def kb_ingest_batch(kb_id: str, sources: str, dedup_policy: str = "skip") -> str
 
 
 @mcp.tool()
+@_with_tool_timeout
 def kb_update_source(source_id: str) -> str:
     """Re-ingest a source (delete old chunks and re-run the ingestion pipeline).
 
@@ -187,6 +278,7 @@ def kb_update_source(source_id: str) -> str:
 
 
 @mcp.tool()
+@_with_tool_timeout
 def kb_remove_source(source_id: str) -> str:
     """Remove a source and all its chunks from the knowledgebase.
 
@@ -201,6 +293,7 @@ def kb_remove_source(source_id: str) -> str:
 
 
 @mcp.tool()
+@_with_tool_timeout
 def kb_lint(kb_id: str) -> str:
     """Run wiki health checks on a knowledgebase.
 
@@ -218,6 +311,7 @@ def kb_lint(kb_id: str) -> str:
 
 
 @mcp.tool()
+@_with_tool_timeout
 def kb_lint_fix(kb_id: str) -> str:
     """Auto-fix fixable lint issues in a knowledgebase.
 
@@ -232,6 +326,7 @@ def kb_lint_fix(kb_id: str) -> str:
 
 
 @mcp.tool()
+@_with_tool_timeout
 def kb_rebuild_index(kb_id: str) -> str:
     """Rebuild the wiki index page for a knowledgebase.
 
@@ -246,6 +341,7 @@ def kb_rebuild_index(kb_id: str) -> str:
 
 
 @mcp.tool()
+@_with_tool_timeout
 def kb_export(kb_id: str, output_dir: str) -> str:
     """Export all wiki pages to markdown files.
 
@@ -266,6 +362,7 @@ def kb_export(kb_id: str, output_dir: str) -> str:
 
 
 @mcp.tool()
+@_with_tool_timeout
 def kb_list() -> str:
     """List all knowledgebases.
 
@@ -277,6 +374,7 @@ def kb_list() -> str:
 
 
 @mcp.tool()
+@_with_tool_timeout
 def kb_info(kb_id: str) -> str:
     """Get knowledgebase details including source and page counts.
 
@@ -293,6 +391,7 @@ def kb_info(kb_id: str) -> str:
 
 
 @mcp.tool()
+@_with_tool_timeout
 def kb_query(kb_id: str, text: str, top_k: int | None = None) -> str:
     """Semantic (vector similarity) query across a knowledgebase.
 
@@ -315,6 +414,7 @@ def kb_query(kb_id: str, text: str, top_k: int | None = None) -> str:
 
 
 @mcp.tool()
+@_with_tool_timeout
 def kb_search(kb_id: str, text: str, top_k: int | None = None) -> str:
     """Keyword search across a knowledgebase.
 
@@ -331,6 +431,7 @@ def kb_search(kb_id: str, text: str, top_k: int | None = None) -> str:
 
 
 @mcp.tool()
+@_with_tool_timeout
 def kb_get_page(page_id: str) -> str:
     """Get a wiki page by ID.
 
@@ -347,6 +448,7 @@ def kb_get_page(page_id: str) -> str:
 
 
 @mcp.tool()
+@_with_tool_timeout
 def kb_list_pages(kb_id: str, page_type: str = "") -> str:
     """List wiki pages in a knowledgebase, optionally filtered by type.
 
@@ -378,6 +480,7 @@ def kb_list_pages(kb_id: str, page_type: str = "") -> str:
 
 
 @mcp.tool()
+@_with_tool_timeout
 def kb_get_source(source_id: str) -> str:
     """Get source details by ID.
 
@@ -394,6 +497,7 @@ def kb_get_source(source_id: str) -> str:
 
 
 @mcp.tool()
+@_with_tool_timeout
 def kb_list_sources(kb_id: str) -> str:
     """List all sources in a knowledgebase.
 
@@ -408,6 +512,7 @@ def kb_list_sources(kb_id: str) -> str:
 
 
 @mcp.tool()
+@_with_tool_timeout
 def kb_get_links(page_id: str, direction: str = "outbound") -> str:
     """Get the link graph for a wiki page.
 
@@ -425,6 +530,7 @@ def kb_get_links(page_id: str, direction: str = "outbound") -> str:
 
 
 @mcp.tool()
+@_with_tool_timeout
 def kb_pipeline_status(kb_id: str) -> str:
     """Check the pipeline status for a knowledgebase.
 
@@ -494,6 +600,7 @@ def _provenance() -> dict[str, str]:
 
 
 @mcp.tool()
+@_with_tool_timeout
 def kb_config_path() -> str:
     """Return the on-disk paths used for user- and project-level config.
 
@@ -519,6 +626,7 @@ def kb_config_path() -> str:
 
 
 @mcp.tool()
+@_with_tool_timeout
 def kb_config_show(scope: str = "merged") -> str:
     """Return configured values.
 
@@ -585,6 +693,7 @@ def kb_config_show(scope: str = "merged") -> str:
 
 
 @mcp.tool()
+@_with_tool_timeout
 def kb_config_get(key: str) -> str:
     """Return one setting by dotted path (e.g. ``embedding.model``).
 
@@ -613,6 +722,7 @@ def kb_config_get(key: str) -> str:
 
 
 @mcp.tool()
+@_with_tool_timeout
 def kb_config_set(scope: str, key: str, value: object) -> str:
     """Write a single setting to the user- or project-level config file.
 
@@ -655,6 +765,7 @@ def kb_config_set(scope: str, key: str, value: object) -> str:
 
 
 @mcp.tool()
+@_with_tool_timeout
 def kb_config_validate() -> str:
     """Dry-run config resolution and report per-file status.
 

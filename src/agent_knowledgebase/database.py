@@ -137,7 +137,13 @@ class Database:
     def __init__(self, db_path: Path) -> None:
         self.db_path = db_path
         db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(str(db_path))
+        # check_same_thread=False lets a connection built on thread A be
+        # reused from thread B (e.g., the MCP tool-timeout worker thread
+        # created lazily on the first @_with_tool_timeout call).  MCP's
+        # stdio transport serialises tool calls, and the per-KB
+        # ingestion lock in KnowledgebaseService serialises writes, so
+        # only one caller uses the connection at a time.
+        self._conn = sqlite3.connect(str(db_path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
