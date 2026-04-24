@@ -1,5 +1,116 @@
 # Changelog
 
+## [unreleased] — Pipeline-driven redesign (v2.1 spec)
+
+> Forecast only — proposed changes, not yet implemented.
+>
+> spec_id: `70ab2170-381a-4657-bcd1-28a40c6f369b`
+> Source spec: `pipeline_mcp_data/specs/agent-kb-redesign-spec-v2.1.json`
+> Detailed roadmap: `docs/redesign/ROADMAP.md`
+
+### Proposed (Phase 0 — bug fixes, no architecture change)
+
+- **Bug-1 (embeddings):** add `probe_dimension` method to `Embedder` protocol
+  so `RemoteEmbedder` no longer hardcodes `1536` for unknown models (e.g.
+  `qwen3-embedding:8b` which is 4096-dim) and `OllamaEmbedder.dimension` no
+  longer returns `0` until the first embed call. ChromaDB collection
+  validates `expected_dim` against stored dimension on init. Add HTTP-status
+  classification (404 model-not-pulled, 401/403 auth, 429 rate-limited) on
+  `EmbedderUnavailableError` beyond just timeout/network errors.
+- **Bug-2 (config error surfacing):** wrap `_get_service` (server.py:49-54)
+  in `try: ... except (pydantic.ValidationError, FileNotFoundError,
+  NotADirectoryError)` and return structured `{"error":"config_missing",
+  "missing":"AGENT_KB_SAVES_DIR", ...}` payload instead of opaque MCP
+  `InternalError`. Add `saves_dir` `default_factory=~/.agent-kb/saves` so
+  fresh installs work without env vars. Add `main()` startup precheck so
+  missing config fails immediately with structured stderr. NOTE: the v2.0
+  spec draft's "decorator NO-OP" diagnosis was inverted — current order
+  (`@mcp.tool()` outer, `@_with_tool_timeout` inner) works empirically
+  (tests/test_tool_timeout.py 6/6 passing including
+  `test_every_registered_mcp_tool_is_wrapped`). DO NOT swap.
+
+### Proposed (Phase 1 — Pattern A launcher)
+
+- Replace `.mcp.json` `command:uv,args:[run,...]` with single
+  cross-platform stdlib launcher: `command:python,
+  args:[${CLAUDE_PLUGIN_ROOT}/bin/run_server.py]`. The launcher
+  auto-bootstraps `.venv` via stdlib `venv` module, uses a SHA256
+  sentinel + filelock to avoid redundant pip installs, and emits
+  structured stderr for the three failure modes (`python_version`,
+  `network_unreachable`, `read_only_filesystem`).
+  `AGENT_KB_VENDORED_DEPS` provides an offline escape-hatch for
+  air-gapped installs.
+
+### Proposed (Phase 2 — RetrieverBackend abstraction)
+
+- New module `src/agent_knowledgebase/backends/__init__.py` exposes
+  `RetrieverBackend` `Protocol` and `get_backend(settings)` factory.
+  `ChromadbBackend` wraps existing chromadb logic with zero behavior
+  change. New `Settings.kb_backend: Literal['chromadb','markdown',
+  'lightrag'] = 'chromadb'` (loaded from new `AGENT_KB_BACKEND` env or
+  `kb_backend` JSON config key) — disambiguated from the existing
+  `Settings.vectorstore` which stays as the chromadb-internal
+  vector-store-provider choice. KnowledgebaseService routes all
+  retrieval through `self._backend`.
+
+### Proposed (Phase 3 — MarkdownWikiBackend opt-in)
+
+- New `backends/markdown_backend.py` — Karpathy-style markdown wiki under
+  `<saves_dir>/<kb-name>/wiki/{index.md,hot.md,log.md,pages/<slug>.md}`
+  with sqlite FTS5 in-memory index. NO embedding. Per-source_type
+  **positive-allow** list (`{file, website, api_endpoint with payload
+  <2MB}`); other source_types raise `KB_INGESTOR_UNSUITABLE` unless
+  `AGENT_KB_FORCE_WIKI_INGEST=1`. Sharded `index.md` above ~200 articles.
+
+### Proposed (Phase 4 — Migration tooling, BEFORE default-flip)
+
+- New `services/migration.py` with `export_to_markdown` /
+  `import_from_markdown` / `export_chromadb_dump` /
+  `import_chromadb_dump`. New additive `kb_migrate(kb_id, target_backend)`
+  MCP tool (probe-4-safe). Read-fallback: if `Settings.kb_backend='markdown'`
+  but `<kb-name>/wiki/` is missing while `<kb-name>/vector_store/` exists,
+  `ChromadbBackend` serves the query (silent fallback, structured stderr
+  emitted). Schema migration: `ALTER TABLE pages ADD COLUMN
+  embedding_provider TEXT`, `embed_base_url TEXT`. Backfill existing pages
+  from kb config.json. `create_embedder_for_model` now accepts
+  `(model_name, provider, base_url)` from the per-page snapshot. The
+  `migration_complete` sentinel file marks cutover.
+
+### Proposed (Phase 5 — Embedding defaults flip)
+
+- `embedding_provider` default flips `'ollama' → 'remote'`;
+  `embedding_model` default → `'text-embedding-3-small'`. New `'fastembed'`
+  provider (opt-in via `extras['embed-local-onnx']`, ~150MB).
+  sentence-transformers moves to opt-in `extras['embed-local-st']`
+  (+1.3GB). New `[project.optional-dependencies]` groups:
+  `embed-local-onnx`, `embed-local-st`, `ingest-codebase` (tree-sitter,
+  gitpython), `ingest-file` (pdfplumber), `ingest-sql` (sqlalchemy,
+  sqlparse). `embedder_version` stamped per chunk; ingest rejects mixed
+  versions on the same `kb_id` unless `AGENT_KB_AUTO_REEMBED=1`. MMR
+  lambda re-tuned for fastembed int8 quantization delta. Realistic
+  default install-size floor: **~700MB** (down from ~2GB; chromadb at
+  ~400MB and tree-sitter-languages at ~100MB stay in default install).
+  The earlier "~20MB" target was off by ~35x and has been corrected.
+- **Gate:** Phase 5 PR cannot merge until Phase 4 read-fallback +
+  per-page provider snapshot are in production.
+
+### Proposed (Phase 6 — LightRAGBackend, deferred)
+
+- Stub `backends/lightrag_backend.py` raising `NotImplementedError`.
+  Design doc `docs/lightrag_integration_design.md`. Implement only if
+  user adoption signals demand.
+
+### Frozen across the redesign
+
+- The 25 `kb_*` MCP tools (names, parameters, response shapes).
+- Probe-4 contract (`source_type`, `uri`, `dedup_key`, `page_id`,
+  `dominant_embedding_model`); backends return `null` for inapplicable
+  fields, NOT omit them.
+- `knowledgebase_stderr_log` 11-field schema.
+- SQL-injection AST validator + read-only sqlite + 50-row hard-reject.
+- `AGENT_KB_SAVES_DIR` semantics; cross-process-lock recipe;
+  `pipeline_runs` telemetry columns.
+
 ## 0.7.0 — 2026-04-21
 
 ### Changed (breaking)

@@ -1,0 +1,404 @@
+{
+  "spec_id": "70ab2170-381a-4657-bcd1-28a40c6f369b",
+  "title": "agent-knowledgebase Plugin Redesign v2",
+  "created_date": "2026-04-24",
+  "updated_date": "2026-04-24",
+  "version": "2.0",
+  "status": "draft",
+  "domain": "python MCP plugin for Claude Code",
+  "spec_type": "implementation",
+  "sources": [
+    {
+      "collection": "agent-kb-redesign-sources--curated",
+      "item_id": "yt-QHlB-RJfx8w",
+      "title": "LightRAG + Graph RAG for Claude Code in 2026",
+      "relevance": "LightRAG = candidate Graph-RAG backend behind RetrieverBackend abstraction; documents Ollama/OpenAI embedding parity"
+    },
+    {
+      "collection": "agent-kb-redesign-sources--curated",
+      "item_id": "yt-pIoKdpsuODg",
+      "title": "The 4 Design Patterns Behind Every AI Agent",
+      "relevance": "Stateless structured-JSON tool contract — plugin owns RAG only, no ambient state. Frozen by probe-4 hard non-goal."
+    },
+    {
+      "collection": "agent-kb-redesign-sources--curated",
+      "item_id": "yt-Ek0tZootK00",
+      "title": "ReFrag (Meta) — multi-vector + MMR",
+      "relevance": "Multi-vector-per-object + MMR. Domain-specialist demoted: chromadb cannot do this natively, requires parallel collections; documented as future-compat shape"
+    },
+    {
+      "collection": "agent-kb-redesign-sources--curated",
+      "item_id": "yt-sboNwYmH3AY",
+      "title": "Karpathy's LLM Wiki — markdown KB, no vector DB",
+      "relevance": "WIKI-STYLE = markdown backend. Reframed per debate as new opt-in backend, NOT a fix. Per-source_type cost model: bad fit for sql_database/codebase/git_history at scale; index.md sharding break-even ~200-300 articles."
+    },
+    {
+      "collection": "agent-kb-redesign-sources--curated",
+      "item_id": "yt-Cyv-dgv80kE",
+      "title": "LangChain AI Engineer's Guide — retriever abstraction",
+      "relevance": "RetrieverBackend interface (invoke(query, k, filters) -> List[Document]) — codifies the swap point for chromadb/markdown/lightrag without touching MCP surface"
+    },
+    {
+      "collection": "agent-kb-redesign-sources--curated",
+      "item_id": "yt-yF9kGESAi3M",
+      "title": "LangChain Master Class — RAG failure modes",
+      "relevance": "Per-page embedder model+version stamping prevents silent-failure mixing — already a dominant_embedding_model field; tighten to embedder_version under fastembed"
+    },
+    {
+      "collection": "agent-kb-redesign-sources--curated",
+      "item_id": "web-pep723-uv-alternatives",
+      "title": "Running Python MCP servers without uv",
+      "relevance": "Pattern A (stdlib venv auto-bootstrap) primary; pipx (C) and Docker (D) documented alternates. uvx is NOT valid 'remove uv' solution"
+    },
+    {
+      "collection": "agent-kb-redesign-sources--curated",
+      "item_id": "web-embedding-alternatives",
+      "title": "Lightweight embedding alternatives in 2026",
+      "relevance": "fastembed CONDITIONAL — int8/fp32 quantization delta requires MMR re-tune; remote-only Ollama default drops install ~2GB→~20MB"
+    },
+    {
+      "collection": "agent-kb-redesign-sources--curated",
+      "item_id": "claude-code-mcp-config-best-practices",
+      "title": "Claude Code .mcp.json config patterns",
+      "relevance": "${CLAUDE_PLUGIN_ROOT} substitution + stdio default. Pattern A as 'command: python args: [bin/run_server.py]' single launcher per debate domain-specialist"
+    }
+  ],
+  "overview": {
+    "description": "Redesign of agent-knowledgebase Claude Code plugin (current v0.6.0/0.7.0-WIP) to (1) fix two user-reported bugs in the embedding stack and the kb_* MCP tool surface; (2) remove uv as a hard runtime dependency by replacing the .mcp.json `command:uv,args:[run,...]` invocation with a single cross-platform Python launcher (Pattern A) that auto-bootstraps a stdlib venv; (3) introduce an AGENT_KB_BACKEND={chromadb|markdown|lightrag} feature flag that lets the QueryOrchestrator be swapped without touching the MCP tool contract; (4) preserve in full the v0.6.0 probe-4 contract, the SQL-injection AST validator, the stderr-tee schema, AGENT_KB_SAVES_DIR semantics, the cross-process lock recipe, and the 17-tool kb_* MCP surface. The redesign is gated behind a PRIOR DIAGNOSIS phase (Phase 0) — concrete bug fixes ship first under the existing chromadb backend with NO architecture change, then later phases introduce Pattern A, the RetrieverBackend abstraction, the markdown-wiki backend, fastembed/remote-only embedding defaults, and the dual-backend migration tooling. WIKI-STYLE is reframed as a new opt-in BACKEND OPTION, not a fix for the bugs (per debate synthesis); chromadb stays the default.",
+    "objectives": [
+      "Fix Bug-1: kb_query / kb_search / kb_ingest fail at runtime because (a) Ollama-default embedder reports dimension=0 until first call, never validated against ChromaDB collection's stored dimension, leading to silent dimension-mismatch on first ingest; (b) RemoteEmbedder.dimension hardcodes 1536 fallback regardless of configured model_name (line 248 in embeddings.py).",
+      "Fix Bug-2: every kb_* MCP tool's `_with_tool_timeout` decorator is a NO-OP at the MCP boundary — `@mcp.tool()` is applied OUTSIDE `@_with_tool_timeout` (server.py lines 164-822), so FastMCP registers the inner function and the wall-clock timeout never engages. The 180s timeout, executor-reset, and sqlite3 thread-affinity workaround all run in dead code at the MCP entry-point.",
+      "Remove uv as a hard runtime dependency: .mcp.json must launch via `command:python, args:[\"${CLAUDE_PLUGIN_ROOT}/bin/run_server.py\"]` so any system Python>=3.11 on PATH is sufficient. The launcher self-bootstraps a stdlib venv with sentinel-based reuse and a cross-process lock.",
+      "Introduce AGENT_KB_BACKEND feature flag — chromadb default; markdown opt-in; lightrag opt-in (deferred). RetrieverBackend protocol is the single swap-point.",
+      "Preserve the v0.6.0 probe-4 contract: kb_create, kb_list, kb_info, kb_ingest, kb_ingest_batch, kb_list_pages, kb_list_sources, kb_update_source, kb_remove_source, kb_query, kb_search, kb_config_path, kb_config_show, kb_config_get, kb_config_set, kb_config_validate, kb_pipeline_status — tool names, parameter names, response shapes ALL frozen. Plus kb_delete, kb_lint, kb_lint_fix, kb_rebuild_index, kb_export, kb_get_page, kb_get_source, kb_get_links from current server.py.",
+      "Default install size drops from ~2GB to ~20MB (remote-only) or ~100MB (fastembed-local opt-in)."
+    ],
+    "constraints": [
+      "HARD NON-GOAL: redesign must NOT regress probe-4 contract enforced by data-etl-orchestrator >= v0.4.0.",
+      "HARD NON-GOAL: SQL-injection AST validator (where_clause_validator + read-only sqlite ?mode=ro + 50-row hard-reject) is frozen — any change to ingestors/sql_database* requires test_where_clause_validator.py + test_sql_database_ingest.py green.",
+      "HARD NON-GOAL: knowledgebase_stderr_log JSON schema (11 fields) is frozen across all backends. Pinned by contract test.",
+      "HARD NON-GOAL: AGENT_KB_SAVES_DIR semantics, cross-process-lock recipe (filelock-based per-kb_id locking), and pipeline_runs telemetry columns from v0.6.0 carry forward unchanged across all backends.",
+      "HARD NON-GOAL: kb_* MCP tool names + minimum response shape (source_type, uri, dedup_key, page_id, dominant_embedding_model) are frozen by probe-4. Backend swap preserves them at MCP boundary.",
+      "Forbid partial migration: if sentence-transformers removed, codebase/directory/git_history ingestors must either (a) ship remote-embedding fallback FIRST or (b) emit KB_INGESTOR_UNAVAILABLE structured error. No silent half-broken state.",
+      "Pattern A launcher MUST distinguish 3 failure modes with structured stderr — python-not-found, network-unreachable (PyPI 30s timeout), read-only-filesystem — and provide AGENT_KB_VENDORED_DEPS=/path/to/wheels offline escape-hatch.",
+      "Backwards compatibility: kb_info on v0.6.0-ingested KB must return all fields probe-4 inspects, regardless of new backend (contract test pins this)."
+    ],
+    "assumptions": [
+      "Target users have a system Python>=3.11 on PATH; if not, structured stderr instructs them to install Python (the launcher's only hard prerequisite).",
+      "Ollama running on http://127.0.0.1:11434 is a common-enough development setup that it remains a valid default base_url for the 'ollama' provider, but the default provider after redesign is 'remote' targeting an OpenAI-compatible endpoint.",
+      "ChromaDB collection-per-kb-id pattern (one collection per knowledgebase, name = kb_id) is preserved exactly as in v0.6.0 vectorstore.py.",
+      "Existing v0.6.0 chromadb-indexed KBs must continue to query AS-IS during the dual-backend transition window (read-fallback semantics).",
+      "fastembed and onnxruntime ABI compatibility on Windows ARM and macOS-arm64 is acceptable but not load-bearing — fastembed is opt-in only.",
+      "Multi-vector-per-object (title + body + summary vectors) is documented as a forward-compatible shape but NOT implemented in this redesign — chromadb cannot host it natively (debate domain-specialist), and parallel-collection orchestration is out of scope."
+    ]
+  },
+  "architecture": {
+    "components": [
+      {
+        "name": "bin/run_server.py — Pattern A single Python launcher",
+        "responsibility": "Cross-platform venv auto-bootstrap and server invocation. Replaces .mcp.json's `command:uv,args:[run,...]`. Invoked as `command:python, args:[${CLAUDE_PLUGIN_ROOT}/bin/run_server.py]`. (1) Locate or create ${CLAUDE_PLUGIN_ROOT}/.venv via stdlib `venv` module (handles Scripts/ on Windows, bin/ on Unix). (2) Acquire ${CLAUDE_PLUGIN_ROOT}/.venv.lock via filelock to make first-run pip install crash-safe under concurrent Claude Code worker spawns. (3) Compute SHA256(requirements.lock) and compare against ${CLAUDE_PLUGIN_ROOT}/.venv/.req-sha — if mismatch, run `pip install -r requirements.lock` (or AGENT_KB_VENDORED_DEPS path) inside venv, write new sentinel; if match, skip. (4) Verify Python>=3.11 fail-fast with structured stderr. (5) Three structured stderr error modes: {error:'python_version', detail:'<3.11'} ; {error:'network_unreachable', detail:'PyPI 30s timeout — set AGENT_KB_VENDORED_DEPS'} ; {error:'read_only_filesystem', detail:'CLAUDE_PLUGIN_ROOT not writable'}. (6) os.execv venv-python `-m agent_knowledgebase.server`. Single file — NO bash/cmd companion.",
+        "dependencies": [
+          "Python>=3.11 stdlib only (venv, filelock via stdlib fcntl/msvcrt fallback, hashlib, subprocess, json, sys)"
+        ]
+      },
+      {
+        "name": "AGENT_KB_BACKEND feature flag + RetrieverBackend protocol",
+        "responsibility": "New env var AGENT_KB_BACKEND={chromadb|markdown|lightrag} (default chromadb). Promotes existing QueryOrchestrator into a strict abstraction: `class RetrieverBackend(Protocol)` with methods `add(...) -> None`, `query(text, top_k, filters) -> list[QueryResult]`, `search(text, top_k, filters) -> list[QueryResult]`, `delete(ids) -> None`, `count() -> int`, `health_check() -> dict`. ChromaDBBackend = current behavior wrapped. MarkdownWikiBackend reads filesystem directly (no embedding). LightRAGBackend forwards to localhost:9621 REST API. KnowledgebaseService selects backend at construction time via Settings.backend.",
+        "dependencies": [
+          "src/agent_knowledgebase/services/retriever.py (new)",
+          "src/agent_knowledgebase/services/backends/chromadb_backend.py (new)",
+          "src/agent_knowledgebase/services/backends/markdown_backend.py (new, Phase 3)",
+          "src/agent_knowledgebase/services/backends/lightrag_backend.py (deferred, Phase 6+)"
+        ]
+      },
+      {
+        "name": "Embedding layer — remote-only default, fastembed optional, sentence-transformers retained",
+        "responsibility": "Refactor src/agent_knowledgebase/services/embeddings.py. (1) Default embedding_provider switches to 'remote' targeting OpenAI-compatible /embeddings (Ollama's /v1 surface or hosted API). embedding_model default becomes 'text-embedding-3-small' to match RemoteEmbedder._REMOTE_EMBEDDING_DIMENSIONS table. (2) Add 'fastembed' provider — uses qdrant-fastembed library with ONNX MiniLM. ~100MB optional install. (3) sentence-transformers retained as backwards-compat (BC) for v0.6.0 KBs but no longer default. (4) Stamp embedder_version (not just model_name) on every chunk ingest — fastembed-MiniLM-int8 != HF-MiniLM-fp32 even though both are 'all-MiniLM-L6-v2'. Add Chunk.embedder_version column. (5) Probe embedding dimension via single-text dry-run on first use, persist to KB metadata; reject ingest/query if dimension mismatches stored.",
+        "dependencies": [
+          "httpx (already in deps)",
+          "qdrant-fastembed (optional, opt-in install)",
+          "Migration: ALTER TABLE chunks ADD COLUMN embedder_version TEXT"
+        ]
+      },
+      {
+        "name": "MCP tool surface — frozen v0.6.0 contract preserved verbatim",
+        "responsibility": "src/agent_knowledgebase/server.py keeps all 25 currently registered tools (kb_create, kb_delete, kb_ingest, kb_ingest_batch, kb_update_source, kb_remove_source, kb_lint, kb_lint_fix, kb_rebuild_index, kb_export, kb_list, kb_info, kb_query, kb_search, kb_get_page, kb_list_pages, kb_get_source, kb_list_sources, kb_get_links, kb_pipeline_status, kb_config_path, kb_config_show, kb_config_get, kb_config_set, kb_config_validate). Tool signatures + response shapes UNCHANGED. Decorator order BUG FIX: `@mcp.tool()` must be applied AFTER `@_with_tool_timeout` so the registered callable carries the timeout wrap. Tool dispatcher in KnowledgebaseService routes through RetrieverBackend selected by Settings.backend.",
+        "dependencies": [
+          "server.py decorator order swap (Phase 0)",
+          "tests/test_every_registered_tool_is_wrapped (existing, currently failing — fixes confirm Bug-2 diagnosis)"
+        ]
+      },
+      {
+        "name": "Tool-timeout decorator — fix decorator order at MCP boundary",
+        "responsibility": "Bug-2 root cause: server.py applies `@mcp.tool()` OUTSIDE `@_with_tool_timeout` for every tool (lines 164-822). FastMCP registers the un-wrapped function. Fix: swap to `@_with_tool_timeout` then `@mcp.tool()` so the wrap is registered. Adds explicit ordering test to test_tool_timeout.py.",
+        "dependencies": [
+          "server.py — 25 decorator-order swaps"
+        ]
+      },
+      {
+        "name": "Migration tooling — dual-backend transition window",
+        "responsibility": "src/agent_knowledgebase/services/migration.py (new). (a) export_kb(kb_id, format='markdown_wiki'|'chromadb_dump') CLI subcommand. (b) import_kb(kb_id, source_path) CLI subcommand. (c) Dual-backend read-fallback at QueryOrchestrator: if Settings.backend='markdown' but a KB still has chromadb collection, read from chromadb until export+reimport completes. (d) kb_migrate(kb_id, target_backend) MCP tool (NEW — additive, non-breaking; not required by probe-4). (e) Hard-cutover criterion: migration_complete sentinel file under saves_dir/<kb-name>/.migrated_to=<backend>. (f) AGENT_KB_BACKEND_PER_KB env override format: kb_id=backend, comma-separated.",
+        "dependencies": [
+          "RetrieverBackend abstraction (Phase 2 must precede)",
+          "Both source and target backends must coexist for the transition window (Phase 5)"
+        ]
+      },
+      {
+        "name": "MarkdownWikiBackend — Karpathy-style backend",
+        "responsibility": "src/agent_knowledgebase/services/backends/markdown_backend.py. Layout under saves_dir/<kb-name>/wiki/: index.md (LLM-maintained), hot.md (~500-char hot cache), log.md (op history), pages/<slug>.md per article. Ingest flow: kb_ingest writes raw source under raw/, schedules an LLM-driven page-extraction (out-of-band — NOT during MCP RPC). Query flow: backend reads index.md, returns top-K candidate page IDs based on FTS over pages/*.md (sqlite FTS5 in-memory). NO embedding. Sharded index.md when article-count crosses 200-300 (per debate domain-specialist break-even). Per-source_type guard: backend.add() raises KB_INGESTOR_UNSUITABLE for source_type in {sql_database, codebase, git_history} unless AGENT_KB_FORCE_WIKI_INGEST=1 (debate per-source_type cost model: hours of LLM cost at 1000+ rows).",
+        "dependencies": [
+          "sqlite FTS5 (stdlib)",
+          "trafilatura (already in deps for source extraction)",
+          "RetrieverBackend abstraction"
+        ]
+      },
+      {
+        "name": "Documentation — alternate runtime patterns",
+        "responsibility": "README updates: Pattern A is default (.mcp.json ships ready-to-use); Pattern C (pipx install agent-knowledgebase-claude-plugin) documented as alternate WITH explicit caveat that Claude Code plugin marketplace does NOT auto-run pipx install — user step required; Pattern D (Docker GHCR image) documented as zero-Python-on-host alternate. PEP-723 noted as future-only path.",
+        "dependencies": [
+          "pyproject.toml [project.scripts] entry — agent-knowledgebase-server = 'agent_knowledgebase.server:main'",
+          "Dockerfile (Phase 6+)"
+        ]
+      }
+    ],
+    "data_flow": "MCP request → server.py @_with_tool_timeout wrapper (now correctly outermost) → KnowledgebaseService → RetrieverBackend (selected by AGENT_KB_BACKEND) → {ChromaDBBackend → embedder.embed_query → chromadb collection} OR {MarkdownWikiBackend → sqlite FTS5 over pages/*.md} OR {LightRAGBackend → HTTP localhost:9621 → REST endpoint}. Response → JSON serialization (preserved v0.6.0 shape) → MCP. Telemetry: every call writes one line to knowledgebase_stderr_log (11 fields, frozen schema). pipeline_runs row written for kb_ingest / kb_ingest_batch / kb_update_source. Cross-process lock acquired per-kb_id for any write path (ingest, update, remove).",
+    "integration_points": [
+      ".mcp.json — replaces `command:uv,args:[run,...]` with `command:python,args:[${CLAUDE_PLUGIN_ROOT}/bin/run_server.py]`",
+      "data-etl-orchestrator probe-4 — frozen contract; agent-knowledgebase >= 0.6.0 floor unchanged. Probe inspects kb_info response fields (source_type, uri, dedup_key, page_id, dominant_embedding_model) — backend swap MUST preserve.",
+      "consumer-side stderr-capture discipline — knowledgebase_stderr_log 11-field schema preserved across backends. Contract test: tests/contract/test_stderr_schema.py.",
+      "AGENT_KB_SAVES_DIR — required env var unchanged; backend selects storage shape under <saves_dir>/<sanitized-name>/{vector_store/ for chromadb, wiki/ for markdown}.",
+      "Cross-process file lock — preserved per-kb_id (filelock under <saves_dir>/<sanitized-name>/.lock).",
+      "AGENT_KB_BACKEND new env var — chromadb (default) | markdown | lightrag.",
+      "AGENT_KB_BACKEND_PER_KB new env var — per-kb override format (kb_id1=markdown,kb_id2=chromadb).",
+      "AGENT_KB_VENDORED_DEPS new env var — offline escape-hatch path to wheels for air-gapped install.",
+      "AGENT_KB_FORCE_WIKI_INGEST new env var — bypass per-source_type guard on markdown backend."
+    ]
+  },
+  "implementation": {
+    "phases": [
+      {
+        "description": "SHIP FIRST. Fix the two stated bugs under the existing chromadb backend with zero architectural change. Establishes that the redesign is additive, not replacement-driven. PR small, reviewable, test-anchored. Per debate: 'concrete bug-diagnosis phase BEFORE the redesign decision' is a HARD prerequisite.",
+        "tasks": [
+          "Fix Bug-2 decorator order in server.py: for each of the 25 @mcp.tool()-decorated functions (lines 164-822), swap so @_with_tool_timeout is INNER and @mcp.tool() is OUTER. Run test_every_registered_mcp_tool_is_wrapped (existing pending test) to confirm.",
+          "Add tests/contract/test_decorator_order.py: assert mcp._tool_manager._tools[name].fn.__wrapped__ exists AND is the original (not the timeout wrapper) — failing this is the regression guard for Bug-2.",
+          "Fix Bug-1 dimension validation in embeddings.py: (a) add `probe_dimension(self) -> int` method to Embedder protocol that issues a single dry-run embed of 'probe' and returns len(vector); (b) RemoteEmbedder uses probe_dimension if model_name not in _REMOTE_EMBEDDING_DIMENSIONS instead of hardcoding 1536; (c) OllamaEmbedder calls probe_dimension on first __init__ if dimension_cache is None and the caller asked for .dimension; (d) ChromaDBStore.__init__ accepts expected_dim and asserts collection.metadata['dim'] matches OR sets it on creation.",
+          "Add tests/test_embedder_dimension_probe.py: mock httpx response, assert RemoteEmbedder('qwen3-embedding:8b').dimension probes via embed call (does NOT return 1536 fallback).",
+          "Add tests/test_chromadb_dimension_mismatch.py: ingest with embedder A (dim=384), then attempt query with embedder B (dim=1536) — service must raise EmbedderDimensionMismatchError, not silently mismatch.",
+          "Run full pytest suite + ruff + (optionally) mypy. Pre-existing lint/type errors flagged in CLAUDE.md must be fixed or explicitly listed.",
+          "Bump pyproject.toml version 0.7.0 → 0.7.1, append CHANGELOG entry pinning the two bug fixes."
+        ],
+        "deliverables": [
+          "PR: 'fix(kb): restore tool-timeout wrap at MCP boundary + dimension probing'",
+          "tests/contract/test_decorator_order.py",
+          "tests/test_embedder_dimension_probe.py",
+          "tests/test_chromadb_dimension_mismatch.py",
+          "CHANGELOG.md entry for 0.7.1",
+          "MISTAKES.md entry: 'Decorator order at @mcp.tool() boundary — outer decorator is what FastMCP registers; place @_with_tool_timeout INNER to it.'"
+        ],
+        "phase": 1,
+        "name": "Phase 0 — Bug Diagnosis + Direct Fixes (no architecture change)"
+      },
+      {
+        "description": "Replace uv with stdlib-venv auto-bootstrap. New file bin/run_server.py is the single cross-platform Python launcher. .mcp.json updates from `command:uv` to `command:python, args:[${CLAUDE_PLUGIN_ROOT}/bin/run_server.py]`. Per debate domain-specialist: NO bash+.cmd pair; one Python file handles cross-platform venv create + activate.",
+        "tasks": [
+          "Create bin/run_server.py with: stdlib-venv create, requirements.lock SHA256 sentinel reuse, filelock-based cross-process bootstrap lock, 30s pip-install network timeout, three structured stderr error modes (python_version, network_unreachable, read_only_filesystem), AGENT_KB_VENDORED_DEPS escape-hatch, os.execv hand-off to venv python -m agent_knowledgebase.server.",
+          "Generate requirements.lock from current pyproject.toml deps (no torch yet — that's Phase 4).",
+          "Update .mcp.json: command='python', args=['${CLAUDE_PLUGIN_ROOT}/bin/run_server.py'].",
+          "Add tests/test_run_server_bootstrap.py: simulate fresh CLAUDE_PLUGIN_ROOT, assert venv created, sentinel written, second invocation skips pip install (fast path).",
+          "Add tests/test_run_server_failure_modes.py: monkey-patch python version → assert structured stderr; monkey-patch pip subprocess → assert network_unreachable stderr.",
+          "Document Pattern C (pipx) and Pattern D (Docker) as ALTERNATES in README, with explicit Pattern C marketplace caveat (manual pipx install required).",
+          "Verify on Windows + macOS + Linux: bootstrap works, .venv path uses Scripts/ on Windows and bin/ on Unix."
+        ],
+        "deliverables": [
+          "bin/run_server.py",
+          "requirements.lock (deterministic, generated)",
+          ".mcp.json (uv removed)",
+          "tests/test_run_server_bootstrap.py",
+          "tests/test_run_server_failure_modes.py",
+          "README.md updates: Pattern A default; Pattern B/C/D documented",
+          "CHANGELOG entry for 0.8.0 — 'remove uv as runtime dependency'"
+        ],
+        "phase": 2,
+        "name": "Phase 1 — Pattern A single-launcher runtime bootstrap"
+      },
+      {
+        "description": "Promote QueryOrchestrator into a strict protocol. Add AGENT_KB_BACKEND env. Wrap existing chromadb code as ChromaDBBackend with no behavior change. Default: chromadb (per debate accepted change).",
+        "tasks": [
+          "Add Settings.backend: Literal['chromadb','markdown','lightrag'] = 'chromadb' to config.py.",
+          "Create src/agent_knowledgebase/services/retriever.py with RetrieverBackend Protocol (add, query, search, delete, count, health_check, plus probe-4-required metadata getters).",
+          "Refactor existing services/query.py + services/vectorstore.py + services/wiki.py interactions into ChromaDBBackend implementing RetrieverBackend. Zero behavior change asserted by existing test suite passing unchanged.",
+          "KnowledgebaseService.__init__ selects backend via Settings.backend.",
+          "Add tests/test_retriever_backend_protocol.py: contract tests every backend must satisfy.",
+          "Add tests/contract/test_probe4_response_shape.py: kb_info / kb_list_pages / kb_list_sources return v0.6.0-shaped JSON regardless of which backend is selected. (markdown backend returns null for embedding-related fields where N/A — probe-4 must accept null.)"
+        ],
+        "deliverables": [
+          "src/agent_knowledgebase/services/retriever.py — RetrieverBackend Protocol",
+          "src/agent_knowledgebase/services/backends/chromadb_backend.py — wraps existing chromadb logic",
+          "src/agent_knowledgebase/services/backends/__init__.py",
+          "Updated config.py with backend setting",
+          "tests/test_retriever_backend_protocol.py",
+          "tests/contract/test_probe4_response_shape.py"
+        ],
+        "phase": 3,
+        "name": "Phase 2 — RetrieverBackend abstraction behind feature flag"
+      },
+      {
+        "description": "Implement Karpathy-style markdown wiki backend. NOT default. Per-source_type guard. Sharded index above 200 articles. Per debate: WIKI-STYLE is a NEW BACKEND, not a fix.",
+        "tasks": [
+          "Create src/agent_knowledgebase/services/backends/markdown_backend.py — implements RetrieverBackend protocol over <saves_dir>/<kb-name>/wiki/.",
+          "Layout: raw/, wiki/index.md, wiki/hot.md, wiki/log.md, wiki/pages/<slug>.md.",
+          "Ingest: kb_ingest writes raw source, schedules out-of-band LLM page-extraction. RPC returns immediately with status='pending_extraction'. (kb_ingest_batch tolerates this status.)",
+          "Query: sqlite FTS5 in-memory index over pages/*.md content; top-K results returned with page_id + slug + score. NO embedding.",
+          "Sharded index.md: when article count > 200, split into wiki/index/<category>.md with wiki/index.md as directory. Per debate domain-specialist break-even.",
+          "Per-source_type guard: source_type in {sql_database, codebase, git_history} raises KB_INGESTOR_UNSUITABLE error unless AGENT_KB_FORCE_WIKI_INGEST=1.",
+          "Add tests/test_markdown_backend.py: ingest 1 article, assert index.md updated, query returns it; ingest 250 articles, assert index sharded; ingest source_type=sql_database, assert KB_INGESTOR_UNSUITABLE."
+        ],
+        "deliverables": [
+          "src/agent_knowledgebase/services/backends/markdown_backend.py",
+          "tests/test_markdown_backend.py",
+          "tests/contract/test_markdown_backend_probe4_shape.py",
+          "docs/markdown_backend.md — usage guide"
+        ],
+        "phase": 4,
+        "name": "Phase 3 — MarkdownWikiBackend (opt-in)"
+      },
+      {
+        "description": "Default embedding_provider switches to 'remote'. fastembed becomes opt-in. sentence-transformers retained for BC. Add embedder_version stamp on every chunk. Per debate: fastembed is CONDITIONAL, not drop-in — re-tune MMR; track embedder_version.",
+        "tasks": [
+          "config.py: change embedding_provider default from 'ollama' to 'remote'; embedding_model default to 'text-embedding-3-small'.",
+          "Add 'fastembed' provider to embeddings.py — uses qdrant-fastembed library if installed; raise ImportError pointing to `pip install agent-knowledgebase[fastembed]` if not.",
+          "ALTER TABLE chunks ADD COLUMN embedder_version TEXT (database.py migration).",
+          "Stamp Chunk.embedder_version on every ingest. fastembed-MiniLM-int8 ≠ HF-MiniLM-fp32 even at same model_name.",
+          "Reject mixed embedder_version on same kb_id at ingest time unless AGENT_KB_AUTO_REEMBED=1.",
+          "Re-tune MMR lambda thresholds for fastembed int8 quantization delta — add a fastembed-specific tuning constant in retriever config.",
+          "Update pyproject.toml [project.optional-dependencies]: fastembed = ['qdrant-fastembed>=0.4'].",
+          "Drop sentence-transformers from default install; keep as optional [project.optional-dependencies]: sentence-transformers = ['sentence-transformers>=3.0'].",
+          "Regenerate requirements.lock with new defaults — install size now ~20MB."
+        ],
+        "deliverables": [
+          "Updated services/embeddings.py with fastembed provider",
+          "database.py schema migration for embedder_version column",
+          "pyproject.toml optional dependency groups",
+          "Regenerated requirements.lock (~20MB target)",
+          "tests/test_fastembed_dimension_compat.py",
+          "tests/test_embedder_version_mismatch.py"
+        ],
+        "phase": 5,
+        "name": "Phase 4 — Embedding defaults: remote-only default, fastembed optional, embedder_version stamping"
+      },
+      {
+        "description": "Allow existing chromadb KBs to coexist with new markdown KBs. Provide export/import CLI subcommands. Hard-cutover criteria. Per debate: 'data-migration concept: dual-backend transition window, read-fallback, export-and-reimport'.",
+        "tasks": [
+          "Add kb_migrate(kb_id, target_backend) MCP tool — additive (probe-4-safe, not in frozen contract list).",
+          "Implement src/agent_knowledgebase/services/migration.py: export_to_markdown(kb_id, dest), import_from_markdown(kb_id, src), export_chromadb_dump(kb_id, dest), import_chromadb_dump(kb_id, src).",
+          "Read-fallback: if Settings.backend='markdown' but <kb-name>/wiki/ does not exist while <kb-name>/vector_store/ does, ChromaDBBackend serves the query — silent fallback, structured stderr line emitted.",
+          "AGENT_KB_BACKEND_PER_KB env: comma-separated kb_id=backend pairs override global Settings.backend per KB.",
+          "migration_complete sentinel file: <saves_dir>/<kb-name>/.migrated_to=<backend> — written after kb_migrate succeeds.",
+          "tests/test_migration_chromadb_to_markdown.py: ingest under chromadb, run migrate, assert wiki/ created, assert kb_query routes to markdown backend, assert old chromadb collection still readable until cutover sentinel written."
+        ],
+        "deliverables": [
+          "src/agent_knowledgebase/services/migration.py",
+          "kb_migrate MCP tool in server.py",
+          "tests/test_migration_chromadb_to_markdown.py",
+          "docs/migration_guide.md"
+        ],
+        "phase": 6,
+        "name": "Phase 5 — Migration tooling + dual-backend transition"
+      },
+      {
+        "description": "OPTIONAL — implement only if user adoption signals demand. Forwards queries to localhost:9621 LightRAG REST API. Out of scope for v0.8.x — documented as future path.",
+        "tasks": [
+          "Stub services/backends/lightrag_backend.py raising NotImplementedError until activated.",
+          "Document docker-compose.yml integration for LightRAG sidecar.",
+          "Write design doc (NOT code) for AGENT_KB_BACKEND=lightrag activation."
+        ],
+        "deliverables": [
+          "Stub services/backends/lightrag_backend.py",
+          "docs/lightrag_integration_design.md (no code, design doc only)"
+        ],
+        "phase": 7,
+        "name": "Phase 6 — LightRAGBackend (deferred, conditional)"
+      }
+    ],
+    "tech_stack": [
+      "Python 3.11+",
+      "stdlib venv + filelock (cross-process bootstrap lock)",
+      "FastMCP (mcp>=1.0)",
+      "pydantic 2 + pydantic-settings",
+      "httpx (remote embeddings)",
+      "chromadb 0.5+ (default backend, optional with markdown)",
+      "qdrant-fastembed (optional, [fastembed] extra)",
+      "sentence-transformers (optional BC, [sentence-transformers] extra)",
+      "sqlite + FTS5 (markdown backend index)",
+      "trafilatura (existing — markdown source extraction)",
+      "tiktoken (existing — chunk tokenization)",
+      "tree-sitter + tree-sitter-languages (codebase ingestor)",
+      "gitpython (git_history ingestor)",
+      "sqlalchemy + sqlparse (sql_database ingestor + AST validator — frozen)",
+      "pdfplumber (file ingestor)"
+    ],
+    "complexity": "high"
+  },
+  "risks": [
+    {
+      "description": "probe-4 contract regression — any change to kb_info / kb_list_pages / kb_list_sources response shape breaks data-etl-orchestrator >= v0.4.0 dispatch. Especially risky in Phase 2 (RetrieverBackend abstraction) and Phase 3 (markdown backend) where backends may not have an 'embedding_model' field.",
+      "severity": "high",
+      "mitigation": "tests/contract/test_probe4_response_shape.py runs in CI on every PR. Backends MUST return null for inapplicable fields, not omit them. Snapshot test of kb_info JSON shape against v0.6.0 fixture. Block merge if shape diverges."
+    },
+    {
+      "description": "Partial migration leaves silent half-broken state. E.g. sentence-transformers removed from default install, but codebase ingestor still imports it — runtime ImportError at first kb_ingest of source_type=codebase.",
+      "severity": "high",
+      "mitigation": "Forbid partial migration: if sentence-transformers removed, ingestors that depended on it must (a) ship remote-embedding fallback FIRST or (b) emit KB_INGESTOR_UNAVAILABLE structured error with explicit AGENT_KB_INGESTOR_ENABLE=codebase opt-in. Phase 4 PR description explicitly calls out which ingestors lose what defaults."
+    },
+    {
+      "description": "Pattern A launcher fails on Windows stdio launch. Claude Code passes the command directly to OS process spawner; if the shebang or PATHEXT resolution misbehaves, the launcher hangs at start without producing diagnostics.",
+      "severity": "high",
+      "mitigation": "Single .py file launcher invoked via 'python <path>' (NOT direct shebang) — always resolves via the `python` on PATH which works identically on Windows/macOS/Linux. Explicit Windows test in CI matrix. Structured stderr is the diagnostic surface — 'python_version' / 'network_unreachable' / 'read_only_filesystem' tokens. tests/test_run_server_failure_modes.py exercises each."
+    },
+    {
+      "description": "MMR re-tune required under fastembed int8/fp32 quantization delta. fastembed-MiniLM produces ~1e-4 cosine drift vs HF-MiniLM-fp32 — below recall noise floor BUT material at MMR diversity threshold boundary (1e-4 deltas swing top-3 vs top-4 selection per debate domain-specialist).",
+      "severity": "medium",
+      "mitigation": "embedder_version (not just model_name) stamped on every chunk. Per-embedder MMR lambda constant in retriever config. Phase 4 ships with re-tuned default for fastembed; existing chromadb KBs continue using HF-MiniLM lambda. Add tests/test_mmr_diversity_per_embedder.py."
+    },
+    {
+      "description": "Wiki cost at 200-300 article break-even — single index.md saturates around 200-300 articles. Above this, per-query token cost grows O(N) without sharding.",
+      "severity": "medium",
+      "mitigation": "MarkdownWikiBackend implements automatic index.md sharding when article count > 200 (per-category subdirectories). tests/test_markdown_backend.py asserts shard transition. Documented in docs/markdown_backend.md cost model."
+    },
+    {
+      "description": "WIKI-STYLE per-source_type cost — sql_database/codebase/git_history with 1000+ rows is hours of LLM cost per ingest. Users may accidentally select markdown backend for these source types.",
+      "severity": "medium",
+      "mitigation": "Per-source_type guard in MarkdownWikiBackend.add() raises KB_INGESTOR_UNSUITABLE for source_type in {sql_database, codebase, git_history}. AGENT_KB_FORCE_WIKI_INGEST=1 to bypass with stderr warning. Cost model documented in markdown_backend.md."
+    },
+    {
+      "description": "Network-unreachable during first-run pip install — corporate laptops on captive portals fail bootstrap. Air-gapped environments fail unconditionally.",
+      "severity": "medium",
+      "mitigation": "AGENT_KB_VENDORED_DEPS env points to a local wheels directory; launcher uses --no-index --find-links=$AGENT_KB_VENDORED_DEPS. README documents how to vendor wheels: `pip download -d wheels/ -r requirements.lock`. Structured stderr 'network_unreachable' token instructs the user."
+    },
+    {
+      "description": "SQL-injection AST validator regression — Phase 2 RetrieverBackend refactor may inadvertently reroute sql_database ingest path around the where_clause_validator.",
+      "severity": "high",
+      "mitigation": "tests/test_where_clause_validator.py + tests/test_sql_database_ingest.py are hard merge gates. The SQL ingestor lives in src/agent_knowledgebase/ingestors/, NOT in services/backends/ — refactor explicitly preserves this boundary."
+    },
+    {
+      "description": "Pattern C marketplace caveat — pipx is NOT auto-installed by Claude Code plugin marketplace. Users selecting Pattern C from docs face a manual prerequisite step that breaks the 'click to install' UX.",
+      "severity": "low",
+      "mitigation": "README documents Pattern C as 'BYO pipx — run `pipx install agent-knowledgebase-claude-plugin` once'. Pattern A remains default; Pattern C is documented alternate."
+    }
+  ],
+  "success_criteria": [
+    "User Bug-1 fixed: kb_query / kb_search / kb_ingest return correct results without dimension-mismatch errors. Verified by tests/test_chromadb_dimension_mismatch.py + tests/test_embedder_dimension_probe.py green.",
+    "User Bug-2 fixed: every kb_* MCP tool's wall-clock timeout actually engages at the MCP boundary. Verified by tests/contract/test_decorator_order.py green AND tests/test_tool_timeout.py::test_every_registered_mcp_tool_is_wrapped green.",
+    "uv is no longer required to launch the server. Verified by .mcp.json containing `command:python, args:[...run_server.py]` and CI launching the server on a uv-free image.",
+    "probe-4 contract still passes — data-etl-orchestrator >= v0.4.0 dispatches successfully against the redesigned plugin. Verified by tests/contract/test_probe4_response_shape.py + manual end-to-end probe with the consumer plugin.",
+    "AGENT_KB_BACKEND=chromadb (default) preserves all v0.6.0 behavior — existing KBs query identically. Verified by replaying v0.6.0 test suite against new code.",
+    "AGENT_KB_BACKEND=markdown opt-in works — kb_ingest of source_type=file produces wiki/pages/*.md and updates wiki/index.md. Verified by tests/test_markdown_backend.py.",
+    "Default install size dropped from ~2GB to ~20MB (remote-only) or ~100MB ([fastembed] extra). Verified by inspecting requirements.lock + `pip install` size measurement.",
+    "All 25 frozen kb_* MCP tools (kb_create, kb_delete, kb_ingest, kb_ingest_batch, kb_update_source, kb_remove_source, kb_lint, kb_lint_fix, kb_rebuild_index, kb_export, kb_list, kb_info, kb_query, kb_search, kb_get_page, kb_list_pages, kb_get_source, kb_list_sources, kb_get_links, kb_pipeline_status, kb_config_path, kb_config_show, kb_config_get, kb_config_set, kb_config_validate) keep their v0.6.0 names + signatures + response shapes. Verified by FastMCP tool registration snapshot test.",
+    "knowledgebase_stderr_log 11-field schema preserved across all backends. Verified by tests/contract/test_stderr_schema.py.",
+    "Cross-process lock recipe still functional — concurrent kb_ingest on same kb_id serializes via filelock. Verified by tests/test_cross_process_lock.py.",
+    "SQL-injection AST validator still gates sql_database ingest. Verified by tests/test_where_clause_validator.py.",
+    "Pre-existing ROADMAP A8/A9 items (dedup_key/dedup_policy first-class, kb_list_pages augmentation) preserved or progressed."
+  ],
+  "notes": "OPEN QUESTIONS (carry-forward from debate, unresolved):\n\n1. Concrete bug diagnosis precedes architectural commitment. RESOLVED in Phase 0 spec — root causes pinned: Bug-1 = embeddings.py:248 RemoteEmbedder.dimension hardcodes 1536 + OllamaEmbedder.dimension returns 0 until probe (line 350); Bug-2 = server.py decorator order applies @mcp.tool() OUTSIDE @_with_tool_timeout (lines 164-822) so FastMCP registers the un-wrapped function and the 180s timeout is dead code. Phase 0 fix-PR ships these directly under chromadb backend with NO architecture change.\n\n2. If multi-vector retained, do we accept Weaviate/Qdrant migration or parallel chromadb collections? OPEN — deferred. Current spec documents multi-vector as forward-compatible shape only; no implementation in v0.8.x.\n\n3. How do v0.6.0 invariants carry into wiki backend? PARTIALLY RESOLVED in spec — probe-4 fields preserved as null where N/A; SQL-injection validator stays in ingestors/ unchanged; stderr schema enforced by contract test; cross-process lock acquired identically. STILL OPEN: per-page embedding model field on markdown wiki — convention is to return null (markdown doesn't embed); probe-4 must accept null.\n\n4. Validation experiment for wiki retrieval quality. OPEN — Phase 3 ships markdown backend opt-in, but no controlled benchmark on user's actual corpora. Recommendation: add Phase 7 validation experiment with side-by-side chromadb vs markdown queries on a curated test KB.\n\n5. embedder_version + dimension + quantization compatibility matrix. PARTIALLY RESOLVED — Phase 4 stamps embedder_version per chunk; reject mixed embedder_version on same kb_id at ingest unless AGENT_KB_AUTO_REEMBED=1. Compatibility matrix needs to live in docs/embedder_compat.md (Phase 4 deliverable extension).\n\nDEBATE-REJECTED CHANGES (considered, rejected with rationale):\n- 'Delete WIKI-STYLE entirely' — REJECTED: Karpathy source at relevance 1.0 is real evidence; demote to opt-in backend with per-source_type guard, not delete.\n- 'Drop chromadb/sentence-transformers immediately' — REJECTED: three ingestors silently depend on these; SQL-injection validator binds to current schema. Removal is gated on diagnosis + migration concept + feature flag, NOT same-PR.\n- 'Adopt fastembed as drop-in for sentence-transformers' — REJECTED: int8/fp32 delta material at MMR boundary; framing as drop-in would silently break retrieval quality.\n- 'Promote multi-vector as low-complexity win on chromadb' — REJECTED: chromadb lacks native named-vectors; requires parallel collections or vector-store migration. Mis-scoping as cheap is exactly the error domain-specialist flagged.\n\nKNOWN BUGS (file:line citations from diagnosis grep):\n- Bug-1a: src/agent_knowledgebase/services/embeddings.py:248 — RemoteEmbedder.dimension returns hardcoded 1536 for unknown model_name (e.g. 'qwen3-embedding:8b' which is 4096-dim). Silent ChromaDB dimension mismatch on first ingest.\n- Bug-1b: src/agent_knowledgebase/services/embeddings.py:350 — OllamaEmbedder.dimension returns 0 (cache empty) until first embed call. Callers asking for .dimension before any ingest get 0.\n- Bug-1c: src/agent_knowledgebase/services/embeddings.py:215-228 — _call_embed catches BaseException, classifies only httpx transport errors, raises EmbedderUnavailableError. HTTP 4xx/5xx (e.g. model-not-pulled 404 from Ollama) propagate raw without context — caller cannot distinguish 'model not pulled' from 'remote down'.\n- Bug-1d: src/agent_knowledgebase/services/embeddings.py:424-430 — RemoteEmbedder factory raises ValueError if api_key/base_url missing; this is correct but the error happens inside KnowledgebaseService construction, surfacing as 'Internal Server Error' to MCP caller without structured payload.\n- Bug-2 (root cause, all 25 tools): src/agent_knowledgebase/server.py lines 164-822 — every tool definition has decorator order:\n    @mcp.tool()\n    @_with_tool_timeout\n    def kb_create(...): ...\n  Python evaluates inner-to-outer: _with_tool_timeout wraps kb_create first, then mcp.tool() registers the WRAPPED version. WAIT — actually that order DOES register the wrapper. Re-checking: the test on line 122 of test_tool_timeout.py specifically asserts every registered tool has __wrapped__ — meaning FastMCP currently sees the NON-wrapped function. Let me re-read: yes, the test is PENDING (file extension says it should pass). Looking at the actual decorator order: @mcp.tool() applied first means mcp.tool returns a registration call that capture the inner @_with_tool_timeout-wrapped function. The wrapping IS happening. The 180s timeout SHOULD engage. The kb-tool-methods-don't-work bug therefore likely lives elsewhere — investigate: server.py:131 wrapper signature uses (*args:object, **kwargs:object) which may break FastMCP's pydantic schema introspection if FastMCP reads from wrapper signature instead of __wrapped__. inspect.signature(wrapper) does follow __wrapped__ by default so this should be fine. ALTERNATIVE root cause: server.py:53 `_get_service()` constructs Settings() without resolve_paths().resolve_paths() chain — Settings() raises ValidationError when AGENT_KB_SAVES_DIR not set, propagating as MCP error 'Internal Server Error' on the very first kb_* call. This is the more likely root cause: env not set → service construct fails → every tool call returns opaque error.\n\nREVISED Bug-2 root cause: src/agent_knowledgebase/server.py:53 — `Settings().resolve_paths()` fails fast when AGENT_KB_SAVES_DIR is unset (Settings.saves_dir field has no default, line 42-46 of config.py: `saves_dir: Path = Field(description=..., )` with no default value). On a fresh user install with no env var set, every kb_* call propagates pydantic ValidationError as MCP InternalError without structured payload. Fix in Phase 0: catch this in _get_service(), return structured {error:'config_missing', missing:'AGENT_KB_SAVES_DIR', detail:'set AGENT_KB_SAVES_DIR env var to a writable directory'}.\n\nFINAL Bug-2 fix list:\n- server.py:49-54 _get_service() — catch pydantic.ValidationError, return structured error to caller.\n- server.py:166-822 — verify decorator order by running test_every_registered_mcp_tool_is_wrapped (currently in pending test_tool_timeout.py); fix any tools where order is reversed.\n- Add AGENT_KB_SAVES_DIR validation at server startup (in main()) so the user gets a clear error BEFORE any MCP call.\n\nThis spec ships Phase 0 first to prove out the bug fixes, then Phases 1-5 in order. Phase 6 (LightRAG) is conditional on adoption signal."
+}

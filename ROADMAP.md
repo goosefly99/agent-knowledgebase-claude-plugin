@@ -95,3 +95,29 @@ uv run python -m agent_knowledgebase  # start MCP server
 - No cross-process lock implementation (documented only).
 - No multi-dialect sql support in release 1 (sqlite only; document Postgres/MySQL as future work).
 - Ingestor changes for non-sql source_types (file, website, codebase, etc.) stay untouched.
+
+## Redesign Roadmap (v0.8.0 — agent-kb-redesign-2026-04-24)
+
+> spec_id: `70ab2170-381a-4657-bcd1-28a40c6f369b`
+> Source spec: `pipeline_mcp_data/specs/agent-kb-redesign-spec-v2.1.json`
+> Detailed phase breakdown: [`docs/redesign/ROADMAP.md`](docs/redesign/ROADMAP.md)
+> Subagent brief: [`docs/redesign/AGENTS.md`](docs/redesign/AGENTS.md)
+> Standing pitfalls: [`docs/redesign/MISTAKES.md`](docs/redesign/MISTAKES.md)
+
+The v0.6.0/0.7.0 sections above remain the **frozen ground-truth** for the
+current shipping plugin. This section is forecast for the v0.8.0 redesign,
+which is additive (does NOT regress probe-4, the SQL-injection AST validator,
+the stderr-tee schema, AGENT_KB_SAVES_DIR semantics, the cross-process-lock
+recipe, or the 25 frozen `kb_*` MCP tools).
+
+The redesign ships in 7 phases. **The Phase 4 → Phase 5 ordering is
+non-negotiable** — migration tooling with read-fallback MUST precede the
+embedding default-flip.
+
+- [ ] **Phase 0 — Bug fixes (chromadb backend, no architecture change).** Wrap `_get_service` for `pydantic.ValidationError` / `FileNotFoundError`; add `saves_dir` `default_factory=~/.agent-kb/saves`; probe embedding dimension on first use; classify HTTP-status errors. Bug-2 corrected diagnosis: NOT a decorator NO-OP — the current `@mcp.tool()` outer + `@_with_tool_timeout` inner order works (test_tool_timeout 6/6 passing). DO NOT swap.
+- [ ] **Phase 1 — Pattern A single-launcher runtime bootstrap.** New `bin/run_server.py` (stdlib venv auto-bootstrap, structured-stderr error modes); `.mcp.json` switches `command:uv` → `command:python args:[bin/run_server.py]`.
+- [ ] **Phase 2 — RetrieverBackend abstraction behind feature flag.** New `src/agent_knowledgebase/backends/__init__.py` factory + Protocol. `ChromadbBackend` wraps existing logic with zero behavior change. Default still chromadb. AGENT_KB_BACKEND env var added.
+- [ ] **Phase 3 — MarkdownWikiBackend (opt-in).** New `backends/markdown_backend.py` Karpathy-style with sqlite FTS5 over `wiki/pages/*.md`. Per-source_type positive-allow list ({file, website, small api_endpoint}); other source_types raise `KB_INGESTOR_UNSUITABLE`.
+- [ ] **Phase 4 — Migration tooling + dual-backend transition + per-page provider snapshot (PRECEDES default-flip).** New `services/migration.py`; `kb_migrate` MCP tool (additive); ALTER pages ADD embedding_provider + embed_base_url; backfill existing pages; read-fallback when wiki/ missing.
+- [ ] **Phase 5 — Embedding defaults flip (FOLLOWS Phase 4).** `embedding_provider` default `'ollama' → 'remote'`; sentence-transformers + tree-sitter to opt-in extras; fastembed opt-in. embedder_version stamped per chunk. Realistic install-size floor ~700MB (NOT ~20MB — chromadb stays at ~400MB).
+- [ ] **Phase 6 — LightRAGBackend (deferred).** Stub only; design doc; activate only if adoption signal.

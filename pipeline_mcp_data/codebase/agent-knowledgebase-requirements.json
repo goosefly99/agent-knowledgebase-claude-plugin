@@ -1,0 +1,98 @@
+{
+  "requirements_id": "cr-b616cb09",
+  "codebase_path": "C:\\Users\\olive\\claude_projects\\coding\\agent_tools_dev\\data_etl_orchestrator_dev\\agent_knowledge_base_plugin_dev",
+  "analyzed_date": "2026-04-24T21:25:30.190Z",
+  "package": {
+    "name": "agent-knowledgebase",
+    "language": "python",
+    "runtime": ">=3.11",
+    "package_manager": "uv",
+    "manifest": "pyproject.toml",
+    "entry_points": []
+  },
+  "structure": {
+    "src_root": "src",
+    "test_root": "tests",
+    "directory_tree": [
+      "docs",
+      "docs/superpowers",
+      "docs/superpowers/plans",
+      "docs/superpowers/specs",
+      "pipeline_mcp_data",
+      "pipeline_mcp_data/collections",
+      "pipeline_mcp_data/collections/raw",
+      "pipeline_mcp_data/ingest_staging",
+      "pipeline_mcp_data/runs",
+      "pipeline_mcp_data/runs/agent-kb-redesign-2026-04-24",
+      "src",
+      "src/agent_knowledgebase",
+      "src/agent_knowledgebase/ingestors",
+      "src/agent_knowledgebase/services",
+      "tests"
+    ]
+  },
+  "conventions": {
+    "import_style": "esm",
+    "type_annotations": "required"
+  },
+  "dependencies": {
+    "runtime": [
+      "mcp>=1.0.0",
+      "pydantic>=2.0",
+      "pydantic-settings>=2.0",
+      "chromadb>=0.5",
+      "sentence-transformers>=3.0",
+      "trafilatura>=1.0",
+      "tree-sitter>=0.23",
+      "tree-sitter-languages>=1.10",
+      "gitpython>=3.1",
+      "sqlalchemy>=2.0",
+      "sqlparse>=0.5",
+      "httpx>=0.27",
+      "pdfplumber>=0.11",
+      "tiktoken>=0.7"
+    ],
+    "dev": [
+      "pytest>=8.0",
+      "pytest-asyncio>=0.24",
+      "ruff>=0.5"
+    ]
+  },
+  "agents_directives": [
+    {
+      "source": "README.md",
+      "description": "Plugin v0.6.0 ships as kb-first Stage 1 of v0.3.0 sibling ecosystem. Uses cross-process-lock-recipe for multi-process deployments. Stderr-tee discipline required by consumers. Config resolves in 4 layers: defaults -> user JSON -> project JSON -> env. Required env: AGENT_KB_SAVES_DIR. Env-only secrets: AGENT_KB_EMBED_API_KEY, AGENT_KB_PINECONE_API_KEY."
+    },
+    {
+      "source": "ROADMAP.md",
+      "description": "Stage 1 of 4 — SQL-injection AST validator was highest-severity blocking item (shipped). Completed: where-clause validator, read-only sqlite, 50-row batch hard-reject, safe-where-clause-grammar docs, cross-process-lock recipe, kb_pipeline_status telemetry. Incomplete: dedup_key/dedup_policy as first-class, kb_list_pages/sources augmentation, per-kb_id asyncio.Lock, per-page embedding model tracking."
+    },
+    {
+      "source": ".mcp.json",
+      "description": "MCP server invocation currently hardcoded to 'uv run --directory ${CLAUDE_PLUGIN_ROOT} python -m agent_knowledgebase.server'. REMOVING uv is explicit requirement."
+    },
+    {
+      "source": "CHANGELOG.md",
+      "description": "0.7.0 swapped third-party openai SDK for plain httpx embeddings client. 0.6.0 added structured stderr telemetry + 9 new pipeline_runs columns. Current version 0.6.0 per pyproject.toml but changelog shows 0.7.0 work completed."
+    },
+    {
+      "source": "CLAUDE.md (global user)",
+      "description": "Verification required before claiming completion: type-check, lint, test suite. Never silently narrow scope to changed files only. Parallel subagents preferred for refactors > 5 files. Branch-and-PR workflow."
+    }
+  ],
+  "testing": {
+    "framework": "pytest",
+    "config": "asyncio_mode=auto, testpaths=tests"
+  },
+  "broken_modules_identified": [
+    {
+      "module": "src/agent_knowledgebase/services/embeddings.py",
+      "reason": "User report: 'current embeddings do not work'. Module was rewritten in 0.7.0 to use plain httpx (removed openai SDK). Likely issues: local sentence-transformers path may still reference removed code, remote provider config validation may reject valid URLs, error surfacing may hide real failures behind EmbedderUnavailableError."
+    },
+    {
+      "module": "src/agent_knowledgebase/server.py and services/query.py",
+      "reason": "User report: 'kb tool methods do not work'. The 180s wall-clock timeout in server.py swallows stalls, and sqlite3 thread-affinity bug forces service-rebuild on every timeout. Query hybrid-weights validation may be rejecting valid defaults."
+    }
+  ],
+  "python_dep_surface_bytes_estimated": "~2GB mostly from sentence-transformers/torch+transformers+tokenizers; chromadb adds ~400MB; tree-sitter-languages adds ~100MB"
+}
