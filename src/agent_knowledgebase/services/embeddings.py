@@ -34,6 +34,10 @@ class EmbedderUnavailableError(RuntimeError):
     Carries a FIELD-14 structured payload so MCP tools can return a JSON
     error to the caller instead of blocking the RPC until the transport's
     own default timeout eventually fires.
+
+    Carries an optional ``extra`` mapping for HTTP-status classification
+    fields (e.g. ``retry_after`` on 429 responses) that don't fit the
+    fixed-shape FIELD-14 payload.
     """
 
     def __init__(
@@ -44,12 +48,14 @@ class EmbedderUnavailableError(RuntimeError):
         phase: str,
         latency_ms: int,
         detail: str = "",
+        extra: dict[str, object] | None = None,
     ) -> None:
         self.error = error
         self.model = model
         self.phase = phase
         self.latency_ms = latency_ms
         self.detail = detail
+        self.extra = dict(extra) if extra else {}
         super().__init__(
             f"{error}: model={model} phase={phase} latency_ms={latency_ms}"
         )
@@ -64,6 +70,53 @@ class EmbedderUnavailableError(RuntimeError):
         }
         if self.detail:
             payload["detail"] = self.detail
+        for key, value in self.extra.items():
+            payload[key] = value
+        return payload
+
+
+class EmbedderDimensionMismatchError(RuntimeError):
+    """An embedder's vector dimension does not match the collection's expected dim.
+
+    Raised when an attempt is made to ingest into or query a vector
+    collection with vectors whose dimensionality differs from the
+    dimension the collection was originally created with. Carries the
+    expected and actual dimensions so callers can return a structured
+    error payload.
+    """
+
+    def __init__(
+        self,
+        *,
+        expected: int,
+        actual: int,
+        model: str | None = None,
+        collection: str | None = None,
+    ) -> None:
+        self.expected = expected
+        self.actual = actual
+        self.model = model
+        self.collection = collection
+        msg = (
+            f"embedder dimension mismatch: expected={expected} actual={actual}"
+        )
+        if model:
+            msg += f" model={model}"
+        if collection:
+            msg += f" collection={collection}"
+        super().__init__(msg)
+
+    def to_payload(self) -> dict[str, object]:
+        """Return a JSON-serialisable payload shape."""
+        payload: dict[str, object] = {
+            "error": "dimension_mismatch",
+            "expected": self.expected,
+            "actual": self.actual,
+        }
+        if self.model is not None:
+            payload["model"] = self.model
+        if self.collection is not None:
+            payload["collection"] = self.collection
         return payload
 
 
@@ -81,9 +134,46 @@ def _classify_httpx_transport_error(exc: BaseException) -> str | None:
     return None
 
 
+def _classify_http_status_error(
+    exc: httpx.HTTPStatusError,
+) -> tuple[str, dict[str, object]] | None:
+    """Return ``(error_token, extra_fields)`` for known HTTP 4xx classes.
+
+    Returns ``None`` when the status is not a class we want to wrap as an
+    :class:`EmbedderUnavailableError` (e.g. unexpected 5xx — let those
+    propagate raw so retry logic at higher layers stays informed).
+    """
+    response = exc.response
+    if response is None:
+        return None
+    status = getattr(response, "status_code", None)
+    if status is None:
+        return None
+    if status == 404:
+        return "model_not_pulled", {}
+    if status in (401, 403):
+        return "auth_failed", {}
+    if status == 429:
+        retry_after_raw = None
+        try:
+            headers = getattr(response, "headers", None)
+            if headers is not None:
+                retry_after_raw = headers.get("Retry-After")
+        except Exception:  # noqa: BLE001 — best-effort header read
+            retry_after_raw = None
+        extra: dict[str, object] = {}
+        if retry_after_raw is not None:
+            extra["retry_after"] = retry_after_raw
+        return "rate_limited", extra
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Protocol
 # ---------------------------------------------------------------------------
+
+
+_PROBE_TEXT = "probe"
 
 
 @runtime_checkable
@@ -106,6 +196,21 @@ class Embedder(Protocol):
     @property
     def model_name(self) -> str:
         """Return the name of the embedding model."""
+        ...
+
+    def probe_dimension(self) -> int:
+        """Return the dimensionality of vectors produced by this embedder.
+
+        Implementations issue a single-text dry-run embed of a fixed
+        probe string when no static lookup is available, then cache the
+        result. This replaces the previous behavior where
+        ``RemoteEmbedder.dimension`` silently returned a hardcoded
+        ``1536`` fallback for unknown models and
+        ``OllamaEmbedder.dimension`` returned ``0`` until the first
+        embed call had succeeded — both bugs that produced
+        dimension-mismatch failures on first ingest into a vector
+        collection sized at the actual probed dimension.
+        """
         ...
 
 
@@ -141,6 +246,10 @@ class SentenceTransformerEmbedder:
     def model_name(self) -> str:
         """Return the name of the loaded SentenceTransformer model."""
         return self._model_name
+
+    def probe_dimension(self) -> int:
+        """Return the embedding dimension; the loaded model reports it directly."""
+        return self.dimension
 
 
 # ---------------------------------------------------------------------------
@@ -193,6 +302,7 @@ class RemoteEmbedder:
                 timeout=timeout_seconds,
                 headers=headers,
             )
+        self._dimension_cache: int | None = None
 
     def _call_embed(self, texts: list[str], *, phase: str) -> list[list[float]]:
         """POST to the embeddings endpoint, converting transport errors.
@@ -200,7 +310,12 @@ class RemoteEmbedder:
         ``phase`` identifies the call site (``embed_query`` /
         ``embed_batch``) and ends up in the structured-error payload.
         Retries are bounded by ``max_retries``; on final transport
-        failure, raises :class:`EmbedderUnavailableError`.
+        failure, raises :class:`EmbedderUnavailableError`. HTTP 4xx
+        responses we know how to classify (404 model-not-pulled,
+        401/403 auth, 429 rate-limited) are also surfaced as
+        :class:`EmbedderUnavailableError` with an appropriate error
+        token so MCP tools can return a structured payload instead of
+        propagating an opaque ``httpx.HTTPStatusError``.
         """
         url = self._base_url + "/embeddings"
         body = {"input": texts, "model": self._model_name}
@@ -212,6 +327,20 @@ class RemoteEmbedder:
                 response.raise_for_status()
                 parsed = response.json()
                 break
+            except httpx.HTTPStatusError as exc:
+                classified = _classify_http_status_error(exc)
+                if classified is None:
+                    raise
+                error_token, extra = classified
+                latency_ms = int((time.monotonic() - started) * 1000)
+                raise EmbedderUnavailableError(
+                    error=error_token,
+                    model=self._model_name,
+                    phase=phase,
+                    latency_ms=latency_ms,
+                    detail=type(exc).__name__,
+                    extra=extra,
+                ) from exc
             except BaseException as exc:  # noqa: BLE001 — classify below
                 error_token = _classify_httpx_transport_error(exc)
                 if error_token is None:
@@ -239,13 +368,53 @@ class RemoteEmbedder:
         """Embed a single query string."""
         return self._call_embed([text], phase="embed_query")[0]
 
+    def probe_dimension(self) -> int:
+        """Return this embedder's vector dimension, probing if necessary.
+
+        Resolution order:
+
+        1. Cached value from a previous probe or successful embed.
+        2. Static lookup in :data:`_REMOTE_EMBEDDING_DIMENSIONS` for
+           well-known OpenAI-compatible models (avoids an HTTP call).
+        3. Live dry-run embed of the literal probe string ``"probe"``;
+           the resulting vector's length is cached and returned.
+        """
+        if self._dimension_cache is not None:
+            return self._dimension_cache
+        known = _REMOTE_EMBEDDING_DIMENSIONS.get(self._model_name)
+        if known is not None:
+            self._dimension_cache = known
+            return known
+        vectors = self._call_embed([_PROBE_TEXT], phase="probe_dimension")
+        if not vectors or not vectors[0]:
+            raise EmbedderUnavailableError(
+                error="probe_failed",
+                model=self._model_name,
+                phase="probe_dimension",
+                latency_ms=0,
+                detail="empty embedding response",
+            )
+        dim = len(vectors[0])
+        self._dimension_cache = dim
+        return dim
+
     @property
     def dimension(self) -> int:
         """Return the expected embedding dimension for the configured model.
 
-        Falls back to 1536 for unknown model names.
+        Returns the static value from :data:`_REMOTE_EMBEDDING_DIMENSIONS`
+        when the model is known, otherwise probes the live endpoint via
+        :meth:`probe_dimension`. The previous hardcoded 1536 fallback —
+        which silently produced dimension mismatches for any non-OpenAI
+        model — has been removed.
         """
-        return _REMOTE_EMBEDDING_DIMENSIONS.get(self._model_name, 1536)
+        if self._dimension_cache is not None:
+            return self._dimension_cache
+        known = _REMOTE_EMBEDDING_DIMENSIONS.get(self._model_name)
+        if known is not None:
+            self._dimension_cache = known
+            return known
+        return self.probe_dimension()
 
     @property
     def model_name(self) -> str:
@@ -298,7 +467,15 @@ class OllamaEmbedder:
         self._dimension_cache: int | None = None
 
     def _call_embed(self, texts: list[str], *, phase: str) -> list[list[float]]:
-        """POST to ``/api/embed`` and decode the Ollama response shape."""
+        """POST to ``/api/embed`` and decode the Ollama response shape.
+
+        Transport errors (timeout / network) become
+        :class:`EmbedderUnavailableError` after retries are exhausted.
+        Ollama-side HTTP 4xx responses we recognise (404 model-not-pulled,
+        401/403 auth, 429 rate-limited) are also classified as
+        :class:`EmbedderUnavailableError` so the MCP layer sees a
+        structured payload instead of an opaque ``httpx.HTTPStatusError``.
+        """
         url = self._base_url + "/api/embed"
         body = {"model": self._model_name, "input": texts}
         started = time.monotonic()
@@ -309,6 +486,20 @@ class OllamaEmbedder:
                 response.raise_for_status()
                 parsed = response.json()
                 break
+            except httpx.HTTPStatusError as exc:
+                classified = _classify_http_status_error(exc)
+                if classified is None:
+                    raise
+                error_token, extra = classified
+                latency_ms = int((time.monotonic() - started) * 1000)
+                raise EmbedderUnavailableError(
+                    error=error_token,
+                    model=self._model_name,
+                    phase=phase,
+                    latency_ms=latency_ms,
+                    detail=type(exc).__name__,
+                    extra=extra,
+                ) from exc
             except BaseException as exc:  # noqa: BLE001 — classify below
                 error_token = _classify_httpx_transport_error(exc)
                 if error_token is None:
@@ -339,15 +530,50 @@ class OllamaEmbedder:
         """Embed a single query string."""
         return self._call_embed([text], phase="embed_query")[0]
 
+    def probe_dimension(self) -> int:
+        """Return this embedder's vector dimension, probing if necessary.
+
+        Issues a single-text dry-run embed of the literal probe string
+        ``"probe"`` when the dimension cache is empty, populating it
+        from the response. Replaces the previous behaviour where
+        :attr:`dimension` returned ``0`` until the first regular embed
+        had succeeded — guaranteeing a dimension mismatch when a
+        ChromaDB collection was sized at 0.
+        """
+        if self._dimension_cache is not None:
+            return self._dimension_cache
+        vectors = self._call_embed([_PROBE_TEXT], phase="probe_dimension")
+        if not vectors or not vectors[0]:
+            raise EmbedderUnavailableError(
+                error="probe_failed",
+                model=self._model_name,
+                phase="probe_dimension",
+                latency_ms=0,
+                detail="empty embedding response",
+            )
+        # ``_call_embed`` populates ``_dimension_cache`` on success but
+        # guard explicitly for the test-mock case where the body uses a
+        # different shape.
+        if self._dimension_cache is None:
+            self._dimension_cache = len(vectors[0])
+        return self._dimension_cache
+
     @property
     def dimension(self) -> int:
-        """Return the embedding dimension.
+        """Return the embedding dimension, probing on first access if needed.
 
-        Cached after the first successful embed. Falls back to 0 before
-        any call has succeeded — callers that need the dimension up
-        front should issue a probe embed first.
+        Cached after the first successful embed or probe. Unlike the
+        previous behaviour (which returned ``0`` until the first
+        regular embed completed), accessing this property now triggers
+        a probe call when no cached value is available, so callers
+        sizing a ChromaDB collection get the real dimension up front.
         """
-        return self._dimension_cache or 0
+        if self._dimension_cache is None:
+            self.probe_dimension()
+        # ``probe_dimension`` populates the cache; assert non-None for
+        # the type-checker.
+        assert self._dimension_cache is not None
+        return self._dimension_cache
 
     @property
     def model_name(self) -> str:

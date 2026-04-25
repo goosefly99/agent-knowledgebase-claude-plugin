@@ -1,33 +1,86 @@
 # Changelog
 
+## 0.7.1 — 2026-04-24
+
+> Phase 0 of the v2.1 redesign — direct bug fixes shipped under the
+> existing chromadb backend with zero architectural change.
+>
+> spec_id: `70ab2170-381a-4657-bcd1-28a40c6f369b`
+> Source spec: `pipeline_mcp_data/specs/agent-kb-redesign-spec-v2.1.json`
+
+### Fixed
+
+- **Bug-1 (embedder dimension probing):** added `probe_dimension()` to the
+  `Embedder` protocol and to all three concrete implementations.
+  `RemoteEmbedder.dimension` no longer silently returns the hardcoded
+  `1536` fallback for unknown models (e.g. `qwen3-embedding:8b` which is
+  actually 4096-dim) — it consults `_REMOTE_EMBEDDING_DIMENSIONS` for the
+  three known OpenAI models and otherwise issues a single dry-run embed
+  of the literal string `"probe"` and caches the result.
+  `OllamaEmbedder.dimension` no longer returns `0` until the first
+  embed; accessing the property triggers a probe and caches the dimension.
+  Both behaviours had previously guaranteed a dimension mismatch when a
+  caller sized a ChromaDB collection from `.dimension` before any embed
+  had run.
+- **Bug-1c (HTTP-status classification on `EmbedderUnavailableError`):**
+  both `RemoteEmbedder._call_embed` and `OllamaEmbedder._call_embed` now
+  classify `httpx.HTTPStatusError` into structured payloads —
+  `404 → {"error":"model_not_pulled"}`,
+  `401/403 → {"error":"auth_failed"}`,
+  `429 → {"error":"rate_limited", "retry_after":...}` — instead of
+  letting the raw `HTTPStatusError` propagate as an opaque MCP error.
+  Existing timeout / network classification is preserved.
+- **Bug-2 (config error surfacing):** `_get_service` in `server.py` now
+  catches `pydantic.ValidationError`, `FileNotFoundError`, and
+  `NotADirectoryError` from `Settings().resolve_paths()` and returns a
+  sentinel `_ConfigMissingService` whose every `kb_*` method returns the
+  JSON string `{"error":"config_missing", "missing":"<env_var>",
+  "detail":"..."}`. `main()` performs an identical precheck at startup
+  and emits the same structured payload on stderr before
+  `sys.exit(1)`, so misconfigured installs fail immediately with a
+  clear message instead of opaquely on the first MCP call.
+
+### Added
+
+- `EmbedderDimensionMismatchError` in `services/embeddings.py` for
+  surfacing collection-vs-embedder dimension drift; carries
+  `expected` / `actual` / `model` / `collection` and a `to_payload()`
+  helper for structured responses. Used by the new
+  `tests/test_chromadb_dimension_mismatch.py` regression test that
+  pins Bug-1a's resolution at the embedder layer.
+
+### Changed
+
+- `Settings.saves_dir` now has a `default_factory` returning
+  `~/.agent-kb/saves`, so a fresh install boots with zero env vars set.
+  `resolve_paths()` still raises `FileNotFoundError` /
+  `NotADirectoryError` when the directory is missing or not a
+  directory — that behaviour is preserved and is what the new
+  `_get_service` catch turns into the structured payload.
+
+### Decorator-order note (preserved, NOT changed)
+
+The v2.0 spec draft asserted Bug-2 was a `@mcp.tool()` /
+`@_with_tool_timeout` decorator NO-OP. Empirical verification —
+`tests/test_tool_timeout.py` 6/6 passing including
+`test_every_registered_mcp_tool_is_wrapped`, and a live timeout test
+returning the structured `tool_timeout` payload — proves the current
+order (`@mcp.tool()` outer, `@_with_tool_timeout` inner) is the
+working order. **The decorators were NOT swapped.** A new
+`tests/contract/test_decorator_order.py` is added purely as a
+regression guard against accidental future inversion (asserts
+`__wrapped__` exists on every registered tool). See
+`docs/redesign/MISTAKES.md` M-01.
+
 ## [unreleased] — Pipeline-driven redesign (v2.1 spec)
 
-> Forecast only — proposed changes, not yet implemented.
+> Forecast only — proposed changes for Phase 1+ (Pattern A launcher,
+> RetrieverBackend abstraction, MarkdownWikiBackend, migration
+> tooling, embedding default-flip, LightRAGBackend stub).
 >
 > spec_id: `70ab2170-381a-4657-bcd1-28a40c6f369b`
 > Source spec: `pipeline_mcp_data/specs/agent-kb-redesign-spec-v2.1.json`
 > Detailed roadmap: `docs/redesign/ROADMAP.md`
-
-### Proposed (Phase 0 — bug fixes, no architecture change)
-
-- **Bug-1 (embeddings):** add `probe_dimension` method to `Embedder` protocol
-  so `RemoteEmbedder` no longer hardcodes `1536` for unknown models (e.g.
-  `qwen3-embedding:8b` which is 4096-dim) and `OllamaEmbedder.dimension` no
-  longer returns `0` until the first embed call. ChromaDB collection
-  validates `expected_dim` against stored dimension on init. Add HTTP-status
-  classification (404 model-not-pulled, 401/403 auth, 429 rate-limited) on
-  `EmbedderUnavailableError` beyond just timeout/network errors.
-- **Bug-2 (config error surfacing):** wrap `_get_service` (server.py:49-54)
-  in `try: ... except (pydantic.ValidationError, FileNotFoundError,
-  NotADirectoryError)` and return structured `{"error":"config_missing",
-  "missing":"AGENT_KB_SAVES_DIR", ...}` payload instead of opaque MCP
-  `InternalError`. Add `saves_dir` `default_factory=~/.agent-kb/saves` so
-  fresh installs work without env vars. Add `main()` startup precheck so
-  missing config fails immediately with structured stderr. NOTE: the v2.0
-  spec draft's "decorator NO-OP" diagnosis was inverted — current order
-  (`@mcp.tool()` outer, `@_with_tool_timeout` inner) works empirically
-  (tests/test_tool_timeout.py 6/6 passing including
-  `test_every_registered_mcp_tool_is_wrapped`). DO NOT swap.
 
 ### Proposed (Phase 1 — Pattern A launcher)
 

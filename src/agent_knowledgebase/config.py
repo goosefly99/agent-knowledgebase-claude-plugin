@@ -40,9 +40,11 @@ class Settings(BaseSettings):
 
     # --- Storage ---
     saves_dir: Path = Field(
+        default_factory=lambda: Path.home() / ".agent-kb" / "saves",
         description="Base directory for knowledgebase storage (AGENT_KB_SAVES_DIR). "
         "Each KB gets its own subdirectory directly under <saves_dir>/<sanitized-name>/. "
-        "This environment variable is required and the directory must exist.",
+        "Defaults to ~/.agent-kb/saves so a fresh install works with no env "
+        "vars; resolve_paths() still requires the directory to exist on disk.",
     )
 
     # --- Vector store ---

@@ -12,11 +12,21 @@ from agent_knowledgebase.config import Settings, sanitize_kb_dir_name
 class TestSavesDir:
     """saves_dir is required and validated."""
 
-    def test_saves_dir_required(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Settings() without AGENT_KB_SAVES_DIR raises."""
+    def test_saves_dir_defaults_to_user_home(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Phase 0: Settings() without AGENT_KB_SAVES_DIR falls back to ~/.agent-kb/saves.
+
+        The previous behaviour raised ``pydantic.ValidationError`` —
+        which then became the opaque MCP InternalError pinpointed by
+        validation finding f-06. The Phase 0 fix gives ``saves_dir`` a
+        ``default_factory`` so a fresh install boots without env vars,
+        and ``resolve_paths()`` is the layer that surfaces the
+        directory-existence error (caught by ``_get_service``).
+        """
         monkeypatch.delenv("AGENT_KB_SAVES_DIR", raising=False)
-        with pytest.raises(Exception):
-            Settings()
+        cfg = Settings()
+        assert cfg.saves_dir == Path.home() / ".agent-kb" / "saves"
 
     def test_saves_dir_from_env(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         saves = tmp_path / "env_saves"

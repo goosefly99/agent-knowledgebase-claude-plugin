@@ -121,14 +121,31 @@ class TestRemoteEmbedder:
         )
         assert emb.dimension == 1536
 
-    def test_dimension_unknown_model_defaults_1536(self) -> None:
+    def test_dimension_unknown_model_probes_via_dry_run(self) -> None:
+        """Phase 0 Bug-1a fix: unknown model no longer hardcodes 1536.
+
+        The previous behaviour returned the literal `1536` for any model
+        not in `_REMOTE_EMBEDDING_DIMENSIONS`, silently producing a
+        dimension mismatch on first ingest into a chromadb collection
+        that was sized at the actual probed dimension. The new
+        behaviour issues a dry-run embed of the literal probe string
+        and returns the response vector's length.
+        """
+        mock_client = MagicMock(spec=httpx.Client)
+        mock_client.post.return_value = _make_embed_response([[0.0] * 4096])
         emb = RemoteEmbedder(
             model_name="some-future-model",
             api_key="sk-test",
             base_url="https://example.invalid/v1",
-            _client=MagicMock(),
+            _client=mock_client,
         )
-        assert emb.dimension == 1536
+        assert emb.dimension == 4096
+        # The probe was a real HTTP call — verify it hit the embeddings
+        # endpoint with the literal "probe" payload.
+        mock_client.post.assert_called_once_with(
+            "https://example.invalid/v1/embeddings",
+            json={"input": ["probe"], "model": "some-future-model"},
+        )
 
     def test_embed_calls_api(self, embedder: RemoteEmbedder) -> None:
         fake_vectors = [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]]
@@ -297,12 +314,23 @@ class TestRemoteEmbedderTransportBounds:
 
         assert excinfo.value.to_payload()["phase"] == "embed_batch"
 
-    def test_http_status_errors_pass_through_unchanged(self) -> None:
-        """HTTP 4xx/5xx (auth failures etc.) must not be re-wrapped."""
+    def test_unclassified_http_status_errors_pass_through_unchanged(self) -> None:
+        """Phase 0 Bug-1c: only known 4xx classes wrap; others pass through.
+
+        Pre-Phase-0: every HTTP 4xx/5xx error propagated raw, including
+        the auth-failure case which surfaces opaquely on the MCP layer.
+        Post-Phase-0: the four known classes (404 model_not_pulled,
+        401/403 auth_failed, 429 rate_limited) are wrapped as
+        ``EmbedderUnavailableError``; everything else (e.g. 500) is
+        still passed through so retry / circuit-breaker logic at higher
+        layers stays informed.
+        """
         mock_client = MagicMock(spec=httpx.Client)
         response = MagicMock(spec=httpx.Response)
         response.raise_for_status.side_effect = httpx.HTTPStatusError(
-            "401 Unauthorized", request=MagicMock(), response=MagicMock(status_code=401)
+            "500 Internal Server Error",
+            request=MagicMock(),
+            response=MagicMock(status_code=500),
         )
         mock_client.post.return_value = response
 
@@ -315,6 +343,112 @@ class TestRemoteEmbedderTransportBounds:
 
         with pytest.raises(httpx.HTTPStatusError):
             embedder.embed_query("x")
+
+    def test_http_401_classified_as_auth_failed(self) -> None:
+        """Bug-1c: 401 → ``EmbedderUnavailableError(error='auth_failed')``."""
+        mock_client = MagicMock(spec=httpx.Client)
+        response = MagicMock(spec=httpx.Response)
+        response.raise_for_status.side_effect = httpx.HTTPStatusError(
+            "401 Unauthorized",
+            request=MagicMock(),
+            response=MagicMock(status_code=401),
+        )
+        mock_client.post.return_value = response
+
+        embedder = RemoteEmbedder(
+            model_name="text-embedding-3-small",
+            api_key="sk-test",
+            base_url="https://example.invalid/v1",
+            _client=mock_client,
+        )
+
+        with pytest.raises(EmbedderUnavailableError) as excinfo:
+            embedder.embed_query("x")
+        payload = excinfo.value.to_payload()
+        assert payload["error"] == "auth_failed"
+        assert payload["model"] == "text-embedding-3-small"
+        assert payload["phase"] == "embed_query"
+
+    def test_http_403_classified_as_auth_failed(self) -> None:
+        """Bug-1c: 403 → ``EmbedderUnavailableError(error='auth_failed')``."""
+        mock_client = MagicMock(spec=httpx.Client)
+        response = MagicMock(spec=httpx.Response)
+        response.raise_for_status.side_effect = httpx.HTTPStatusError(
+            "403 Forbidden",
+            request=MagicMock(),
+            response=MagicMock(status_code=403),
+        )
+        mock_client.post.return_value = response
+
+        embedder = RemoteEmbedder(
+            model_name="text-embedding-3-small",
+            api_key="sk-test",
+            base_url="https://example.invalid/v1",
+            _client=mock_client,
+        )
+
+        with pytest.raises(EmbedderUnavailableError) as excinfo:
+            embedder.embed_query("x")
+        assert excinfo.value.to_payload()["error"] == "auth_failed"
+
+    def test_http_404_classified_as_model_not_pulled(self) -> None:
+        """Bug-1c: 404 → ``EmbedderUnavailableError(error='model_not_pulled')``.
+
+        Captures the Ollama-specific case where ``ollama pull
+        <model>`` was never run on the host serving the
+        ``/v1/embeddings`` surface.
+        """
+        mock_client = MagicMock(spec=httpx.Client)
+        response = MagicMock(spec=httpx.Response)
+        response.raise_for_status.side_effect = httpx.HTTPStatusError(
+            "404 Not Found",
+            request=MagicMock(),
+            response=MagicMock(status_code=404),
+        )
+        mock_client.post.return_value = response
+
+        embedder = RemoteEmbedder(
+            model_name="qwen3-embedding:8b",
+            api_key="ollama",
+            base_url="http://localhost:11434/v1",
+            _client=mock_client,
+        )
+
+        with pytest.raises(EmbedderUnavailableError) as excinfo:
+            embedder.embed_query("x")
+        payload = excinfo.value.to_payload()
+        assert payload["error"] == "model_not_pulled"
+        assert payload["model"] == "qwen3-embedding:8b"
+
+    def test_http_429_classified_as_rate_limited(self) -> None:
+        """Bug-1c: 429 → ``EmbedderUnavailableError(error='rate_limited')``.
+
+        Includes the ``Retry-After`` header value when the response
+        carries one.
+        """
+        mock_client = MagicMock(spec=httpx.Client)
+        mock_response = MagicMock(status_code=429)
+        mock_response.headers = {"Retry-After": "30"}
+        outer_response = MagicMock(spec=httpx.Response)
+        outer_response.raise_for_status.side_effect = httpx.HTTPStatusError(
+            "429 Too Many Requests",
+            request=MagicMock(),
+            response=mock_response,
+        )
+        mock_client.post.return_value = outer_response
+
+        embedder = RemoteEmbedder(
+            model_name="text-embedding-3-small",
+            api_key="sk-test",
+            base_url="https://example.invalid/v1",
+            _client=mock_client,
+        )
+
+        with pytest.raises(EmbedderUnavailableError) as excinfo:
+            embedder.embed_query("x")
+        payload = excinfo.value.to_payload()
+        assert payload["error"] == "rate_limited"
+        assert payload["retry_after"] == "30"
 
     def test_unrelated_errors_pass_through_unchanged(self) -> None:
         """Non-transport errors (e.g. validation) must not be re-wrapped."""
@@ -515,11 +649,30 @@ class TestOllamaEmbedder:
         assert embedder.embed([]) == []
         embedder._client.post.assert_not_called()
 
-    def test_dimension_caches_after_first_call(self, embedder: OllamaEmbedder) -> None:
-        assert embedder.dimension == 0  # no probe yet
-        embedder._client.post.return_value = _make_ollama_response([[0.1] * 4096])
-        embedder.embed_query("probe")
+    def test_dimension_triggers_probe_when_uncached(
+        self, embedder: OllamaEmbedder
+    ) -> None:
+        """Phase 0 Bug-1b fix: `.dimension` no longer returns 0 pre-embed.
+
+        The previous behaviour returned 0 until a regular embed had
+        populated the cache, which guaranteed a dimension-mismatch when
+        a caller used `.dimension` to size a ChromaDB collection
+        before any embed had run. The new behaviour issues a probe
+        call on first `.dimension` access and caches the result.
+        """
+        embedder._client.post.return_value = _make_ollama_response(
+            [[0.1] * 4096]
+        )
+        # First access triggers a probe.
         assert embedder.dimension == 4096
+        # Probe sent the literal "probe" payload.
+        embedder._client.post.assert_called_once_with(
+            "http://127.0.0.1:11434/api/embed",
+            json={"model": "qwen3-embedding:8b", "input": ["probe"]},
+        )
+        # Subsequent accesses are cached — no further HTTP calls.
+        assert embedder.dimension == 4096
+        assert embedder._client.post.call_count == 1
 
     def test_timeout_converts_to_unavailable(self) -> None:
         mock_client = MagicMock(spec=httpx.Client)

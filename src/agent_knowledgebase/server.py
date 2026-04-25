@@ -5,6 +5,7 @@ from __future__ import annotations
 import concurrent.futures
 import json
 import os
+import sys
 import threading
 from dataclasses import asdict
 from functools import wraps
@@ -13,6 +14,7 @@ from typing import Callable, TypeVar
 
 from mcp.server.fastmcp import FastMCP
 
+from pydantic import ValidationError
 from pydantic_core import PydanticUndefined
 
 from agent_knowledgebase.config import Settings
@@ -43,15 +45,121 @@ mcp = FastMCP(
 # Lazy initialization of the service singleton
 # ---------------------------------------------------------------------------
 
-_service: KnowledgebaseService | None = None
+_service: KnowledgebaseService | object | None = None
 
 
-def _get_service() -> KnowledgebaseService:
+def _config_missing_payload(
+    *, missing: str, detail: str
+) -> dict[str, str]:
+    """Return the structured ``config_missing`` JSON payload."""
+    return {
+        "error": "config_missing",
+        "missing": missing,
+        "detail": detail,
+    }
+
+
+def _classify_config_error(exc: BaseException) -> dict[str, str]:
+    """Translate a Settings/resolve_paths exception into a structured payload.
+
+    Inspects ``pydantic.ValidationError`` errors to identify the
+    specific missing field (typically ``saves_dir`` →
+    ``AGENT_KB_SAVES_DIR``) and falls back to an
+    ``AGENT_KB_SAVES_DIR``-flavoured payload for path-existence errors
+    raised by ``resolve_paths``.
+    """
+    if isinstance(exc, ValidationError):
+        missing_field = "AGENT_KB_SAVES_DIR"
+        try:
+            errors = exc.errors()
+        except Exception:  # noqa: BLE001 — defensive
+            errors = []
+        for err in errors:
+            loc = err.get("loc") or ()
+            if not loc:
+                continue
+            field = str(loc[0])
+            # Map Settings field name to AGENT_KB_-prefixed env var.
+            missing_field = f"AGENT_KB_{field.upper()}"
+            break
+        return _config_missing_payload(
+            missing=missing_field,
+            detail=f"Settings validation failed: {exc}",
+        )
+    if isinstance(exc, FileNotFoundError):
+        return _config_missing_payload(
+            missing="AGENT_KB_SAVES_DIR",
+            detail=str(exc),
+        )
+    if isinstance(exc, NotADirectoryError):
+        return _config_missing_payload(
+            missing="AGENT_KB_SAVES_DIR",
+            detail=str(exc),
+        )
+    return _config_missing_payload(
+        missing="unknown",
+        detail=f"{type(exc).__name__}: {exc}",
+    )
+
+
+class _ConfigMissingError(Exception):
+    """Internal sentinel raised by ``_get_service`` when config is missing.
+
+    Carries the structured ``config_missing`` payload so the
+    ``_with_tool_timeout`` wrapper can return it as the tool response
+    without each individual ``kb_*`` tool needing to know about the
+    failure mode.
+    """
+
+    def __init__(self, payload: dict[str, str]) -> None:
+        self.payload = payload
+        super().__init__(payload.get("detail", "config missing"))
+
+
+class _ConfigMissingService:
+    """Sentinel service returned by ``_get_service`` when config is missing.
+
+    Every attribute access returns a callable that, when invoked,
+    raises :class:`_ConfigMissingError` carrying the structured
+    payload. The ``_with_tool_timeout`` wrapper catches that exception
+    and returns the payload as the tool's JSON response, so every
+    ``kb_*`` tool surfaces a structured ``config_missing`` payload
+    instead of an opaque MCP InternalError.
+
+    Why raise instead of return: most ``kb_*`` tools post-process the
+    service return value (``_serialize_model_list``, etc.), so a bare
+    JSON string returned from ``svc.list_kbs()`` would itself break.
+    Raising lets the wrapper short-circuit cleanly at one chokepoint.
+    """
+
+    def __init__(self, payload: dict[str, str]) -> None:
+        self._payload = dict(payload)
+
+    @property
+    def payload(self) -> dict[str, str]:
+        return dict(self._payload)
+
+    def __getattr__(self, name: str) -> Callable[..., str]:
+        payload = self._payload
+
+        def _raise_config_missing(*_args: object, **_kwargs: object) -> str:
+            raise _ConfigMissingError(payload)
+
+        _raise_config_missing.__name__ = f"_config_missing_{name}"
+        return _raise_config_missing
+
+
+def _get_service() -> KnowledgebaseService | _ConfigMissingService:
     global _service
     if _service is None:
-        config = Settings().resolve_paths()
-        _service = KnowledgebaseService(config)
-    return _service
+        try:
+            config = Settings().resolve_paths()
+        except (ValidationError, FileNotFoundError, NotADirectoryError) as exc:
+            payload = _classify_config_error(exc)
+            _service = _ConfigMissingService(payload)
+        else:
+            _service = KnowledgebaseService(config)
+    return _service  # type: ignore[return-value]
 
 
 # ---------------------------------------------------------------------------
@@ -126,13 +234,23 @@ def _with_tool_timeout(func: _F) -> _F:
     On timeout, returns a JSON string
     ``{"error": "tool_timeout", "tool": ..., "timeout_seconds": ...}`` so
     MCP sees a normal tool response instead of a hung RPC.
+
+    Also catches :class:`_ConfigMissingError` raised by the
+    ``_ConfigMissingService`` sentinel (when ``_get_service`` cannot
+    construct a real service due to missing or invalid configuration)
+    and returns the structured ``config_missing`` JSON payload as the
+    tool response. This converts the previous opaque MCP InternalError
+    into a useful diagnostic for the caller — the Phase 0 Bug-2 fix.
     """
     @wraps(func)
     def wrapper(*args: object, **kwargs: object) -> str:
         # Re-entrant call from inside the worker thread: skip the
         # executor hop to avoid self-deadlock on the single worker.
         if getattr(_in_tool_worker, "active", False):
-            return func(*args, **kwargs)
+            try:
+                return func(*args, **kwargs)
+            except _ConfigMissingError as exc:
+                return json.dumps(exc.payload)
 
         def _run(*a: object, **kw: object) -> str:
             _in_tool_worker.active = True
@@ -152,6 +270,8 @@ def _with_tool_timeout(func: _F) -> _F:
                 "tool": func.__name__,
                 "timeout_seconds": _TOOL_TIMEOUT_SECONDS,
             })
+        except _ConfigMissingError as exc:
+            return json.dumps(exc.payload)
 
     return wrapper  # type: ignore[return-value]
 
@@ -812,7 +932,22 @@ def kb_config_validate() -> str:
 
 
 def main() -> None:
-    """Run the MCP server."""
+    """Run the MCP server.
+
+    Performs a startup precheck of the configuration so that missing or
+    misconfigured paths fail immediately with a structured single-line
+    JSON message on stderr, rather than surfacing on the first
+    ``kb_*`` MCP call and confusing the caller. ``sys.exit(1)`` on
+    failure ensures the launcher / supervisor sees a non-zero exit
+    code.
+    """
+    try:
+        Settings().resolve_paths()
+    except (ValidationError, FileNotFoundError, NotADirectoryError) as exc:
+        payload = _classify_config_error(exc)
+        sys.stderr.write(json.dumps(payload) + "\n")
+        sys.stderr.flush()
+        sys.exit(1)
     mcp.run()
 
 
