@@ -140,10 +140,19 @@ class ChromadbBackend:
         """Vector-similarity query — delegates to the existing
         :class:`agent_knowledgebase.services.query.QueryOrchestrator`.
 
-        ``filters`` is a chromadb ``where`` dict; the orchestrator's
-        existing ``where={"kb_id": kb_id}`` is preserved.  Extra
-        ``filters`` keys are merged on top and passed through.
+        ``filters`` is reserved for the Phase 3 markdown backend, which
+        will honor it. ChromadbBackend does NOT yet honor ``filters``,
+        and silently dropping it would create a contract-mismatch bug
+        the moment a caller starts relying on it. Until that path is
+        wired through to chromadb's ``where=`` dict, passing a non-None
+        ``filters`` raises :class:`NotImplementedError` instead of
+        being ignored.
         """
+        if filters is not None:
+            raise NotImplementedError(
+                "ChromadbBackend.query does not yet honor filters; pass "
+                "them via where=... at the QueryOrchestrator level"
+            )
         from agent_knowledgebase.services.query import QueryOrchestrator
 
         service = self._require_service()
@@ -151,10 +160,7 @@ class ChromadbBackend:
         vs = service._get_vectorstore(kb_id)  # noqa: SLF001 — by design
         embedder = service._query_embedder_for(kb_id)  # noqa: SLF001
         orchestrator = QueryOrchestrator(vs, embedder, ctx.wiki)
-        # NOTE: QueryOrchestrator.query already injects where={"kb_id":
-        # kb_id}; the optional ``filters`` kwarg is reserved for future
-        # use by the markdown backend (Phase 3) and is intentionally
-        # ignored here so we preserve bit-for-bit v0.6.0 behavior.
+        # QueryOrchestrator.query already injects where={"kb_id": kb_id}.
         results = orchestrator.query(text, kb_id, top_k=top_k)
         return [asdict(r) for r in results]
 
@@ -168,7 +174,17 @@ class ChromadbBackend:
     ) -> list[dict[str, Any]]:
         """FTS search over wiki pages — delegates to
         :meth:`QueryOrchestrator.search`.
+
+        ``filters`` is reserved for the Phase 3 markdown backend.
+        ChromadbBackend.search does NOT yet honor ``filters``; passing
+        a non-None value raises :class:`NotImplementedError` so the
+        contract drift is loud rather than silent.
         """
+        if filters is not None:
+            raise NotImplementedError(
+                "ChromadbBackend.search does not yet honor filters; pass "
+                "them via where=... at the QueryOrchestrator level"
+            )
         from agent_knowledgebase.services.query import QueryOrchestrator
 
         service = self._require_service()
@@ -225,6 +241,14 @@ class ChromadbBackend:
         first-source fields), and from
         ``Database.count_chunks_by_embedding_model(kb_id)`` for
         ``dominant_embedding_model``.
+
+        Field selection rule: when multiple sources exist,
+        ``source_type`` / ``uri`` / ``dedup_key`` are populated from
+        ``sources[0]`` (the first row returned by
+        ``Database.list_sources(kb_id)``, whose ordering follows the
+        underlying SQL ``ORDER BY`` clause). Phase 3's
+        ``MarkdownBackend.info()`` should match this choice for shape
+        consistency.
 
         Inapplicable fields (e.g. an empty KB has no first source so
         ``source_type`` / ``uri`` / ``dedup_key`` are ``None``) are

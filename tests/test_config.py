@@ -301,6 +301,62 @@ class TestHybridWeightValidation:
         )
 
 
+class TestKBBackendVectorstoreConsistency:
+    """``vectorstore`` is only meaningful when ``kb_backend='chromadb'``.
+
+    Setting ``kb_backend in {markdown, lightrag}`` together with a
+    non-default ``vectorstore`` is a meaningless combination — those
+    backends don't read the ``vectorstore`` field. The validator must
+    reject it loudly (Phase 2 hardening; protects Phase 3+).
+    """
+
+    def test_markdown_with_pinecone_rejected(self, tmp_path: Path) -> None:
+        from pydantic import ValidationError
+
+        with pytest.raises(
+            ValidationError, match="vectorstore=.*meaningless when kb_backend"
+        ):
+            Settings(
+                saves_dir=tmp_path,
+                kb_backend="markdown",
+                vectorstore="pinecone",
+                embed_api_key="x",
+                embed_base_url="y",
+            )
+
+    def test_markdown_with_chromadb_default_succeeds(self, tmp_path: Path) -> None:
+        """``vectorstore='chromadb'`` is benign even when ignored by the
+        markdown backend (it's the field default).
+        """
+        cfg = Settings(
+            saves_dir=tmp_path,
+            kb_backend="markdown",
+            vectorstore="chromadb",
+        )
+        assert cfg.kb_backend == "markdown"
+        assert cfg.vectorstore == "chromadb"
+
+    def test_chromadb_default_state_validates(self, tmp_path: Path) -> None:
+        """The default state ``kb_backend='chromadb' + vectorstore='chromadb'``
+        must continue to validate.
+        """
+        cfg = Settings(saves_dir=tmp_path)
+        assert cfg.kb_backend == "chromadb"
+        assert cfg.vectorstore == "chromadb"
+
+    def test_chromadb_with_pinecone_validates(self, tmp_path: Path) -> None:
+        """``kb_backend='chromadb' + vectorstore='pinecone'`` is the
+        legitimate cross-product the validator must NOT reject.
+        """
+        cfg = Settings(
+            saves_dir=tmp_path,
+            kb_backend="chromadb",
+            vectorstore="pinecone",
+        )
+        assert cfg.kb_backend == "chromadb"
+        assert cfg.vectorstore == "pinecone"
+
+
 class TestFixtures:
     """Verify the shared fixtures from conftest work."""
 

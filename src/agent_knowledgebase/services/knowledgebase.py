@@ -612,6 +612,11 @@ class KnowledgebaseService:
         ``_ingest_source_locked`` is called directly (bypassing the lock
         acquisition in ``ingest_source``) to avoid a self-deadlock, since
         ``threading.Lock`` is non-reentrant.
+
+        Note: when the dedup policy resolves to ``'replace'``, the inner
+        ``_ingest_source_locked`` path calls ``self.remove_source(existing.id)``
+        which itself routes through ``self._backend.delete`` — so all delete
+        paths are backend-routed.
         """
         ctx, _ = self._find_context_by_source(source_id)
         source = ctx.db.get_source(source_id)

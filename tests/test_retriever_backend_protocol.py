@@ -221,3 +221,26 @@ def test_chromadb_backend_per_kb_methods_raise_clearly_without_service(
     backend = _build_chromadb_backend(saves_dir)
     with pytest.raises(RuntimeError, match="without a KnowledgebaseService"):
         backend.info(kb_id="missing-kb")
+
+
+def test_chromadb_backend_query_rejects_filters_kwarg(tmp_path: Path) -> None:
+    """ChromadbBackend.query MUST raise NotImplementedError when ``filters``
+    is supplied — the Protocol accepts the kwarg for Phase 3 markdown
+    backend compatibility, but ChromadbBackend does not yet honor it.
+    Silently dropping it would create a contract-mismatch bug the moment
+    a caller starts relying on filters.
+    """
+    saves_dir = tmp_path / "saves"
+    saves_dir.mkdir()
+    backend = _build_chromadb_backend(saves_dir)
+    with pytest.raises(NotImplementedError, match="does not yet honor filters"):
+        backend.query(kb_id="x", text="t", top_k=1, filters={"a": 1})
+
+
+def test_chromadb_backend_search_rejects_filters_kwarg(tmp_path: Path) -> None:
+    """Symmetric guard for ChromadbBackend.search — same contract."""
+    saves_dir = tmp_path / "saves"
+    saves_dir.mkdir()
+    backend = _build_chromadb_backend(saves_dir)
+    with pytest.raises(NotImplementedError, match="does not yet honor filters"):
+        backend.search(kb_id="x", text="t", top_k=1, filters={"a": 1})

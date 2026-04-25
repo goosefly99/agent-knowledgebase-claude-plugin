@@ -173,6 +173,35 @@ class Settings(BaseSettings):
             raise ValueError(msg)
         return self
 
+    @model_validator(mode="after")
+    def _validate_kb_backend_vectorstore_consistency(self) -> Settings:
+        """``vectorstore`` is only meaningful when ``kb_backend='chromadb'``.
+
+        The ``vectorstore`` field selects the chromadb-internal vector-store
+        provider (``chromadb`` PersistentClient vs. ``pinecone``). It is
+        consumed exclusively by ``ChromadbBackend`` / ``services/vectorstore.py``
+        — the ``markdown`` and ``lightrag`` backends don't read it. Accepting
+        e.g. ``kb_backend='markdown' + vectorstore='pinecone'`` therefore
+        encodes a meaningless combination that almost certainly reflects a
+        configuration error. Reject it loudly so Phase 3 doesn't silently
+        ignore the operator's intent.
+
+        The default ``chromadb`` value of ``vectorstore`` is treated as
+        benign even when ``kb_backend != 'chromadb'`` (it's the field
+        default and may simply be unset).
+        """
+        if (
+            self.kb_backend in {"markdown", "lightrag"}
+            and self.vectorstore != "chromadb"
+        ):
+            msg = (
+                f"vectorstore={self.vectorstore!r} is meaningless when "
+                f"kb_backend={self.kb_backend!r}; only set vectorstore "
+                f"when kb_backend='chromadb'"
+            )
+            raise ValueError(msg)
+        return self
+
     # --- Query ---
     query_default_top_k: int = Field(
         default=10,
