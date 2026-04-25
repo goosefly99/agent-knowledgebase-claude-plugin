@@ -29,25 +29,60 @@ Behaviour (Phase 1, v0.8.0):
   3. Verify the plugin root is writable (structured stderr
      `read_only_filesystem`).
   4. Acquire a stdlib-only cross-process lock on
-     `<plugin_root>/.venv.lock` (`fcntl.flock` on Unix, `msvcrt.locking`
-     on Windows) so concurrent worker spawns serialise the bootstrap.
-     We do NOT depend on the pip `filelock` package: this runs BEFORE pip.
+     `<plugin_root>/.venv.lock`. Both branches use a non-blocking
+     primitive (`fcntl.LOCK_EX | LOCK_NB` on Unix, `msvcrt.LK_NBLCK` on
+     Windows) inside a 60s poll-and-deadline loop with 500ms slices.
+     On deadline expiry both branches emit the same structured stderr
+     (`bootstrap_lock_timeout`) and exit 1, so contention behaviour
+     does NOT diverge across operating systems. We do NOT depend on the
+     pip `filelock` package: this runs BEFORE pip.
   5. Create `<plugin_root>/.venv` via stdlib `venv` if missing.
+     Any `venv.create` failure (disk full, permissions, etc.) is wrapped
+     in structured stderr `venv_create_failed` and exits 1.
   6. SHA256 of `<plugin_root>/requirements.lock` is compared against
      `<plugin_root>/.venv/.req-sha`. On match, skip pip install (fast path).
      On mismatch, run `pip install --timeout 30 -r requirements.lock`
      in the venv. `subprocess.TimeoutExpired` is surfaced as structured
-     stderr `network_unreachable`.
+     stderr `network_unreachable`. A non-zero `pip` exit (dep conflict,
+     hash mismatch, etc.) is surfaced as structured stderr
+     `pip_install_failed` carrying the returncode and a truncated stderr
+     capture.
   7. `AGENT_KB_VENDORED_DEPS=/path/to/wheels` swaps in
      `--no-index --find-links=$AGENT_KB_VENDORED_DEPS` for air-gapped
-     installs.
-  8. After successful install, write the new sentinel.
-  9. `os.execv` to `<venv>/bin/python` (POSIX) or
+     installs. The path must be an existing directory; otherwise
+     structured stderr `vendored_deps_invalid` is emitted and the
+     launcher exits 1 BEFORE pip is invoked (so the user sees a single
+     actionable error instead of pip's "no matching distribution" wall).
+  8. After successful install, write the new sentinel. A sentinel write
+     IO error is logged as a non-fatal warning to stderr — the install
+     succeeded; only the cache marker failed, so the next launch will
+     redundantly re-install but still work correctly.
+  9. Hand off to `<venv>/bin/python` (POSIX) or
      `<venv>\\Scripts\\python.exe` (Windows) with
-     `["-m", "agent_knowledgebase.server"]` so this process is replaced
-     and does not stay resident.
+     `["-m", "agent_knowledgebase.server"]` via `os.execv`.
+
+     POSIX semantics: `os.execv` replaces the current process image, so
+     the launcher process is gone and only the server interpreter
+     remains in the process table.
+
+     Windows semantics: `os.execv` is implemented via `_spawnv` under
+     the hood, which means the parent (launcher) process stays resident
+     as a stub waiting for the child to exit, then exits with the
+     child's return code. This is harmless for the MCP stdio transport
+     (Claude Code talks to the parent's stdio, which the OS pipes
+     transparently to the child) but the launcher is NOT actually
+     replaced on Windows.
 
 NO bash/cmd companion. Single .py file is the design.
+
+Canonical structured-stderr error tokens emitted by this launcher:
+    python_version          Python<3.11 detected
+    read_only_filesystem    CLAUDE_PLUGIN_ROOT missing or not writable
+    bootstrap_lock_timeout  60s contention deadline on .venv.lock hit
+    venv_create_failed      stdlib venv.create raised (disk full, perms, ...)
+    network_unreachable     pip install exceeded the 30s wall-clock budget
+    pip_install_failed      pip exited non-zero (dep conflict, hash mismatch)
+    vendored_deps_invalid   AGENT_KB_VENDORED_DEPS does not point at a dir
 """
 
 from __future__ import annotations
@@ -58,8 +93,18 @@ import json
 import os
 import subprocess
 import sys
+import time
 import venv
 from pathlib import Path
+
+# Platform-conditional locking primitive imports. Hoisted to module level
+# (under a sys.platform guard) so static analysis (mypy/ruff) can resolve
+# the conditional dependency. Inside the function, we only USE whichever
+# module was imported on the current platform.
+if sys.platform == "win32":
+    import msvcrt
+else:
+    import fcntl
 
 # Spec_id pinned for traceability — future agents grep this comment to find
 # the launcher that implements the v2.1 Pattern A design.
@@ -71,18 +116,48 @@ _SPEC_VERSION = "2.1"
 # without making the launcher feel hung.
 _PIP_INSTALL_TIMEOUT_SECONDS = 30
 
+# Wall-clock budget for cross-process bootstrap lock acquisition. 60s is
+# more than enough for one in-flight pip install to finish (the install
+# itself is bounded at 30s) plus startup overhead.
+_BOOTSTRAP_LOCK_TIMEOUT_SECONDS = 60
+
+# Poll interval for the lock-acquisition loop. 500ms keeps wall-clock
+# acquisition latency low for the common no-contention case while not
+# burning CPU when contention is real.
+_BOOTSTRAP_LOCK_POLL_SECONDS = 0.5
+
 
 def _emit_stderr_error(error_token: str, detail: str, **extra: object) -> None:
     """
     Emit a structured single-line JSON error to stderr.
 
-    The three canonical error_token values per spec are:
-      - ``python_version``        Python<3.11 detected
-      - ``network_unreachable``   PyPI 30 s timeout — set AGENT_KB_VENDORED_DEPS
-      - ``read_only_filesystem``  CLAUDE_PLUGIN_ROOT not writable
+    Canonical error_token values per spec — see the module docstring's
+    "Canonical structured-stderr error tokens" list for the full set
+    and their meanings. The launcher contract is that any fatal exit
+    is preceded by one such single-line JSON document.
     """
     payload: dict[str, object] = {
         "error": error_token,
+        "detail": detail,
+        "launcher": "agent-knowledgebase/bin/run_server.py",
+        "spec_id": _SPEC_ID,
+        "spec_version": _SPEC_VERSION,
+    }
+    payload.update(extra)
+    sys.stderr.write(json.dumps(payload, separators=(",", ":")) + "\n")
+    sys.stderr.flush()
+
+
+def _emit_stderr_warning(warning_token: str, detail: str, **extra: object) -> None:
+    """Emit a structured single-line JSON warning to stderr (non-fatal).
+
+    Distinguished from ``_emit_stderr_error`` only by the ``"level"``
+    field in the payload — both share the same launcher/spec metadata
+    so downstream log-shippers can treat them uniformly.
+    """
+    payload: dict[str, object] = {
+        "warning": warning_token,
+        "level": "warning",
         "detail": detail,
         "launcher": "agent-knowledgebase/bin/run_server.py",
         "spec_id": _SPEC_ID,
@@ -174,16 +249,82 @@ def _check_writable(plugin_root: Path) -> None:
         sys.exit(1)
 
 
+def _acquire_bootstrap_lock_or_exit(fh, lock_path: Path) -> None:
+    """Acquire the OS-level lock on ``fh`` with a deadline; exit on timeout.
+
+    Both Unix and Windows branches share the same poll-with-deadline
+    strategy so contention behaviour is identical across operating
+    systems. On deadline expiry, both branches emit the canonical
+    ``bootstrap_lock_timeout`` structured stderr and ``sys.exit(1)``.
+    The non-blocking flavour of each primitive (``fcntl.LOCK_NB`` /
+    ``msvcrt.LK_NBLCK``) lets us own the timeout policy in Python rather
+    than delegating to the kernel.
+    """
+    deadline = time.monotonic() + _BOOTSTRAP_LOCK_TIMEOUT_SECONDS
+    if sys.platform == "win32":
+        # msvcrt.locking requires a non-empty region. Write a sentinel
+        # byte if the file is empty so locking has something to grab.
+        if os.fstat(fh.fileno()).st_size == 0:
+            fh.write("0")
+            fh.flush()
+        fh.seek(0)
+        while True:
+            try:
+                msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+                return
+            except OSError:
+                if time.monotonic() >= deadline:
+                    _emit_stderr_error(
+                        "bootstrap_lock_timeout",
+                        f"another process holds {lock_path}",
+                        timeout_seconds=_BOOTSTRAP_LOCK_TIMEOUT_SECONDS,
+                        lock_path=str(lock_path),
+                    )
+                    sys.exit(1)
+                time.sleep(_BOOTSTRAP_LOCK_POLL_SECONDS)
+    else:
+        while True:
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return
+            except (BlockingIOError, OSError):
+                if time.monotonic() >= deadline:
+                    _emit_stderr_error(
+                        "bootstrap_lock_timeout",
+                        f"another process holds {lock_path}",
+                        timeout_seconds=_BOOTSTRAP_LOCK_TIMEOUT_SECONDS,
+                        lock_path=str(lock_path),
+                    )
+                    sys.exit(1)
+                time.sleep(_BOOTSTRAP_LOCK_POLL_SECONDS)
+
+
+def _release_bootstrap_lock(fh) -> None:
+    """Release the OS-level lock acquired by ``_acquire_bootstrap_lock_or_exit``.
+
+    Errors during release are suppressed — if the FD is already closed
+    or the lock has already been released, we do not want to mask the
+    original control-flow path with a teardown exception.
+    """
+    if sys.platform == "win32":
+        fh.seek(0)
+        with contextlib.suppress(OSError):
+            msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+    else:
+        with contextlib.suppress(OSError):
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+
+
 @contextlib.contextmanager
 def _bootstrap_lock(lock_path: Path):
     """Stdlib-only cross-process lock on ``<plugin_root>/.venv.lock``.
 
-    On Unix uses ``fcntl.flock`` (advisory, blocking). On Windows uses
-    ``msvcrt.locking`` with a tiny retry loop because ``msvcrt.locking``
-    locks at most ``LK_LOCK`` blocks and raises ``OSError`` with EDEADLK
-    if it cannot acquire after ~10 s. We sidestep the dependency on the
-    pip ``filelock`` package because this code path runs BEFORE pip
-    install.
+    Implemented as a context manager around
+    ``_acquire_bootstrap_lock_or_exit`` / ``_release_bootstrap_lock`` so
+    the unified poll-and-deadline + structured-stderr-on-timeout
+    behaviour is shared between Unix and Windows. We sidestep the
+    dependency on the pip ``filelock`` package because this code path
+    runs BEFORE pip install.
 
     The lock file itself is a 1-byte placeholder; we never read or write
     its contents. We only use the OS-level lock on the open handle.
@@ -193,44 +334,11 @@ def _bootstrap_lock(lock_path: Path):
     # gives us a writable handle without truncating any prior placeholder.
     fh = open(lock_path, "a+")
     try:
-        if sys.platform == "win32":
-            import msvcrt
-
-            # msvcrt.locking requires a non-empty region. Write a sentinel
-            # byte if the file is empty so locking has something to grab.
-            if os.fstat(fh.fileno()).st_size == 0:
-                fh.write("0")
-                fh.flush()
-            fh.seek(0)
-            # Retry up to 60 s in 1 s slices — concurrent worker spawns
-            # should always make progress within the bootstrap window.
-            import time
-
-            deadline = time.monotonic() + 60.0
-            while True:
-                try:
-                    msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
-                    break
-                except OSError:
-                    if time.monotonic() >= deadline:
-                        raise
-                    time.sleep(0.5)
-            try:
-                yield
-            finally:
-                # Release the same byte range we locked.
-                fh.seek(0)
-                with contextlib.suppress(OSError):
-                    msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
-        else:
-            import fcntl
-
-            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
-            try:
-                yield
-            finally:
-                with contextlib.suppress(OSError):
-                    fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        _acquire_bootstrap_lock_or_exit(fh, lock_path)
+        try:
+            yield
+        finally:
+            _release_bootstrap_lock(fh)
     finally:
         fh.close()
 
@@ -261,19 +369,52 @@ def _read_sentinel(sentinel_path: Path) -> str | None:
 
 
 def _write_sentinel(sentinel_path: Path, sha: str) -> None:
-    """Persist the new SHA after a successful pip install."""
-    sentinel_path.parent.mkdir(parents=True, exist_ok=True)
-    sentinel_path.write_text(sha, encoding="utf-8")
+    """Persist the new SHA after a successful pip install.
+
+    A failure to write the sentinel is non-fatal: pip install already
+    succeeded, so the venv is in a usable state. The only consequence
+    is that the next launcher invocation will redundantly re-run pip
+    install (because the SHA cache marker is missing). We surface a
+    structured warning to stderr so operators can investigate the
+    underlying disk/permissions issue without breaking the user's
+    workflow right now.
+    """
+    try:
+        sentinel_path.parent.mkdir(parents=True, exist_ok=True)
+        sentinel_path.write_text(sha, encoding="utf-8")
+    except OSError as exc:
+        _emit_stderr_warning(
+            "sentinel_write_failed",
+            f"could not write sentinel at {sentinel_path}: {exc}. "
+            "pip install succeeded; next launch will redundantly re-install.",
+            sentinel_path=str(sentinel_path),
+        )
 
 
 def _ensure_venv(plugin_root: Path, venv_python: Path) -> None:
-    """Create ``<plugin_root>/.venv`` via stdlib ``venv`` if missing."""
+    """Create ``<plugin_root>/.venv`` via stdlib ``venv`` if missing.
+
+    Any failure inside ``venv.create`` (disk full, permission denied,
+    Python install missing the ``ensurepip`` module, etc.) is wrapped
+    in the canonical ``venv_create_failed`` structured stderr and
+    exits 1. Without this wrapper the user sees a raw traceback that
+    obscures the actionable recovery hint.
+    """
     if venv_python.exists():
         return
     venv_dir = plugin_root / ".venv"
     # with_pip=True bootstraps pip into the new venv so the install step
     # below has something to invoke.
-    venv.create(str(venv_dir), with_pip=True, clear=False, symlinks=False)
+    try:
+        venv.create(str(venv_dir), with_pip=True, clear=False, symlinks=False)
+    except Exception as exc:
+        _emit_stderr_error(
+            "venv_create_failed",
+            f"stdlib venv.create failed for {venv_dir}: {exc}",
+            venv_dir=str(venv_dir),
+            exception_type=type(exc).__name__,
+        )
+        sys.exit(1)
 
 
 def _build_pip_install_argv(
@@ -283,8 +424,11 @@ def _build_pip_install_argv(
 
     With the env var set, ``--no-index --find-links=<dir>`` makes pip
     skip PyPI entirely so air-gapped corporate hosts can preload wheels
-    and bootstrap without network access. Without it, the launcher
-    relies on the public PyPI mirror.
+    and bootstrap without network access. The path is validated by
+    ``_validate_vendored_deps`` BEFORE this function constructs the
+    argv, so by the time we reach this code the directory is known to
+    exist. Without the env var, the launcher relies on the public
+    PyPI mirror.
     """
     argv: list[str] = [
         str(venv_python),
@@ -302,14 +446,39 @@ def _build_pip_install_argv(
     return argv
 
 
+def _validate_vendored_deps() -> None:
+    """Validate ``AGENT_KB_VENDORED_DEPS`` points at an existing directory.
+
+    pip's own error for a non-existent ``--find-links`` is a wall of
+    "no matching distribution" failures per package — confusing because
+    the root cause (a typo in the env var) is buried. Validate up-front
+    and surface a single structured token instead.
+    """
+    vendored = os.environ.get("AGENT_KB_VENDORED_DEPS")
+    if not vendored:
+        return
+    if not Path(vendored).is_dir():
+        _emit_stderr_error(
+            "vendored_deps_invalid",
+            f"AGENT_KB_VENDORED_DEPS={vendored} is not an existing "
+            "directory. Set it to a directory containing pre-downloaded "
+            "wheels (e.g. `pip download -d wheels/ -r requirements.lock`).",
+            path=vendored,
+        )
+        sys.exit(1)
+
+
 def _run_pip_install(
     venv_python: Path, requirements_path: Path
 ) -> None:
     """Run pip install inside the venv with a 30 s wall-clock budget.
 
     A ``TimeoutExpired`` is surfaced as structured stderr
-    ``network_unreachable``; any other non-zero exit re-raises so the
-    user sees the underlying pip output (which itself is informative).
+    ``network_unreachable``. A non-zero pip exit (dep conflict, hash
+    mismatch, missing wheel under a vendored deps dir, etc.) is
+    surfaced as structured stderr ``pip_install_failed`` carrying the
+    returncode and a truncated stderr capture so the user can diagnose
+    without scrolling through pip's full output.
     """
     argv = _build_pip_install_argv(venv_python, requirements_path)
     try:
@@ -317,6 +486,8 @@ def _run_pip_install(
             argv,
             check=True,
             timeout=_PIP_INSTALL_TIMEOUT_SECONDS,
+            capture_output=True,
+            text=True,
         )
     except subprocess.TimeoutExpired:
         _emit_stderr_error(
@@ -326,6 +497,21 @@ def _run_pip_install(
             "installs (vendor wheels via "
             "`pip download -d wheels/ -r requirements.lock`).",
             timeout_seconds=_PIP_INSTALL_TIMEOUT_SECONDS,
+        )
+        sys.exit(1)
+    except subprocess.CalledProcessError as exc:
+        # Truncate captured stderr so we don't dump a megabyte of pip
+        # output into the launcher's structured token. ~500 chars is
+        # enough to see the first failed package + its reason.
+        stderr_text = (exc.stderr or "") if isinstance(exc.stderr, str) else ""
+        if len(stderr_text) > 500:
+            stderr_text = stderr_text[:500] + "...[truncated]"
+        _emit_stderr_error(
+            "pip_install_failed",
+            f"pip install exited with returncode {exc.returncode}. "
+            "Check the captured stderr for the offending package.",
+            returncode=exc.returncode,
+            stderr=stderr_text,
         )
         sys.exit(1)
 
@@ -340,6 +526,11 @@ def _bootstrap_venv(plugin_root: Path) -> Path:
     requirements_path = plugin_root / "requirements.lock"
     sentinel_path = plugin_root / ".venv" / ".req-sha"
     lock_path = plugin_root / ".venv.lock"
+
+    # Validate AGENT_KB_VENDORED_DEPS up-front, BEFORE acquiring the
+    # bootstrap lock — a malformed env var should fail fast and not
+    # serialise behind any in-flight venv creation.
+    _validate_vendored_deps()
 
     with _bootstrap_lock(lock_path):
         # (1) ensure the venv exists.
@@ -367,7 +558,13 @@ def _bootstrap_venv(plugin_root: Path) -> Path:
 
 
 def main() -> None:
-    """Pattern A launcher entry point."""
+    """Pattern A launcher entry point.
+
+    On POSIX the final ``os.execv`` replaces the launcher process with
+    the server interpreter. On Windows ``os.execv`` is implemented via
+    ``_spawnv`` and the launcher process stays resident as a stub
+    waiting for the child to exit (see module docstring step 9).
+    """
     _check_python_version()
 
     plugin_root = _resolve_plugin_root()

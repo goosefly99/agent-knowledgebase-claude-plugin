@@ -120,6 +120,29 @@ def test_fresh_plugin_root_creates_venv_and_writes_sentinel(
     assert create_mock.call_count == 1
     # pip install was invoked.
     assert fake_subprocess_run.called
+    # Inspect the actual argv passed to subprocess.run — guards against
+    # a regression where ``_run_pip_install`` bypasses
+    # ``_build_pip_install_argv``. Also assert the kwargs (cwd is left
+    # at None / process default; check=True must remain on so a
+    # non-zero pip exit raises CalledProcessError).
+    call_args = fake_subprocess_run.call_args
+    argv = call_args.args[0]
+    # --timeout 30 must appear in that order (timeout flag immediately
+    # followed by its value) — bug-prone area when refactoring argv.
+    assert "--timeout" in argv
+    timeout_idx = argv.index("--timeout")
+    assert argv[timeout_idx + 1] == "30"
+    # -r requirements.lock must appear in that order.
+    assert "-r" in argv
+    r_idx = argv.index("-r")
+    assert argv[r_idx + 1] == str(plugin_root / "requirements.lock")
+    # Kwargs that the launcher contract depends on:
+    #   check=True  — non-zero exit raises CalledProcessError so we can
+    #                 surface ``pip_install_failed`` structured stderr.
+    #   timeout=30  — wall-clock budget so we can surface
+    #                 ``network_unreachable`` on a captive-portal hang.
+    assert call_args.kwargs.get("check") is True
+    assert call_args.kwargs.get("timeout") == launcher._PIP_INSTALL_TIMEOUT_SECONDS
     # The launcher returned the venv-python path.
     assert returned == venv_python
     # The sentinel was written.
