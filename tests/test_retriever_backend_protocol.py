@@ -30,11 +30,12 @@ import pytest
 
 from agent_knowledgebase.backends import RetrieverBackend, get_backend
 from agent_knowledgebase.backends.chromadb_backend import ChromadbBackend
+from agent_knowledgebase.backends.markdown_backend import MarkdownWikiBackend
 from agent_knowledgebase.config import Settings
 
 
 # ---------------------------------------------------------------------------
-# Backend factories — Phase 3 will append a markdown variant here.
+# Backend factories — extended in Phase 3 with the markdown variant.
 # ---------------------------------------------------------------------------
 
 
@@ -50,8 +51,20 @@ def _build_chromadb_backend(saves_dir: Path) -> RetrieverBackend:
     return ChromadbBackend(settings)
 
 
+def _build_markdown_backend(saves_dir: Path) -> RetrieverBackend:
+    """Construct a MarkdownWikiBackend pointing at ``saves_dir``.
+
+    Same Protocol-conformance contract as the chromadb variant — no
+    service back-reference is needed for the surface-level checks below.
+    """
+    settings = Settings(saves_dir=saves_dir, kb_backend="markdown")
+    settings = settings.resolve_paths()
+    return MarkdownWikiBackend(settings)
+
+
 _BACKEND_FACTORIES: dict[str, Callable[[Path], RetrieverBackend]] = {
     "chromadb": _build_chromadb_backend,
+    "markdown": _build_markdown_backend,
 }
 
 
@@ -170,18 +183,22 @@ def test_get_backend_factory_returns_chromadb_for_default_settings(
     assert isinstance(backend, RetrieverBackend)
 
 
-def test_get_backend_factory_raises_for_markdown_until_phase3(
+def test_get_backend_factory_returns_markdown_when_opted_in(
     tmp_path: Path,
 ) -> None:
-    """The markdown backend stub must raise NotImplementedError pointing
-    at Phase 3 — this guards the gate criterion in
-    ``docs/redesign/ROADMAP.md`` (Phase 2 -> Phase 3 transition).
+    """``AGENT_KB_BACKEND=markdown`` instantiates :class:`MarkdownWikiBackend`.
+
+    Phase 3 promoted the markdown branch of ``get_backend()`` from
+    ``NotImplementedError`` to a real backend instance. The default
+    remains ``'chromadb'`` (covered by
+    :func:`test_get_backend_factory_returns_chromadb_for_default_settings`).
     """
     saves_dir = tmp_path / "saves"
     saves_dir.mkdir()
     settings = Settings(saves_dir=saves_dir, kb_backend="markdown").resolve_paths()
-    with pytest.raises(NotImplementedError, match="Phase 3"):
-        get_backend(settings)
+    backend = get_backend(settings)
+    assert isinstance(backend, MarkdownWikiBackend)
+    assert isinstance(backend, RetrieverBackend)
 
 
 def test_get_backend_factory_raises_for_lightrag_until_phase6(

@@ -179,10 +179,8 @@ def get_backend(
         return ChromadbBackend(settings, service=service)
 
     if backend_name == "markdown":
-        raise NotImplementedError(
-            "MarkdownWikiBackend is a Phase 3 deliverable. Set "
-            "AGENT_KB_BACKEND=chromadb (the default) until Phase 3 lands."
-        )
+        from .markdown_backend import MarkdownWikiBackend
+        return MarkdownWikiBackend(settings, service=service)
 
     if backend_name == "lightrag":
         raise NotImplementedError(

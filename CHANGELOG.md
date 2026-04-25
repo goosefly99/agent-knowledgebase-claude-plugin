@@ -1,5 +1,99 @@
 # Changelog
 
+## 0.9.0 — 2026-04-24
+
+> Phase 3 of the v2.1 redesign — opt-in Karpathy-style markdown wiki
+> backend. **chromadb stays the default**; markdown is purely opt-in
+> via `AGENT_KB_BACKEND=markdown`. Zero behavior change for existing
+> v0.6.0/0.8.x KBs unless the operator explicitly flips the env var.
+>
+> spec_id: `70ab2170-381a-4657-bcd1-28a40c6f369b`
+> Source spec: `pipeline_mcp_data/specs/agent-kb-redesign-spec-v2.1.json`
+
+### Added
+
+- New `MarkdownWikiBackend` in
+  `src/agent_knowledgebase/backends/markdown_backend.py` — second
+  concrete implementation of the Phase 2 `RetrieverBackend` Protocol.
+  Stores knowledge as Karpathy-style interlinked markdown files on
+  disk (`docs/karpathy-llm-wiki.md` design pattern) instead of as
+  chromadb vectors. Layout under `<saves_dir>/<kb-dir>/wiki/`:
+  `raw/<source_id>.<ext>`, `pages/<slug>.md`, `index.md` (or sharded
+  `index/<category>.md` above 200 pages), `log.md`, `hot.md`.
+- New `KbIngestorUnsuitableError` (error_code `KB_INGESTOR_UNSUITABLE`)
+  raised when `index()` is called with a `source_type` outside the
+  positive-allow list `{file, website, api_endpoint with payload <2MB}`
+  (validation finding f-15 — positive form, NOT a deny-list).
+  Disallowed types include `sql_database`, `codebase`, `git_history`,
+  `directory`, and `api_endpoint` payloads >= 2MB. Set
+  `AGENT_KB_FORCE_WIKI_INGEST=1` to bypass the check; the bypass
+  emits a structured `knowledgebase_stderr_log` warning carrying
+  `error_code=KB_INGESTOR_UNSUITABLE_FORCED` so operators can grep
+  for forced ingests.
+- sqlite FTS5 in-memory index over `pages/*.md` content. Both
+  `RetrieverBackend.query()` (vector path) and `search()` (keyword
+  path) route through the FTS5 index — markdown has no embedding
+  path, so `query()` re-routes to `search()` and surfaces scores in
+  `[0, 1]` descending via `score = 1 / (1 + abs(rank))`.
+- Sharded `index.md`: above 200 pages the index becomes a directory
+  pointer with one shard per `source_type` under `wiki/index/`.
+  Categorisation via `source_type` is the v0 placeholder
+  (per spec.phases[3].tasks[4]).
+- `tests/test_markdown_backend.py` — 13 tests covering single-article
+  ingest, 250-article shard transition, allow-list rejection (each
+  disallowed `source_type`, plus oversized api_endpoint), force-flag
+  bypass + stderr_log emission, empty-input no-op, search-on-empty,
+  delete by source_id / by ids, health_check, and factory wiring.
+- `tests/contract/test_markdown_backend_probe4_shape.py` — pins the
+  probe-4 contract on `MarkdownWikiBackend.info()` directly: every
+  required key (`source_type`, `uri`, `dedup_key`, `page_id`,
+  `dominant_embedding_model`) is present, with `dominant_embedding_model`
+  ALWAYS `None` for the markdown backend (markdown does not embed)
+  but never omitted (validation finding f-20).
+- `docs/markdown_backend.md` — usage guide, allow-list rationale,
+  per-source_type cost-model table (rough order-of-magnitude
+  estimates for the deferred LLM page-extraction pass), sharded-index
+  layout diagram, probe-4 contract table, and an explicit
+  Limitations section calling out: synchronous-only ingest (no
+  out-of-band LLM yet), no vector queries, no incremental update,
+  filters pushdown limited to `source_type` / `slug`, no cross-process
+  serialization, `source_type`-based categories.
+
+### Changed
+
+- `src/agent_knowledgebase/backends/__init__.py` — `get_backend()`
+  factory's `'markdown'` branch now instantiates
+  `MarkdownWikiBackend(settings, service=service)` instead of raising
+  `NotImplementedError`. The `'lightrag'` branch stays as
+  `NotImplementedError` (Phase 6 deferred).
+- `tests/test_retriever_backend_protocol.py` — extended
+  `_BACKEND_FACTORIES` with the markdown variant so all
+  Protocol-conformance assertions (runtime-checkable Protocol
+  membership, method signatures via `inspect.signature`) run
+  parameterized across both backends. The "raises for markdown
+  until Phase 3" guard test was inverted into a positive
+  "returns markdown when opted in" check.
+
+### NOT in scope (Phase 4+)
+
+- `kb_migrate` MCP tool + `services/migration.py` + read-fallback
+  semantics — Phase 4. Until that ships, switching `AGENT_KB_BACKEND`
+  does NOT copy data between backends; a KB ingested under chromadb
+  is not queryable via markdown without re-ingesting from raw sources.
+- Out-of-band LLM page-extraction (the spec's
+  `status='pending_extraction'` path). Phase 3 MVP is synchronous,
+  no LLM — `index()` blocks until the page is written and the body
+  is a deterministic transformer of the raw content (file body
+  verbatim; website → trafilatura plain text; api_endpoint payload →
+  fenced code block). Documented as a future enhancement in
+  `docs/markdown_backend.md`.
+- Embedding default-flip + `embedder_version` stamping — Phase 5
+  (PRECEDED by Phase 4 per non-negotiable phase ordering).
+- Decorator order swap in `server.py` — explicitly NOT changed (M-01).
+- Server.py / decorator changes of any kind — Phase 3 touches NO
+  MCP tool definitions and adds NO new MCP tools. The 25-tool frozen
+  surface is preserved bit-for-bit.
+
 ## 0.8.1 — 2026-04-24
 
 > Phase 2 of the v2.1 redesign — RetrieverBackend abstraction with the
