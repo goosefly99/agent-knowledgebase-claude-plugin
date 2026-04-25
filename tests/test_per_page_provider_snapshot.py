@@ -28,6 +28,7 @@ What's being tested
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from unittest.mock import patch
 
@@ -352,4 +353,177 @@ def test_backfill_stamps_columns_for_legacy_chunks(tmp_path: Path) -> None:
         base_url="other",
     )
     assert rerun == 0
+    db.close()
+
+
+# ---------------------------------------------------------------------------
+# I-02 — backfill restricts by metadata.embedding_model
+# ---------------------------------------------------------------------------
+
+
+def test_backfill_skips_chunks_with_mismatched_embedding_model(
+    tmp_path: Path,
+) -> None:
+    """I-02: ``backfill_provider_snapshot`` must only stamp chunks
+    whose ``metadata.embedding_model`` matches the current
+    ``Settings.embedding_model``. A mixed-history KB whose chunks were
+    ingested under MULTIPLE different embedders must NOT have the
+    process-wide provider misstamped onto the chunks that came from a
+    different embedder.
+
+    Bug history: the old implementation read
+    ``service._config.embedding_provider`` and stamped every NULL
+    chunk regardless of model, so a switch from Ollama to Remote
+    would silently misstamp the older Ollama chunks with
+    ``provider='remote'``.
+    """
+    from agent_knowledgebase.config import Settings
+    from agent_knowledgebase.services.knowledgebase import KnowledgebaseService
+    from agent_knowledgebase.services.migration import backfill_provider_snapshot
+
+    saves = tmp_path / "saves"
+    saves.mkdir()
+    # Live config says model=text-embedding-3-small, provider=remote.
+    settings = Settings(
+        saves_dir=saves,
+        embedding_provider="remote",
+        embedding_model="text-embedding-3-small",
+        embed_base_url="https://api.openai.com/v1",
+        embed_api_key="sk-test",
+    ).resolve_paths()
+    svc = KnowledgebaseService(settings)
+    kb = svc.create_kb(name="bf-mixed")
+    ctx = svc._ctx(kb.id)
+
+    # Insert a source row so the FK constraints are satisfied.
+    ctx.db._conn.execute(
+        "INSERT INTO sources (id, kb_id, source_type, uri, status) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (f"src-{kb.id}", kb.id, "file", "x://mixed", "ingested"),
+    )
+    ctx.db._conn.commit()
+
+    # 5 chunks with embedding_model='text-embedding-3-small' (matches
+    # current settings); should be stamped.
+    for i in range(5):
+        ctx.db._conn.execute(
+            "INSERT INTO chunks (id, source_id, kb_id, content, metadata, embedding_id) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                f"c-match-{i}",
+                f"src-{kb.id}",
+                kb.id,
+                f"matching {i}",
+                json.dumps({"embedding_model": "text-embedding-3-small"}),
+                None,
+            ),
+        )
+    # 5 chunks with embedding_model='qwen3-embedding:8b' (DIFFERENT
+    # model — must NOT be misstamped with provider='remote').
+    for i in range(5):
+        ctx.db._conn.execute(
+            "INSERT INTO chunks (id, source_id, kb_id, content, metadata, embedding_id) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                f"c-skip-{i}",
+                f"src-{kb.id}",
+                kb.id,
+                f"skip {i}",
+                json.dumps({"embedding_model": "qwen3-embedding:8b"}),
+                None,
+            ),
+        )
+    ctx.db._conn.commit()
+
+    summary = backfill_provider_snapshot(svc, kb_id=kb.id)
+    assert summary[kb.id] == 5, (
+        f"expected 5 matching chunks updated, got {summary[kb.id]} — "
+        f"the mismatched-model chunks must be left untouched"
+    )
+
+    # Matching-model chunks: stamped with remote.
+    matching = ctx.db._conn.execute(
+        "SELECT embedding_provider, embed_base_url FROM chunks "
+        "WHERE id LIKE 'c-match-%'"
+    ).fetchall()
+    for row in matching:
+        assert row["embedding_provider"] == "remote", (
+            f"matching-model chunk should be stamped 'remote', got "
+            f"{row['embedding_provider']!r}"
+        )
+        assert row["embed_base_url"] == "https://api.openai.com/v1"
+
+    # Mismatched-model chunks: STILL NULL (the bug catcher).
+    skipped = ctx.db._conn.execute(
+        "SELECT embedding_provider, embed_base_url FROM chunks "
+        "WHERE id LIKE 'c-skip-%'"
+    ).fetchall()
+    for row in skipped:
+        assert row["embedding_provider"] is None, (
+            f"mismatched-model chunk MUST stay NULL (no misstamp); "
+            f"got provider={row['embedding_provider']!r}. "
+            f"This is the I-02 bug: the old backfill stamped every NULL "
+            f"row with the process-wide provider, silently corrupting "
+            f"mixed-embedder KBs."
+        )
+        assert row["embed_base_url"] is None
+
+
+def test_backfill_embedding_snapshot_db_method_honors_model_filter(
+    tmp_path: Path,
+) -> None:
+    """I-02 unit test for the Database method directly: the
+    ``embedding_model=`` kwarg must restrict the UPDATE to matching
+    rows. Without the kwarg, all NULL rows are stamped (legacy
+    behavior, kept for backwards compat).
+    """
+    db = Database(db_path=tmp_path / "x.db")
+    db._conn.execute(
+        "INSERT INTO knowledgebases (id, name, created_at, updated_at) "
+        "VALUES (?, ?, ?, ?)",
+        ("kb-mf", "kb-mf", "2026-04-24T00:00:00", "2026-04-24T00:00:00"),
+    )
+    db._conn.execute(
+        "INSERT INTO sources (id, kb_id, source_type, uri, status) "
+        "VALUES (?, ?, ?, ?, ?)",
+        ("src-mf", "kb-mf", "file", "x://a", "ingested"),
+    )
+    db._conn.commit()
+    # 3 model-A chunks, 2 model-B chunks, all with NULL provider.
+    import json as _json
+    for i in range(3):
+        db._conn.execute(
+            "INSERT INTO chunks (id, source_id, kb_id, content, metadata, embedding_id) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (f"a{i}", "src-mf", "kb-mf", "x",
+             _json.dumps({"embedding_model": "model-A"}), None),
+        )
+    for i in range(2):
+        db._conn.execute(
+            "INSERT INTO chunks (id, source_id, kb_id, content, metadata, embedding_id) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (f"b{i}", "src-mf", "kb-mf", "x",
+             _json.dumps({"embedding_model": "model-B"}), None),
+        )
+    db._conn.commit()
+
+    # Stamp only model-A chunks.
+    n = db.backfill_embedding_snapshot(
+        kb_id="kb-mf",
+        provider="provider-A",
+        base_url="url-A",
+        embedding_model="model-A",
+    )
+    assert n == 3
+
+    # model-A: stamped.
+    rows_a = db._conn.execute(
+        "SELECT embedding_provider FROM chunks WHERE id LIKE 'a%'"
+    ).fetchall()
+    assert all(r["embedding_provider"] == "provider-A" for r in rows_a)
+    # model-B: untouched.
+    rows_b = db._conn.execute(
+        "SELECT embedding_provider FROM chunks WHERE id LIKE 'b%'"
+    ).fetchall()
+    assert all(r["embedding_provider"] is None for r in rows_b)
     db.close()

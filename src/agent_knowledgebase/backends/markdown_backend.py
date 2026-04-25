@@ -396,12 +396,25 @@ class MarkdownWikiBackend:
         # Accept SourceType enum members or plain strings.
         return getattr(st, "value", st)
 
-    def _check_source_allowed(self, doc: dict[str, Any], *, kb_id: str) -> None:
+    def _check_source_allowed(
+        self, doc: dict[str, Any], *, kb_id: str, force: bool = False
+    ) -> None:
         """Raise :class:`KbIngestorUnsuitableError` if ``doc`` is
         outside the positive-allow list, unless the force-flag is set
         (in which case emit a structured stderr_log warning and
         proceed).
+
+        ``force`` is a private/migration-only escape hatch: when
+        ``True`` it has the same effect as the
+        ``AGENT_KB_FORCE_WIKI_INGEST=1`` env var but is scoped to a
+        single call instead of the entire process. Used by
+        ``services.migration.export_to_markdown`` so the migration
+        can be lossless across the markdown allow-list without
+        mutating process-wide environment state (see I-05). Public
+        callers should NOT pass ``force=True`` — the env var is the
+        documented operator escape.
         """
+        effective_force = force or self._force_flag()
         st = self._doc_source_type(doc)
         if st in _WIKI_ALLOW_TYPES:
             if st == "api_endpoint":
@@ -413,7 +426,7 @@ class MarkdownWikiBackend:
                 else:
                     payload_size = len(str(payload).encode("utf-8"))
                 if payload_size >= _API_ENDPOINT_MAX_BYTES:
-                    if self._force_flag():
+                    if effective_force:
                         self._emit_force_warning(
                             kb_id=kb_id,
                             source_type=st,
@@ -431,7 +444,7 @@ class MarkdownWikiBackend:
                         ),
                     )
             return
-        if self._force_flag():
+        if effective_force:
             self._emit_force_warning(
                 kb_id=kb_id,
                 source_type=st,
@@ -524,6 +537,44 @@ class MarkdownWikiBackend:
         atomicity caveat (raw → page → log is also non-transactional
         across the three files).
         """
+        self._index_impl(kb_id=kb_id, documents=documents, force=False)
+
+    def _index_with_force(
+        self,
+        *,
+        kb_id: str,
+        documents: list[dict[str, Any]],
+    ) -> None:
+        """Private migration-only entry point: bypass the allow-list.
+
+        Identical to :meth:`index` but bypasses the positive-allow
+        list (a stderr_log warning is still emitted per document).
+        Used by ``services.migration.export_to_markdown`` to keep the
+        export lossless across source_type values the markdown
+        backend would otherwise reject (``sql_database``,
+        ``codebase``, ...).
+
+        This is NOT part of the :class:`RetrieverBackend` Protocol —
+        it is a backend-private escape hatch. The Protocol's
+        ``index()`` signature stays narrow per
+        ``tests/test_retriever_backend_protocol.py``. Public callers
+        outside the migration module should keep using the
+        documented operator env override
+        ``AGENT_KB_FORCE_WIKI_INGEST=1`` instead. Per-call scoping
+        avoids the process-wide env-mutation race I-05 documents.
+        """
+        self._index_impl(kb_id=kb_id, documents=documents, force=True)
+
+    def _index_impl(
+        self,
+        *,
+        kb_id: str,
+        documents: list[dict[str, Any]],
+        force: bool,
+    ) -> None:
+        """Internal index body shared by :meth:`index` and
+        :meth:`_index_with_force`.
+        """
         if not documents:
             return
         # Validate ALL documents up-front so a partially-written batch
@@ -531,7 +582,7 @@ class MarkdownWikiBackend:
         # malformed doc was rejected mid-loop. (This does NOT prevent
         # crash-mid-batch — see Atomicity caveat in the docstring.)
         for doc in documents:
-            self._check_source_allowed(doc, kb_id=kb_id)
+            self._check_source_allowed(doc, kb_id=kb_id, force=force)
 
         self._ensure_layout(kb_id)
 

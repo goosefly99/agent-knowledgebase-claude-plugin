@@ -217,9 +217,12 @@ backfill_provider_snapshot(svc)
 
 Rules:
 
-- The backfill reads `Settings.embedding_provider` /
-  `Settings.embed_base_url` (the process-wide values) and stamps them
-  onto every chunk row that currently has NULL columns.
+- The backfill reads `Settings.embedding_provider`,
+  `Settings.embed_base_url`, AND `Settings.embedding_model` (the
+  process-wide values) and stamps the (provider, base_url) tuple onto
+  every chunk row that (a) currently has NULL provider/base_url
+  columns AND (b) carries a `metadata.embedding_model` matching the
+  current `Settings.embedding_model`.
 - Existing non-null values are **never overwritten** — the SQL uses
   `COALESCE(embedding_provider, ?)` so a previously-stamped chunk is
   left alone.
@@ -227,6 +230,43 @@ Rules:
   no-op (returns 0 rows updated).
 - **Phase 5 will not merge** until the backfill has been run against
   every existing KB. Run the dry-run first to confirm coverage.
+
+#### Heterogeneous-history KBs (I-02)
+
+If a KB's chunks were ingested under MULTIPLE different embedders
+across its history, the model filter described above means each
+backfill invocation only stamps the subset whose
+`metadata.embedding_model` matches the live `Settings.embedding_model`.
+Other-model chunks are intentionally LEFT UNTOUCHED so the wrong
+`(provider, base_url)` tuple is never silently propagated.
+
+To backfill a multi-model KB completely, run the backfill once per
+historical model — temporarily flipping `Settings.embedding_model`
+each pass, OR drop down to the `Database.backfill_embedding_snapshot`
+helper which accepts an explicit `embedding_model=` argument:
+
+```python
+from agent_knowledgebase.services.knowledgebase import KnowledgebaseService
+from agent_knowledgebase.config import Settings
+
+svc = KnowledgebaseService(Settings().resolve_paths())
+ctx = svc._ctx("<kb-uuid>")
+
+# Pass 1: stamp ollama-era chunks.
+ctx.db.backfill_embedding_snapshot(
+    kb_id="<kb-uuid>",
+    provider="ollama",
+    base_url="http://127.0.0.1:11434",
+    embedding_model="qwen3-embedding:8b",
+)
+# Pass 2: stamp remote-era chunks.
+ctx.db.backfill_embedding_snapshot(
+    kb_id="<kb-uuid>",
+    provider="remote",
+    base_url="https://api.openai.com/v1",
+    embedding_model="text-embedding-3-small",
+)
+```
 
 ---
 
@@ -288,9 +328,12 @@ ls "$AGENT_KB_SAVES_DIR/<kb-name>/wiki/pages/"
   process). See `docs/cross-process-lock-recipe.md` for opt-in
   recipes.
 - **Allow-list relaxation during export.** `export_to_markdown`
-  temporarily sets `AGENT_KB_FORCE_WIKI_INGEST=1` so source_types
-  outside the markdown allow-list (`sql_database`, `codebase`, etc.)
-  can be migrated losslessly. The corresponding
+  routes through the markdown backend's private
+  `_index_with_force(...)` entry so source_types outside the markdown
+  allow-list (`sql_database`, `codebase`, etc.) can be migrated
+  losslessly without mutating the process-wide
+  `AGENT_KB_FORCE_WIKI_INGEST` env var (the latter would race with
+  concurrent unrelated wiki ingests). The corresponding
   `KB_INGESTOR_UNSUITABLE_FORCED` stderr_log line will fire for each
   such source — operators should treat those as informational, not
   errors, during a migration window.

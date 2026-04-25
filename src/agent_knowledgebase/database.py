@@ -892,29 +892,38 @@ class Database:
         returns a 3-tuple ``(model, provider, base_url)`` where
         ``provider`` and ``base_url`` may individually be ``None`` for
         legacy chunks that were not backfilled.
+
+        Performance (I-01): aggregation runs SQLite-side via
+        ``json_extract`` + ``GROUP BY`` so a 100k-chunk KB pays a
+        single index pass and zero Python-side ``json.loads`` calls,
+        rather than the previous full table scan + per-row Python
+        decoding. ``COALESCE`` collapses the native-column / metadata
+        fallback into the same group key in one pass.
         """
-        rows = self._conn.execute(
-            "SELECT metadata, embedding_provider, embed_base_url "
-            "FROM chunks WHERE kb_id = ?",
+        # Single-pass aggregation: group by the COALESCE-resolved
+        # (model, provider, base_url) tuple and count. ORDER BY count
+        # DESC + LIMIT 1 picks the dominant tuple without pulling all
+        # groups into Python.
+        row = self._conn.execute(
+            "SELECT "
+            "  json_extract(metadata, '$.embedding_model') AS model, "
+            "  COALESCE("
+            "    embedding_provider, "
+            "    json_extract(metadata, '$.embedding_provider')"
+            "  ) AS provider, "
+            "  COALESCE("
+            "    embed_base_url, "
+            "    json_extract(metadata, '$.embed_base_url')"
+            "  ) AS base_url, "
+            "  COUNT(*) AS cnt "
+            "FROM chunks WHERE kb_id = ? "
+            "GROUP BY model, provider, base_url "
+            "ORDER BY cnt DESC LIMIT 1",
             (kb_id,),
-        ).fetchall()
-        counts: dict[
-            tuple[Optional[str], Optional[str], Optional[str]], int
-        ] = {}
-        for row in rows:
-            meta = _json_loads(row["metadata"])
-            if not isinstance(meta, dict):
-                meta = {}
-            model = meta.get("embedding_model")
-            # Prefer the native column; fall back to metadata for KBs
-            # ingested before the column was wired into the write path.
-            provider = row["embedding_provider"] or meta.get("embedding_provider")
-            base_url = row["embed_base_url"] or meta.get("embed_base_url")
-            key = (model, provider, base_url)
-            counts[key] = counts.get(key, 0) + 1
-        if not counts:
+        ).fetchone()
+        if row is None:
             return None
-        return max(counts, key=lambda k: counts[k])
+        return (row["model"], row["provider"], row["base_url"])
 
     def backfill_embedding_snapshot(
         self,
@@ -922,6 +931,7 @@ class Database:
         kb_id: str,
         provider: Optional[str],
         base_url: Optional[str],
+        embedding_model: Optional[str] = None,
     ) -> int:
         """Backfill ``embedding_provider`` / ``embed_base_url`` columns
         for chunks in *kb_id* that lack them.
@@ -934,17 +944,41 @@ class Database:
         columns that are currently NULL; never overwrites a stamped
         value).
 
+        ``embedding_model`` (I-02): when supplied, the UPDATE is
+        restricted to rows whose ``metadata.embedding_model`` matches.
+        This avoids misstamping a heterogeneous KB whose chunks were
+        ingested under MULTIPLE different embedders — without the
+        filter, the current process-wide ``Settings.embedding_provider``
+        would be stamped onto chunks that came from a different
+        embedder (e.g. stamping ``provider='remote'`` onto chunks
+        actually produced by Ollama). Callers should pass the model
+        whose ``(provider, base_url)`` they're stamping.
+
         Returns the number of rows updated.
         """
         if provider is None and base_url is None:
             return 0
         # Only touch rows missing BOTH columns so a partially-backfilled
-        # KB stays consistent across reruns.
-        cur = self._conn.execute(
-            "UPDATE chunks SET embedding_provider = COALESCE(embedding_provider, ?), "
-            "embed_base_url = COALESCE(embed_base_url, ?) "
-            "WHERE kb_id = ? AND (embedding_provider IS NULL OR embed_base_url IS NULL)",
-            (provider, base_url, kb_id),
-        )
+        # KB stays consistent across reruns. When embedding_model is
+        # supplied, additionally restrict to rows whose stamped
+        # ``metadata.embedding_model`` matches — sqlite's json_extract
+        # handles the metadata blob server-side so we don't pay the
+        # Python-side json.loads cost per row.
+        if embedding_model is None:
+            cur = self._conn.execute(
+                "UPDATE chunks SET embedding_provider = COALESCE(embedding_provider, ?), "
+                "embed_base_url = COALESCE(embed_base_url, ?) "
+                "WHERE kb_id = ? AND (embedding_provider IS NULL OR embed_base_url IS NULL)",
+                (provider, base_url, kb_id),
+            )
+        else:
+            cur = self._conn.execute(
+                "UPDATE chunks SET embedding_provider = COALESCE(embedding_provider, ?), "
+                "embed_base_url = COALESCE(embed_base_url, ?) "
+                "WHERE kb_id = ? "
+                "AND (embedding_provider IS NULL OR embed_base_url IS NULL) "
+                "AND json_extract(metadata, '$.embedding_model') = ?",
+                (provider, base_url, kb_id, embedding_model),
+            )
         self._conn.commit()
         return cur.rowcount or 0

@@ -48,6 +48,9 @@ sentinel file.
 from __future__ import annotations
 
 import json
+import os
+import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -115,12 +118,41 @@ def _resolve_kb_dir(service: "KnowledgebaseService", kb_id: str) -> Path:
 
 
 def _write_migrated_sentinel(kb_root: Path, target_backend: str) -> Path:
-    """Atomically write ``<kb_root>/.migrated_to`` containing the backend name."""
+    """Atomically write ``<kb_root>/.migrated_to`` containing the backend name.
+
+    Uses :func:`tempfile.mkstemp` keyed on the ``.migrated_to.``
+    prefix so the tmp file lands beside the sentinel (same filesystem,
+    enabling atomic ``os.replace``) and concurrent migrations targeting
+    the same kb_root never collide on the same tmp filename.
+
+    Note on the prior bug: an earlier implementation used the pathlib
+    suffix-replacement helper to derive the tmp path from the sentinel
+    name, which silently stripped the dot-prefixed filename (treating
+    it as a suffix) and produced a tmp file in the wrong directory
+    AND a process-wide collision target. The mkstemp route avoids
+    both bugs. See test_sentinel_tmp_file_uses_correct_prefix.
+    """
     sentinel = kb_root / MIGRATED_SENTINEL_FILENAME
     kb_root.mkdir(parents=True, exist_ok=True)
-    tmp = sentinel.with_suffix(".tmp")
-    tmp.write_text(target_backend, encoding="utf-8")
-    tmp.replace(sentinel)
+    # delete=False so we control the lifecycle: we rename the file into
+    # place via os.replace; on any failure we unlink the leftover tmp.
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f"{MIGRATED_SENTINEL_FILENAME}.",
+        suffix=".tmp",
+        dir=str(kb_root),
+    )
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(target_backend)
+        os.replace(tmp_path, sentinel)
+    except Exception:
+        # Best-effort cleanup; propagate the original exception.
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+        raise
     return sentinel
 
 
@@ -190,19 +222,16 @@ def export_to_markdown(
             },
         }
         # The markdown allow-list rejects sql_database/codebase/etc.
-        # During migration we want to be lossless, so set the force
-        # env var transiently for this call. Re-raises a clear error
-        # if the OS denies env mutation (extremely rare).
-        import os
-        prev = os.environ.get("AGENT_KB_FORCE_WIKI_INGEST")
-        os.environ["AGENT_KB_FORCE_WIKI_INGEST"] = "1"
-        try:
-            md_backend.index(kb_id=synthetic_kb_id, documents=[doc])
-        finally:
-            if prev is None:
-                os.environ.pop("AGENT_KB_FORCE_WIKI_INGEST", None)
-            else:
-                os.environ["AGENT_KB_FORCE_WIKI_INGEST"] = prev
+        # During migration we want to be lossless, so call the private
+        # ``_index_with_force`` entry point instead of mutating the
+        # process-wide ``AGENT_KB_FORCE_WIKI_INGEST`` env var (which
+        # would race with concurrent unrelated wiki ingests). The
+        # private entry is documented as migration-only and is NOT
+        # part of the public RetrieverBackend Protocol surface (see
+        # I-05).
+        md_backend._index_with_force(  # noqa: SLF001 — by design
+            kb_id=synthetic_kb_id, documents=[doc]
+        )
         pages_written += 1
     return pages_written
 
@@ -216,6 +245,8 @@ def import_from_markdown(
     service: "KnowledgebaseService",
     kb_id: str,
     src: Path,
+    *,
+    _lock_already_held: bool = False,
 ) -> int:
     """Re-ingest a ``src/wiki/`` tree into the *kb_id* chromadb backend.
 
@@ -223,7 +254,27 @@ def import_from_markdown(
     standard ingest pipeline as a ``source_type=file`` source. Each
     page's frontmatter ``source_id`` becomes the dedup_key so re-runs
     are idempotent. Returns the count of pages re-ingested.
+
+    Phase 4 routing fix (B-01): the index write does NOT route through
+    ``service._backend_for(kb_id)``. The OLD ``.migrated_to`` sentinel
+    still says ``markdown`` while this import is in flight, so the
+    cached per-KB backend is the markdown backend — and routing the
+    re-ingest through it would write the pages back into the wiki and
+    leave ZERO vectors in chromadb. Instead, instantiate a
+    :class:`ChromadbBackend` directly and pass it as
+    ``explicit_backend`` to the ingest pipeline so writes land in the
+    real chromadb collection regardless of what the sentinel says.
+    The sentinel is rewritten by the orchestrator AFTER this import
+    completes. spec_id: 70ab2170-381a-4657-bcd1-28a40c6f369b
+
+    ``_lock_already_held`` (Phase-4-migration-only): when ``True``,
+    skip ``ingest_source`` (which would re-acquire the per-KB lock
+    and self-deadlock since ``threading.Lock`` is non-reentrant) and
+    call ``_ingest_source_locked`` directly. ``migrate()`` holds the
+    lock around this whole import path (B-02), so this kwarg is set
+    to ``True`` from there.
     """
+    from agent_knowledgebase.backends.chromadb_backend import ChromadbBackend
     from agent_knowledgebase.backends.markdown_backend import _parse_page
     from agent_knowledgebase.models import SourceType
 
@@ -236,6 +287,13 @@ def import_from_markdown(
             pages_dir = alt_dir
     if not pages_dir.is_dir():
         return 0
+
+    # Build a chromadb backend bound to the same service so the index
+    # write lands in the right collection even though the sentinel
+    # still says 'markdown'. Mirror the Settings.kb_backend='chromadb'
+    # branch so the backend's vectorstore wiring uses the existing
+    # service plumbing without any further config edits.
+    chromadb_backend = ChromadbBackend(service._config, service=service)  # noqa: SLF001
     imported = 0
     for path in sorted(pages_dir.glob("*.md")):
         rec = _parse_page(path)
@@ -243,18 +301,34 @@ def import_from_markdown(
             continue
         # Use the original uri so probe-4 fields stay populated.
         uri = rec.uri or str(path)
-        service.ingest_source(
-            kb_id=kb_id,
-            source_type=SourceType.file,
-            uri=uri,
-            metadata={
-                "source_type": rec.source_type or "file",
-                "title": rec.title,
-                "imported_from_markdown": True,
-            },
-            dedup_key=rec.source_id or rec.slug,
-            dedup_policy="replace",
-        )
+        if _lock_already_held:
+            service._ingest_source_locked(  # noqa: SLF001 — by design
+                kb_id,
+                SourceType.file,
+                uri,
+                {
+                    "source_type": rec.source_type or "file",
+                    "title": rec.title,
+                    "imported_from_markdown": True,
+                },
+                rec.source_id or rec.slug,
+                "replace",
+                explicit_backend=chromadb_backend,
+            )
+        else:
+            service.ingest_source(
+                kb_id=kb_id,
+                source_type=SourceType.file,
+                uri=uri,
+                metadata={
+                    "source_type": rec.source_type or "file",
+                    "title": rec.title,
+                    "imported_from_markdown": True,
+                },
+                dedup_key=rec.source_id or rec.slug,
+                dedup_policy="replace",
+                explicit_backend=chromadb_backend,
+            )
         imported += 1
     return imported
 
@@ -380,25 +454,47 @@ def backfill_provider_snapshot(
     return dict still reports the number of rows that *would* have
     been touched.
 
+    Heterogeneous-KB safety (I-02)
+    ------------------------------
+
+    The UPDATE is restricted to chunks whose ``metadata.embedding_model``
+    matches ``Settings.embedding_model``. Chunks with a different stamped
+    model (e.g. a KB that was partially ingested under one embedder, then
+    further ingested under another, then has its config flipped) are
+    LEFT UNTOUCHED so we never misstamp them with the wrong
+    ``(provider, base_url)`` tuple. Operators with mixed-embedder history
+    must call :meth:`Database.backfill_embedding_snapshot` directly per
+    model. See ``docs/migration_guide.md`` for the multi-model recipe.
+
     Returns ``{kb_id: rows_updated}``.
     """
     results: dict[str, int] = {}
     targets = [kb_id] if kb_id is not None else list(service._index.keys())  # noqa: SLF001
     provider = service._config.embedding_provider  # noqa: SLF001
     base_url = service._config.embed_base_url  # noqa: SLF001
+    embedding_model = service._config.embedding_model  # noqa: SLF001
     for kid in targets:
         ctx = service._ctx(kid)  # noqa: SLF001
         if dry_run:
-            # Count rows with NULL columns; do not write.
+            # Count rows with NULL columns AND matching model — mirrors
+            # the WHERE clause backfill_embedding_snapshot will use so
+            # the dry-run count is the actual number of rows the live
+            # run would touch (not an over-count that includes
+            # mismatched-model chunks the live run would correctly
+            # skip).
             row = ctx.db._conn.execute(  # noqa: SLF001
-                "SELECT COUNT(*) AS cnt FROM chunks WHERE kb_id = ? AND "
-                "(embedding_provider IS NULL OR embed_base_url IS NULL)",
-                (kid,),
+                "SELECT COUNT(*) AS cnt FROM chunks WHERE kb_id = ? "
+                "AND (embedding_provider IS NULL OR embed_base_url IS NULL) "
+                "AND json_extract(metadata, '$.embedding_model') = ?",
+                (kid, embedding_model),
             ).fetchone()
             results[kid] = int(row["cnt"]) if row is not None else 0
         else:
             results[kid] = ctx.db.backfill_embedding_snapshot(
-                kb_id=kid, provider=provider, base_url=base_url
+                kb_id=kid,
+                provider=provider,
+                base_url=base_url,
+                embedding_model=embedding_model,
             )
     return results
 
@@ -420,17 +516,25 @@ def migrate(
 
     1. Validate ``target_backend`` is in ``{'chromadb', 'markdown'}``.
     2. Detect the current backend from ``Settings`` + per-KB overrides.
-    3. Run the appropriate export/import pair so the new backend has a
+    3. Acquire the per-kb_id ``threading.Lock`` (mirrors
+       ``ingest_source`` / ``update_source`` — see B-02). Concurrent
+       ``kb_query`` / ``kb_search`` against the same KB during a
+       migration would otherwise observe torn state mid-cutover.
+    4. Run the appropriate export/import pair so the new backend has a
        complete copy of the data on disk.
-    4. Write ``<kb_root>/.migrated_to`` containing the target backend
+    5. Write ``<kb_root>/.migrated_to`` containing the target backend
        name. The OLD backend's data is intentionally left intact —
        rollback = delete the sentinel file.
-    5. Invalidate the service's per-KB backend cache so the next read
+    6. Invalidate the service's per-KB backend cache so the next read
        picks up the new routing.
 
-    Emits structured stderr lines at start and finish so operators can
-    observe the cutover. Raises :class:`ValueError` for an invalid
-    target or an unknown ``kb_id``.
+    Emits structured stderr lines at start and finish AND on lock
+    acquire / acquired / release boundaries (mirroring the existing
+    ingest_source pattern) so operators can observe the cutover.
+    Raises :class:`ValueError` for an invalid target or an unknown
+    ``kb_id``.
+
+    spec_id: 70ab2170-381a-4657-bcd1-28a40c6f369b
     """
     if target_backend not in _VALID_BACKENDS:
         raise ValueError(
@@ -456,29 +560,88 @@ def migrate(
         tool_caller_version=None,
     )
 
+    # B-02: acquire the per-kb_id lock for the entire export/import +
+    # sentinel-write + cache-invalidate sequence. Without it, a
+    # concurrent kb_query against the same KB would observe a torn
+    # state mid-cutover (e.g. after the wiki/ tree is materialized
+    # but before the sentinel is written, the per-KB cache still
+    # routes through chromadb but the new data is half-on-disk under
+    # wiki/). Emit lock_acquire / lock_acquired / lock_release
+    # telemetry mirroring the ingest_source pattern so operators can
+    # see the lock boundaries on the same op="kb_migrate" stream.
+    knowledgebase_stderr_log(
+        kb_id=kb_id,
+        op="kb_migrate",
+        phase="lock_acquire",
+        elapsed_ms=0,
+        rows_in=0,
+        rows_ok=0,
+        rows_skipped=0,
+        rows_failed=0,
+        dedup_policy="n/a",
+        request_id=None,
+        tool_caller_version=None,
+    )
+    lock_acquired_at = time.monotonic()
     pages_migrated = 0
-    if target_backend == "markdown":
-        # Render the wiki tree into the kb's existing root so the
-        # markdown backend can see it without any further plumbing.
-        # The path is <saves_dir>/<dir_name>/wiki/, which matches
-        # MarkdownWikiBackend's natural layout.
-        pages_migrated = export_to_markdown(service, kb_id, kb_root)
-        notes.append(
-            f"wrote {pages_migrated} markdown pages under {kb_root / 'wiki'}"
+    with service._get_kb_lock(kb_id):  # noqa: SLF001 — by design
+        knowledgebase_stderr_log(
+            kb_id=kb_id,
+            op="kb_migrate",
+            phase="lock_acquired",
+            elapsed_ms=0,
+            rows_in=0,
+            rows_ok=0,
+            rows_skipped=0,
+            rows_failed=0,
+            dedup_policy="n/a",
+            request_id=None,
+            tool_caller_version=None,
         )
-    elif target_backend == "chromadb":
-        # Reverse direction: re-ingest pages/*.md back into chromadb.
-        pages_migrated = import_from_markdown(service, kb_id, kb_root)
-        notes.append(
-            f"re-ingested {pages_migrated} markdown pages back into chromadb"
-        )
+        try:
+            if target_backend == "markdown":
+                # Render the wiki tree into the kb's existing root so the
+                # markdown backend can see it without any further plumbing.
+                # The path is <saves_dir>/<dir_name>/wiki/, which matches
+                # MarkdownWikiBackend's natural layout.
+                pages_migrated = export_to_markdown(service, kb_id, kb_root)
+                notes.append(
+                    f"wrote {pages_migrated} markdown pages under {kb_root / 'wiki'}"
+                )
+            elif target_backend == "chromadb":
+                # Reverse direction: re-ingest pages/*.md back into chromadb.
+                # ``_lock_already_held=True`` so the import bypasses
+                # ``ingest_source``'s lock acquisition (which would
+                # self-deadlock against the lock we already hold —
+                # threading.Lock is non-reentrant).
+                pages_migrated = import_from_markdown(
+                    service, kb_id, kb_root, _lock_already_held=True
+                )
+                notes.append(
+                    f"re-ingested {pages_migrated} markdown pages back into chromadb"
+                )
 
-    sentinel = _write_migrated_sentinel(kb_root, target_backend)
-    notes.append(f"wrote sentinel {sentinel.name}={target_backend}")
+            sentinel = _write_migrated_sentinel(kb_root, target_backend)
+            notes.append(f"wrote sentinel {sentinel.name}={target_backend}")
 
-    # Drop the cached per-KB backend so the next read consults the
-    # new sentinel + target backend.
-    service._invalidate_backend_cache(kb_id)  # noqa: SLF001
+            # Drop the cached per-KB backend so the next read consults the
+            # new sentinel + target backend.
+            service._invalidate_backend_cache(kb_id)  # noqa: SLF001
+        finally:
+            elapsed_ms = int((time.monotonic() - lock_acquired_at) * 1000)
+            knowledgebase_stderr_log(
+                kb_id=kb_id,
+                op="kb_migrate",
+                phase="lock_release",
+                elapsed_ms=elapsed_ms,
+                rows_in=0,
+                rows_ok=0,
+                rows_skipped=0,
+                rows_failed=0,
+                dedup_policy="n/a",
+                request_id=None,
+                tool_caller_version=None,
+            )
 
     knowledgebase_stderr_log(
         kb_id=kb_id,

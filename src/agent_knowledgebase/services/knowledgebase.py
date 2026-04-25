@@ -164,6 +164,20 @@ class KnowledgebaseService:
         self._backends_per_kb: dict[str, RetrieverBackend] = {}
         self._backends_per_kb_lock: threading.Lock = threading.Lock()
 
+        # Phase 4 (I-01): per-(kb_id, snapshot-tuple) embedder cache so
+        # repeated queries against an unchanged KB don't pay the
+        # snapshot read + ``create_embedder_for_model`` build cost on
+        # every call. Keyed on (kb_id, model, provider, base_url) and
+        # invalidated on (a) per-KB backend cache invalidation
+        # (delete_kb / kb_migrate cutover), and (b) every
+        # ``_ingest_source_locked`` completion (the embedder identity
+        # may have shifted with new chunks). The lock guards both the
+        # dict mutation and the cached entries during invalidation.
+        self._query_embedder_cache: dict[
+            tuple[str, str | None, str | None, str | None], Embedder
+        ] = {}
+        self._query_embedder_cache_lock: threading.Lock = threading.Lock()
+
     @property
     def _embedder(self) -> Embedder:
         """Lazily instantiate the embedder on first use."""
@@ -189,6 +203,14 @@ class KnowledgebaseService:
         ``base_url=...openai.com``. Falls back to the globally
         configured embedder when the KB has no chunks yet or no
         ``embedding_model`` metadata (pre-0.7 ingestions).
+
+        Performance (I-01): the snapshot read uses sqlite-side
+        aggregation (single index pass, no Python-side json.loads), and
+        the rebuilt embedder is cached per
+        (kb_id, model, provider, base_url) so repeated queries against
+        an unchanged KB skip the rebuild entirely. The cache is
+        invalidated on per-KB backend invalidation (delete_kb /
+        kb_migrate) and on each ``_ingest_source_locked`` completion.
         spec_id: 70ab2170-381a-4657-bcd1-28a40c6f369b
         """
         ctx = self._ctx(kb_id)
@@ -214,12 +236,49 @@ class KnowledgebaseService:
             )
         ):
             return self._embedder
-        return create_embedder_for_model(
-            self._config,
+        # Snapshot diverges from the configured embedder; consult the
+        # per-(kb_id, snapshot-tuple) cache before rebuilding. The
+        # cache key includes kb_id so two KBs that share a
+        # (model, provider, base_url) tuple still get distinct cache
+        # entries — the embedder instance is the same shape, but
+        # invalidation is scoped per-KB (an ingest into KB A shouldn't
+        # invalidate KB B's cached entry).
+        cache_key = (
+            kb_id,
             dominant_model,
-            provider=dominant_provider,
-            base_url=dominant_base_url,
+            dominant_provider,
+            dominant_base_url,
         )
+        cached = self._query_embedder_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        with self._query_embedder_cache_lock:
+            cached = self._query_embedder_cache.get(cache_key)
+            if cached is not None:
+                return cached
+            embedder = create_embedder_for_model(
+                self._config,
+                dominant_model,
+                provider=dominant_provider,
+                base_url=dominant_base_url,
+            )
+            self._query_embedder_cache[cache_key] = embedder
+            return embedder
+
+    def _invalidate_query_embedder_cache(self, kb_id: str | None = None) -> None:
+        """Drop cached query embedders for *kb_id* (or all if None).
+
+        Called on per-KB backend invalidation and on each successful
+        ingest, since either event can shift the dominant snapshot
+        tuple for the KB.
+        """
+        with self._query_embedder_cache_lock:
+            if kb_id is None:
+                self._query_embedder_cache.clear()
+            else:
+                stale = [k for k in self._query_embedder_cache if k[0] == kb_id]
+                for key in stale:
+                    self._query_embedder_cache.pop(key, None)
 
     def _backend_for(self, kb_id: str) -> RetrieverBackend:
         """Return the :class:`RetrieverBackend` for *kb_id*.
@@ -247,12 +306,18 @@ class KnowledgebaseService:
         a config-level change like a ``kb_migrate`` that may flip
         routing for the current process). When a kb_id is supplied,
         only that entry is dropped.
+
+        Also drops the per-KB query embedder cache (I-01) since the
+        snapshot tuple may have changed in lockstep with the backend
+        flip (e.g. a markdown -> chromadb cutover repopulates the
+        chunks table with a fresh provider snapshot).
         """
         with self._backends_per_kb_lock:
             if kb_id is None:
                 self._backends_per_kb.clear()
             else:
                 self._backends_per_kb.pop(kb_id, None)
+        self._invalidate_query_embedder_cache(kb_id)
 
     def _get_kb_lock(self, kb_id: str) -> threading.Lock:
         """Return (creating lazily) the per-kb_id ingestion lock.
@@ -421,6 +486,7 @@ class KnowledgebaseService:
         request_id: str | None = None,
         tool_caller_version: str | None = None,
         batch_size: int | None = None,
+        explicit_backend: RetrieverBackend | None = None,
     ) -> Source:
         """Full ingestion pipeline for a new source.
 
@@ -435,6 +501,15 @@ class KnowledgebaseService:
         ``request_id`` / ``tool_caller_version`` / ``batch_size`` are
         optional caller correlators threaded through to the
         PipelineRun telemetry row and the structured stderr log.
+
+        ``explicit_backend`` is a Phase-4-migration-only escape hatch:
+        when supplied, the index write skips the per-KB cache lookup
+        (``_backend_for(kb_id)``) and routes directly to the supplied
+        backend instance. This is required by the markdown -> chromadb
+        reverse migration path because the ``.migrated_to`` sentinel
+        still says ``markdown`` while the import is in flight, so the
+        per-KB cache would otherwise route writes back into the wiki
+        and ZERO vectors would land in chromadb.
         """
         knowledgebase_stderr_log(
             kb_id=kb_id,
@@ -475,6 +550,7 @@ class KnowledgebaseService:
                     request_id=request_id,
                     tool_caller_version=tool_caller_version,
                     batch_size=batch_size,
+                    explicit_backend=explicit_backend,
                 )
             finally:
                 elapsed_ms = int((time.monotonic() - lock_acquired_at) * 1000)
@@ -503,6 +579,7 @@ class KnowledgebaseService:
         request_id: str | None = None,
         tool_caller_version: str | None = None,
         batch_size: int | None = None,
+        explicit_backend: RetrieverBackend | None = None,
     ) -> Source:
         """Inner pipeline body — called only while the kb_id lock is held.
 
@@ -513,6 +590,13 @@ class KnowledgebaseService:
 
         A telemetry row is written for every outcome including ``skip``
         so callers can see the skip via ``kb_pipeline_status``.
+
+        ``explicit_backend`` (Phase-4-migration-only): when supplied,
+        the index write routes through this backend instead of the
+        cached per-KB backend. Required by ``import_from_markdown`` —
+        the ``.migrated_to`` sentinel still says ``markdown`` while the
+        reverse migration is in flight, so the cached backend is the
+        wrong target. spec_id: 70ab2170-381a-4657-bcd1-28a40c6f369b
         """
         ctx = self._ctx(kb_id)
 
@@ -625,7 +709,16 @@ class KnowledgebaseService:
             # to the global default when neither is set, preserving
             # Phase 2/3 behavior.
             if chunks:
-                self._backend_for(kb_id).index(
+                # Phase 4: when an explicit backend is supplied (e.g.
+                # the markdown -> chromadb reverse migration), bypass
+                # the per-KB cache so writes don't get re-routed back
+                # into the OLD backend by the still-valid sentinel.
+                target_backend = (
+                    explicit_backend
+                    if explicit_backend is not None
+                    else self._backend_for(kb_id)
+                )
+                target_backend.index(
                     kb_id=kb_id,
                     documents=[
                         {
@@ -663,6 +756,13 @@ class KnowledgebaseService:
             source.ingested_at = datetime.now(UTC)
             ctx.db.update_source(source)
             ctx.pipeline.complete_phase(run.id)
+
+            # I-01: drop the cached query embedder for this KB so the
+            # next query re-reads the snapshot. The new chunks may have
+            # shifted the dominant (model, provider, base_url) tuple
+            # (e.g. switching to a new embedder mid-KB) and a stale
+            # cache entry would silently return the old embedder.
+            self._invalidate_query_embedder_cache(kb_id)
 
             # v0.6.0 telemetry row — final counters & ended_at.
             final_run = ctx.pipeline.get_run(run.id)
