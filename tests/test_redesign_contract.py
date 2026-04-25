@@ -167,9 +167,12 @@ def test_mcp_tool_surface_unchanged() -> None:
         registered = set(mcp._tool_manager._tools.keys())
         assert registered == _FROZEN_MCP_TOOLS_V0_6_0
 
-    NOTE: Phase 4 introduces the additive kb_migrate tool. At that point,
-    extend _FROZEN_MCP_TOOLS_V0_6_0 to add 'kb_migrate' — DO NOT remove any
-    existing tool.
+    NOTE: Phase 4 introduced the additive kb_migrate tool (the
+    _FROZEN_MCP_TOOLS_V0_6_0 set above already includes it — the
+    surface is now 26 tools, not 25). Phase 6 (LightRAGBackend stub)
+    adds NO MCP tools — the 26-tool surface is preserved bit-for-bit.
+    Any future phase that adds a tool must extend this set; no existing
+    tool may be removed or renamed.
 
     Reference: spec.overview.objectives[4]; success_criteria[9]; empirical
                grep at server.py decorator hits on lines 164,180,195,225,

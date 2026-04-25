@@ -1,5 +1,97 @@
 # Changelog
 
+## 0.11.0+phase6 — 2026-04-24
+
+> Phase 6 of the v2.1 redesign — `LightRAGBackend` stub. **Stub only**;
+> activation deferred per the spec adoption-signal gate. No version
+> bump from 0.11.0 — Phase 6 reserves the contract surface but adds
+> no live retrieval path.
+>
+> spec_id: `70ab2170-381a-4657-bcd1-28a40c6f369b`
+> Source spec: `pipeline_mcp_data/specs/agent-kb-redesign-spec-v2.1.json`
+
+### Added
+
+- **`backends/lightrag_backend.py`** — new `LightRAGBackend` class
+  implementing the full `RetrieverBackend` Protocol surface (7
+  methods). Construction succeeds (so callers can probe non-activated
+  KBs); `info()` returns all 5 probe-4 keys with `None` values plus
+  a `backend='lightrag'` discriminator + `status='unavailable'`;
+  `health_check()` returns the same deferred-status payload. The
+  remaining 5 methods (`index`, `query`, `search`, `delete`, `count`)
+  raise `NotImplementedError` with a canonical activation message
+  listing the three preconditions (`AGENT_KB_LIGHTRAG_URL`,
+  `AGENT_KB_BACKEND=lightrag`, per-method implementation).
+- **`docs/lightrag_backend.md`** — design doc covering: deferral
+  rationale (no adoption signal), activation trigger conditions,
+  sidecar architecture diagram, `docker-compose.yml` snippet for
+  the LightRAG sidecar (image, ports, persistent volume, healthcheck,
+  env vars), REST API contract (5 endpoints: `/insert`, `/query`,
+  `/delete`, `/info`, `/health`), migration path from chromadb /
+  markdown (requires extending `services/migration.py`), and an
+  activation checklist that must go green before the stub can be
+  promoted to live forwarding code.
+- **`tests/test_lightrag_backend_stub.py`** — 11 tests pinning the
+  stub's contract: importability, construction success, Protocol
+  membership, probe-4 5-key shape on `info()`,
+  `health_check()` deferred-status payload, NotImplementedError on
+  the 5 raising methods (with the activation message verified
+  verbatim), and the factory-branch promotion assertion.
+
+### Changed
+
+- **`backends/__init__.py::get_backend()`** — the `'lightrag'` branch
+  now imports and constructs `LightRAGBackend(settings, service=...)`
+  instead of raising `NotImplementedError` directly. Construction
+  succeeds; the raises live on the per-method bodies and surface
+  lazily on actual use.
+- **`tests/test_retriever_backend_protocol.py`** — `_BACKEND_FACTORIES`
+  extended with the `'lightrag'` variant so the parameterised
+  Protocol-conformance tests cover all three concrete backends. The
+  former `test_get_backend_factory_raises_for_lightrag_until_phase6`
+  was inverted into a positive `test_get_backend_factory_returns_lightrag_stub_in_phase6`
+  (matches the inversion Phase 3 made for the markdown branch). Two
+  small targeted tests added to verify the lightrag stub's `index`
+  and `query` raise with the canonical activation message.
+- **`tests/test_redesign_contract.py`** — docstring updated to note
+  that Phase 4 introduced the additive `kb_migrate` (set is now
+  26 tools, not 25) and Phase 6 adds NO MCP tools (the 26-tool
+  surface is preserved bit-for-bit).
+
+### Frozen contracts (preserved)
+
+- **The 26 MCP tools surface (25 frozen v0.6.0 + Phase 4's
+  `kb_migrate`)** — unchanged. Phase 6 adds NO new MCP tools.
+  `server.py` is untouched.
+- **Decorator order** on every tool: `@mcp.tool()` outer,
+  `@_with_tool_timeout` inner. Per `docs/redesign/MISTAKES.md` M-01.
+- **`Settings.kb_backend` default** — still `'chromadb'`. Phase 6
+  does NOT change any default.
+- **`Settings.embedding_provider` / `embedding_model` defaults** —
+  still `'remote'` / `'text-embedding-3-small'` (Phase 5).
+- **Probe-4 contract** (`source_type`, `uri`, `dedup_key`,
+  `page_id`, `dominant_embedding_model`) on `kb_info` /
+  `kb_list_pages` / `kb_list_sources` — unchanged. The new
+  `LightRAGBackend.info()` returns all 5 keys with `None` values per
+  validation finding f-20.
+- **`knowledgebase_stderr_log` 11-field schema** — unchanged. Phase
+  6 emits no new stderr lines.
+- **Database schema** — Phase 6 adds NO new columns / tables /
+  migrations.
+
+### Deferred (Phase 6 activation)
+
+- **Live REST forwarding** to the LightRAG sidecar. Activation is
+  conditional on adoption signal — see
+  `docs/lightrag_backend.md` for the operator-facing trigger
+  conditions and the activation checklist. If no operator opts in
+  within 6 months of v0.11.0 GA, this stub may be deleted to reduce
+  maintenance surface.
+- **`kb_migrate(target_backend='lightrag')`** — currently rejected
+  by the Phase 4 migration tool. Activation requires extending
+  `services/migration.py` with `migrate_to_lightrag` (per the
+  "Migration path" section of `docs/lightrag_backend.md`).
+
 ## 0.11.0 — 2026-04-24
 
 > Phase 5 of the v2.1 redesign — embedding default-flip
@@ -222,8 +314,9 @@
 ### NOT in scope (Phase 6+)
 
 - `LightRAGBackend` — Phase 6 (deferred, conditional on adoption
-  signal). Stub-only delivery — no production LightRAG path in
-  this release.
+  signal). The Phase 6 entry above ships the stub class +
+  `docs/lightrag_backend.md` design doc — no production LightRAG
+  forwarding path in this release.
 
 ## 0.10.0 — 2026-04-24
 

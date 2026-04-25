@@ -217,10 +217,12 @@ class KnowledgebaseService:
         self._kb_locks_guard: threading.Lock = threading.Lock()
 
         # RetrieverBackend abstraction (Phase 2 redesign).  The factory
-        # dispatches on ``self._config.kb_backend`` and returns a real
-        # backend wrapping the existing chromadb pipeline (default), or
-        # raises NotImplementedError for markdown / lightrag until those
-        # phases land.
+        # dispatches on ``self._config.kb_backend`` and returns:
+        # ``ChromadbBackend`` (default; Phase 2), ``MarkdownWikiBackend``
+        # (Phase 3 opt-in), or ``LightRAGBackend`` (Phase 6 stub —
+        # constructs cleanly but the index/query/search/delete/count
+        # methods raise ``NotImplementedError`` with the activation
+        # message documented in ``docs/lightrag_backend.md``).
         #
         # Phase 4 (per-KB routing): the global backend is still
         # constructed here so legacy code paths that don't have a

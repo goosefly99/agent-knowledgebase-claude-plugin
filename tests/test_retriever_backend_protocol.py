@@ -30,12 +30,14 @@ import pytest
 
 from agent_knowledgebase.backends import RetrieverBackend, get_backend
 from agent_knowledgebase.backends.chromadb_backend import ChromadbBackend
+from agent_knowledgebase.backends.lightrag_backend import LightRAGBackend
 from agent_knowledgebase.backends.markdown_backend import MarkdownWikiBackend
 from agent_knowledgebase.config import Settings
 
 
 # ---------------------------------------------------------------------------
-# Backend factories — extended in Phase 3 with the markdown variant.
+# Backend factories — extended in Phase 3 with the markdown variant and
+# in Phase 6 with the lightrag stub.
 # ---------------------------------------------------------------------------
 
 
@@ -62,9 +64,25 @@ def _build_markdown_backend(saves_dir: Path) -> RetrieverBackend:
     return MarkdownWikiBackend(settings)
 
 
+def _build_lightrag_backend(saves_dir: Path) -> RetrieverBackend:
+    """Construct a LightRAGBackend stub pointing at ``saves_dir``.
+
+    Phase 6 promoted the lightrag factory branch from
+    raise-NotImplementedError to a stub that constructs successfully;
+    info() and health_check() return non-raising responses while the
+    other Protocol methods raise lazily with the canonical activation
+    message. The Protocol-conformance suite only inspects method
+    signatures so the stub is fully exercised here.
+    """
+    settings = Settings(saves_dir=saves_dir, kb_backend="lightrag")
+    settings = settings.resolve_paths()
+    return LightRAGBackend(settings)
+
+
 _BACKEND_FACTORIES: dict[str, Callable[[Path], RetrieverBackend]] = {
     "chromadb": _build_chromadb_backend,
     "markdown": _build_markdown_backend,
+    "lightrag": _build_lightrag_backend,
 }
 
 
@@ -201,15 +219,54 @@ def test_get_backend_factory_returns_markdown_when_opted_in(
     assert isinstance(backend, RetrieverBackend)
 
 
-def test_get_backend_factory_raises_for_lightrag_until_phase6(
+def test_get_backend_factory_returns_lightrag_stub_in_phase6(
     tmp_path: Path,
 ) -> None:
-    """Symmetric guard for lightrag -> Phase 6."""
+    """Phase 6 promoted the ``'lightrag'`` factory branch from
+    raise-NotImplementedError to constructing a :class:`LightRAGBackend`
+    stub.
+
+    Construction must NOT raise — the raises now live on the
+    per-method bodies (index/query/search/delete/count) and surface
+    lazily on actual use. info() and health_check() return non-raising
+    responses (status='unavailable') so probe-4 introspection of a
+    non-activated backend doesn't crash.
+    """
     saves_dir = tmp_path / "saves"
     saves_dir.mkdir()
     settings = Settings(saves_dir=saves_dir, kb_backend="lightrag").resolve_paths()
-    with pytest.raises(NotImplementedError, match="Phase 6"):
-        get_backend(settings)
+    backend = get_backend(settings)
+    assert isinstance(backend, LightRAGBackend)
+    assert isinstance(backend, RetrieverBackend)
+    # health_check is one of the two non-raising stub methods.
+    health = backend.health_check()
+    assert health["backend"] == "lightrag"
+    assert health["status"] == "unavailable"
+
+
+def test_lightrag_backend_index_raises_with_activation_message(
+    tmp_path: Path,
+) -> None:
+    """The lightrag stub's :meth:`index` raises NotImplementedError
+    referencing ``AGENT_KB_BACKEND=lightrag`` so an operator who hits
+    the raise sees exactly which env var to flip.
+    """
+    saves_dir = tmp_path / "saves"
+    saves_dir.mkdir()
+    backend = _build_lightrag_backend(saves_dir)
+    with pytest.raises(NotImplementedError, match="AGENT_KB_BACKEND=lightrag"):
+        backend.index(kb_id="x", documents=[])
+
+
+def test_lightrag_backend_query_raises_with_activation_message(
+    tmp_path: Path,
+) -> None:
+    """Symmetric guard — :meth:`query` raises with the canonical message."""
+    saves_dir = tmp_path / "saves"
+    saves_dir.mkdir()
+    backend = _build_lightrag_backend(saves_dir)
+    with pytest.raises(NotImplementedError, match="docs/lightrag_backend.md"):
+        backend.query(kb_id="x", text="t", top_k=1)
 
 
 def test_chromadb_backend_health_check_reports_chromadb(tmp_path: Path) -> None:

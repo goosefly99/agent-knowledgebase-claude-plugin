@@ -30,8 +30,12 @@ PHASE STATUS
   ``<saves_dir>/<kb-name>/wiki/``, sqlite FTS5 in-memory index over
   ``pages/*.md``, NO embedding. Per-source_type positive-allow list:
   ``{file, website, api_endpoint with payload <2MB}``.
-* Phase 6: LightRAGBackend forwards to ``localhost:9621`` REST API.
-  Stub only until adoption signal.
+* Phase 6: LightRAGBackend stub — constructs successfully; ``info()``
+  + ``health_check()`` return probe-4-compliant ``status='unavailable'``
+  payloads; the other 5 Protocol methods raise ``NotImplementedError``
+  with the canonical activation message. Live REST forwarding to
+  ``localhost:9621`` deferred until adoption signal — see
+  ``docs/lightrag_backend.md``.
 """
 
 from __future__ import annotations
@@ -274,11 +278,15 @@ def get_backend(
         return MarkdownWikiBackend(settings, service=service)
 
     if backend_name == "lightrag":
-        raise NotImplementedError(
-            "LightRAGBackend is a deferred Phase 6 deliverable. Set "
-            "AGENT_KB_BACKEND=chromadb (the default) — LightRAG support "
-            "is conditional on adoption signal."
-        )
+        # Phase 6: stub-only deliverable. Construction succeeds so
+        # consumers can probe info() / health_check() (which return
+        # status='unavailable') without crashing; the write/read paths
+        # raise NotImplementedError with the canonical activation
+        # message documented in docs/lightrag_backend.md. Activation
+        # requires a running LightRAG sidecar at
+        # AGENT_KB_LIGHTRAG_URL plus per-method implementation.
+        from .lightrag_backend import LightRAGBackend
+        return LightRAGBackend(settings, service=service)
 
     raise ValueError(
         f"Unknown AGENT_KB_BACKEND={backend_name!r}; "
