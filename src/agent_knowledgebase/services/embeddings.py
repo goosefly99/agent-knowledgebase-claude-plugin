@@ -385,13 +385,15 @@ class RemoteEmbedder:
         if known is not None:
             self._dimension_cache = known
             return known
+        started = time.monotonic()
         vectors = self._call_embed([_PROBE_TEXT], phase="probe_dimension")
         if not vectors or not vectors[0]:
+            latency_ms = int((time.monotonic() - started) * 1000)
             raise EmbedderUnavailableError(
                 error="probe_failed",
                 model=self._model_name,
                 phase="probe_dimension",
-                latency_ms=0,
+                latency_ms=latency_ms,
                 detail="empty embedding response",
             )
         dim = len(vectors[0])
@@ -542,13 +544,15 @@ class OllamaEmbedder:
         """
         if self._dimension_cache is not None:
             return self._dimension_cache
+        started = time.monotonic()
         vectors = self._call_embed([_PROBE_TEXT], phase="probe_dimension")
         if not vectors or not vectors[0]:
+            latency_ms = int((time.monotonic() - started) * 1000)
             raise EmbedderUnavailableError(
                 error="probe_failed",
                 model=self._model_name,
                 phase="probe_dimension",
-                latency_ms=0,
+                latency_ms=latency_ms,
                 detail="empty embedding response",
             )
         # ``_call_embed`` populates ``_dimension_cache`` on success but

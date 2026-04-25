@@ -2,6 +2,10 @@
 
 ## 0.7.1 — 2026-04-24
 
+> Note: pyproject.toml was bumped 0.6.0 → 0.7.1 (skipping 0.7.0). The
+> 0.7.0 CHANGELOG entry was authored ahead of pyproject; this release
+> reconciles them.
+
 > Phase 0 of the v2.1 redesign — direct bug fixes shipped under the
 > existing chromadb backend with zero architectural change.
 >

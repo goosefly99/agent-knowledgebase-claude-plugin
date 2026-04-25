@@ -17,11 +17,14 @@ Three regressions pinned here, one per concrete embedder behaviour:
 
 from __future__ import annotations
 
+import time
 from unittest.mock import MagicMock
 
 import httpx
+import pytest
 
 from agent_knowledgebase.services.embeddings import (
+    EmbedderUnavailableError,
     OllamaEmbedder,
     RemoteEmbedder,
 )
@@ -140,6 +143,41 @@ def test_ollama_embedder_dimension_triggers_probe() -> None:
     # Subsequent accesses are cached.
     assert embedder.dimension == 4096
     assert mock_client.post.call_count == 1
+
+
+def test_remote_probe_failure_reports_real_latency() -> None:
+    """Important #1: empty-response probe must report measured latency.
+
+    Pre-fix the empty-response branch hardcoded ``latency_ms=0``,
+    masking slow-probe-then-empty failures. This test sleeps inside
+    the mocked POST so any non-zero elapsed time proves the probe call
+    site (not a literal ``0``) populated the field.
+    """
+
+    def slow_empty_response(*_args: object, **_kwargs: object) -> MagicMock:
+        time.sleep(0.01)
+        response = MagicMock(spec=httpx.Response)
+        response.status_code = 200
+        response.json.return_value = {"data": []}
+        response.raise_for_status.return_value = None
+        return response
+
+    mock_client = MagicMock(spec=httpx.Client)
+    mock_client.post.side_effect = slow_empty_response
+
+    embedder = RemoteEmbedder(
+        model_name="qwen3-embedding:8b",
+        api_key="test",
+        base_url="http://test/v1",
+        _client=mock_client,
+    )
+
+    with pytest.raises(EmbedderUnavailableError) as excinfo:
+        embedder.probe_dimension()
+
+    assert excinfo.value.error == "probe_failed"
+    assert excinfo.value.phase == "probe_dimension"
+    assert excinfo.value.latency_ms > 0
 
 
 def test_ollama_embedder_dimension_uses_cache_after_real_embed() -> None:
