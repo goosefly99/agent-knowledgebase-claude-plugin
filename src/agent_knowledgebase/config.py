@@ -70,6 +70,94 @@ class Settings(BaseSettings):
         "Pinecone-backed VectorStore.",
     )
 
+    # --- Per-KB retrieval backend overrides (Phase 4 redesign) ---
+    kb_backend_per_kb: dict[str, str] = Field(
+        default_factory=dict,
+        validation_alias=AliasChoices(
+            "kb_backend_per_kb",
+            "AGENT_KB_BACKEND_PER_KB",
+            "AGENT_KB_KB_BACKEND_PER_KB",
+        ),
+        description="Per-knowledgebase backend overrides (Phase 4). "
+        "Comma-separated ``kb_id=backend`` pairs that override "
+        "``kb_backend`` for the listed KB ids. Example env: "
+        "``AGENT_KB_BACKEND_PER_KB='kb1=markdown,kb2=chromadb'``. "
+        "Resolution precedence at backend-selection time is: "
+        "(1) <saves_dir>/<kb-name>/.migrated_to sentinel (written by "
+        "kb_migrate after a successful migration), "
+        "(2) this kb_backend_per_kb mapping, "
+        "(3) the global ``Settings.kb_backend``. "
+        "Values must be one of {'chromadb', 'markdown', 'lightrag'}; "
+        "invalid backend names are rejected at validation time. "
+        "spec_id: 70ab2170-381a-4657-bcd1-28a40c6f369b",
+    )
+
+    @field_validator("kb_backend_per_kb", mode="before")
+    @classmethod
+    def _parse_kb_backend_per_kb(cls, value: object) -> object:
+        """Accept either a dict or a comma-separated ``kb_id=backend`` string.
+
+        pydantic-settings would normally try to JSON-decode an env value
+        for a ``dict`` field; declaring this validator with
+        ``mode='before'`` lets us accept the friendlier
+        ``kb1=markdown,kb2=chromadb`` form that the spec calls for
+        (parallel to the existing ``ingest_excluded_dirs`` parser).
+        """
+        if value is None or value == "":
+            return {}
+        if isinstance(value, dict):
+            return value
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return {}
+            # Best-effort JSON first so users can still pass strict JSON
+            # if they prefer; fall through to the comma-separated form
+            # on parse failure.
+            if text.startswith("{"):
+                import json as _json
+                try:
+                    parsed = _json.loads(text)
+                except ValueError:
+                    parsed = None
+                if isinstance(parsed, dict):
+                    return parsed
+            out: dict[str, str] = {}
+            for pair in text.split(","):
+                pair = pair.strip()
+                if not pair:
+                    continue
+                if "=" not in pair:
+                    raise ValueError(
+                        f"AGENT_KB_BACKEND_PER_KB entry {pair!r} is not "
+                        f"a valid 'kb_id=backend' pair"
+                    )
+                kb_id, backend = pair.split("=", 1)
+                kb_id = kb_id.strip()
+                backend = backend.strip()
+                if not kb_id or not backend:
+                    raise ValueError(
+                        f"AGENT_KB_BACKEND_PER_KB entry {pair!r} has "
+                        f"an empty kb_id or backend"
+                    )
+                out[kb_id] = backend
+            return out
+        return value
+
+    @field_validator("kb_backend_per_kb", mode="after")
+    @classmethod
+    def _validate_kb_backend_per_kb_values(
+        cls, value: dict[str, str]
+    ) -> dict[str, str]:
+        valid = {"chromadb", "markdown", "lightrag"}
+        for kb_id, backend in value.items():
+            if backend not in valid:
+                raise ValueError(
+                    f"AGENT_KB_BACKEND_PER_KB[{kb_id!r}]={backend!r} is "
+                    f"not a valid backend; expected one of {sorted(valid)}"
+                )
+        return value
+
     # --- Vector store (chromadb-internal provider selection) ---
     vectorstore: Literal["chromadb", "pinecone"] = Field(
         default="chromadb",

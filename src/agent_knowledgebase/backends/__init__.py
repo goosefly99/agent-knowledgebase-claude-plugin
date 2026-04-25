@@ -148,10 +148,94 @@ class RetrieverBackend(Protocol):
         ...
 
 
+_VALID_BACKENDS = frozenset({"chromadb", "markdown", "lightrag"})
+
+# The sentinel file written by ``kb_migrate`` after a successful
+# migration: ``<saves_dir>/<kb-name>/.migrated_to``. The file's content
+# is the target backend name (e.g. ``"markdown"``) and its presence
+# overrides BOTH ``Settings.kb_backend_per_kb`` and the global
+# ``Settings.kb_backend`` for the affected KB. Phase 4 spec task:
+# "migration_complete sentinel file: <saves_dir>/<kb-name>/.migrated_to=
+# <backend> — written after kb_migrate succeeds."
+MIGRATED_SENTINEL_FILENAME = ".migrated_to"
+
+
+def _read_migrated_sentinel(
+    settings: "Settings",
+    *,
+    kb_id: str,
+    service: "KnowledgebaseService | None",
+) -> str | None:
+    """Return the backend recorded in the kb's ``.migrated_to`` sentinel.
+
+    Resolves the per-KB on-disk directory the same way
+    :class:`MarkdownWikiBackend._kb_root` does: when a service is bound
+    use ``service._index[kb_id]`` for the sanitized dir name; otherwise
+    fall through to ``saves_dir / sanitize_kb_dir_name(kb_id)``.
+    Returns ``None`` when the sentinel is absent, unreadable, or
+    contains an unrecognized backend name.
+    """
+    from agent_knowledgebase.config import sanitize_kb_dir_name
+
+    if service is not None:
+        # Local helper to avoid relying on `service._index` private
+        # access in this module if a future refactor changes the lookup
+        # path; falls back to the sanitized name like markdown_backend.
+        dir_name = service._index.get(kb_id) if hasattr(service, "_index") else None  # noqa: SLF001
+        if dir_name is None:
+            dir_name = sanitize_kb_dir_name(kb_id)
+    else:
+        dir_name = sanitize_kb_dir_name(kb_id)
+    saves_dir = getattr(settings, "saves_dir", None)
+    if saves_dir is None:
+        return None
+    sentinel_path = saves_dir / dir_name / MIGRATED_SENTINEL_FILENAME
+    if not sentinel_path.is_file():
+        return None
+    try:
+        target = sentinel_path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if target in _VALID_BACKENDS:
+        return target
+    return None
+
+
+def resolve_backend_name(
+    settings: "Settings",
+    *,
+    kb_id: str | None = None,
+    service: "KnowledgebaseService | None" = None,
+) -> str:
+    """Resolve the effective backend name for *kb_id* (or globally).
+
+    Precedence order (highest first), per Phase 4 spec:
+
+    1. ``<saves_dir>/<kb-name>/.migrated_to`` sentinel file written by
+       ``kb_migrate`` after a successful cutover.
+    2. ``settings.kb_backend_per_kb[kb_id]`` env / config mapping.
+    3. ``settings.kb_backend`` global default.
+
+    When ``kb_id`` is ``None`` (legacy callers), only the global
+    default is used so existing behavior is preserved bit-for-bit.
+    """
+    if kb_id is not None:
+        sentinel_target = _read_migrated_sentinel(
+            settings, kb_id=kb_id, service=service
+        )
+        if sentinel_target is not None:
+            return sentinel_target
+        per_kb = getattr(settings, "kb_backend_per_kb", None) or {}
+        if kb_id in per_kb:
+            return per_kb[kb_id]
+    return getattr(settings, "kb_backend", "chromadb")
+
+
 def get_backend(
     settings: "Settings",
     *,
     service: "KnowledgebaseService | None" = None,
+    kb_id: str | None = None,
 ) -> RetrieverBackend:
     """Backend factory. Reads ``settings.kb_backend`` and dispatches.
 
@@ -171,8 +255,15 @@ def get_backend(
     Tests can pass ``service=None`` to instantiate the backend in
     isolation; methods that need service plumbing will fail with a
     clear error in that mode.
+
+    Phase 4 (per-KB routing): when ``kb_id`` is supplied, the resolved
+    backend name comes from :func:`resolve_backend_name` so the
+    ``.migrated_to`` sentinel and ``Settings.kb_backend_per_kb``
+    overrides are honored. ``kb_id=None`` preserves Phase 2 behavior
+    (uses ``settings.kb_backend`` directly).
+    spec_id: 70ab2170-381a-4657-bcd1-28a40c6f369b
     """
-    backend_name = getattr(settings, "kb_backend", "chromadb")
+    backend_name = resolve_backend_name(settings, kb_id=kb_id, service=service)
 
     if backend_name == "chromadb":
         from .chromadb_backend import ChromadbBackend
@@ -195,4 +286,9 @@ def get_backend(
     )
 
 
-__all__ = ["RetrieverBackend", "get_backend"]
+__all__ = [
+    "RetrieverBackend",
+    "get_backend",
+    "resolve_backend_name",
+    "MIGRATED_SENTINEL_FILENAME",
+]

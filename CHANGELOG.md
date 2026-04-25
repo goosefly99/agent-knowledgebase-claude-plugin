@@ -1,5 +1,188 @@
 # Changelog
 
+## 0.10.0 — 2026-04-24
+
+> Phase 4 of the v2.1 redesign — migration tooling + dual-backend
+> transition + per-page provider snapshot. **Phase 4 ships BEFORE
+> Phase 5** (the embedding default-flip) because without the
+> per-page provider snapshot + read-fallback, the global default
+> change in Phase 5 would silently break every existing v0.6.0
+> chromadb KB ingested with the Ollama default. Per validation
+> findings f-10 / f-17.
+>
+> spec_id: `70ab2170-381a-4657-bcd1-28a40c6f369b`
+> Source spec: `pipeline_mcp_data/specs/agent-kb-redesign-spec-v2.1.json`
+
+### Added
+
+- **New MCP tool: `kb_migrate(kb_id, target_backend)`** — additive
+  (probe-4-safe). Cuts a knowledgebase over from one
+  `RetrieverBackend` to another (`"chromadb"` <-> `"markdown"`;
+  `"lightrag"` rejected — Phase 6 deferred). Materialises the new
+  layout on disk, writes the routing sentinel
+  `<saves_dir>/<kb-name>/.migrated_to=<backend>`, invalidates the
+  per-KB backend cache. **Non-destructive**: the OLD backend's data
+  remains on disk so rollback = delete the sentinel file. The
+  decorator stack is identical to the existing 25 tools
+  (`@mcp.tool()` outer, `@_with_tool_timeout` inner) per
+  `docs/redesign/MISTAKES.md` M-01. The frozen MCP surface is now
+  **26 tools** (was 25); the contract test
+  `tests/test_redesign_contract.py::_FROZEN_MCP_TOOLS_V0_6_0` was
+  extended in place — no existing tool removed.
+- **New service module `services/migration.py`** with
+  `export_to_markdown` / `import_from_markdown` /
+  `export_chromadb_dump` / `import_chromadb_dump` plus the top-level
+  `migrate(...)` orchestrator and the `backfill_provider_snapshot(...)`
+  helper used by the Phase 5 gate. Lazy-imported by `server.py` so
+  test environments without all migration deps still load the server.
+- **Per-page (per-chunk) provider snapshot** — additive ALTER ADD
+  migration adds two columns to `chunks`:
+  ```sql
+  ALTER TABLE chunks ADD COLUMN embedding_provider TEXT;
+  ALTER TABLE chunks ADD COLUMN embed_base_url TEXT;
+  ```
+  Stamped on every newly-inserted chunk by `Database.insert_chunk`
+  from the chunk's `metadata` blob (mirroring the existing
+  `embedding_model` field). Read at query time by
+  `Database.get_embedding_snapshot(kb_id)` which returns the
+  dominant `(model, provider, base_url)` triple. Migration is
+  strictly ALTER ADD — non-destructive — and idempotent across
+  re-opens.
+- **Backwards-compatible `create_embedder_for_model` signature.**
+  Old call sites passing `(config, model_name)` continue to work
+  unchanged; new Phase 4 call sites pass
+  `(config, model_name, provider=..., base_url=...)` so the snapshot
+  rebuilds the original embedder even after the Phase 5 default
+  flip swaps the global `Settings.embedding_provider`. The Phase 0
+  dimension-probe path is preserved (no signature break).
+- **`Settings.kb_backend_per_kb`** field — `dict[str, str]` parsed
+  from either the comma-separated env form
+  `AGENT_KB_BACKEND_PER_KB="kb1=markdown,kb2=chromadb"` or a JSON
+  object via the user/project config files. Validation rejects
+  invalid backend names up-front. Resolution precedence
+  (highest first): `<saves_dir>/<kb-name>/.migrated_to` sentinel >
+  `kb_backend_per_kb[kb_id]` > global `Settings.kb_backend`.
+- **Read-fallback** in `MarkdownWikiBackend.query()` /
+  `MarkdownWikiBackend.search()`: when `kb_backend='markdown'` is
+  active for a KB but `<kb-name>/wiki/` is missing while
+  `<kb-name>/chroma/` (or `<kb-name>/vector_store/`) exists, the
+  call is silently delegated to `ChromadbBackend` with a structured
+  `phase='read_fallback'` /
+  `error_code='MARKDOWN_READ_FALLBACK_TO_CHROMADB'` stderr_log
+  emission carrying all 11 required fields.
+- **`backends.resolve_backend_name(...)`** helper — exposes the
+  routing precedence so callers (tests, docs, future tools) can
+  introspect the effective backend choice for a given `kb_id`.
+- **`backends.MIGRATED_SENTINEL_FILENAME`** constant
+  (`".migrated_to"`) — single source of truth for the sentinel
+  filename used by the migration flow and the routing resolver.
+- **Per-KB backend cache** in `KnowledgebaseService` — backends
+  resolved via `_backend_for(kb_id)` are cached behind a lock so
+  the routing precedence is computed once per KB per process.
+  Cache invalidated on `delete_kb` and after each successful
+  `kb_migrate`.
+- **`tests/test_migration_chromadb_to_markdown.py`** — 10 tests
+  covering the full migration round-trip, sentinel write, post-
+  migration query routing, non-destructive guarantee, dump round-
+  trip, backfill (live + dry-run), and the kb_migrate decorator
+  order spot-check.
+- **`tests/test_per_page_provider_snapshot.py`** — 9 tests covering
+  the schema migration (additive + idempotent), the
+  `insert_chunk` -> native column mapping,
+  `get_embedding_snapshot` resolution, the backwards-compat
+  `create_embedder_for_model` signature, the explicit-override
+  build path, the snapshot-driven query embedder rebuild after a
+  simulated default flip, and the legacy-row backfill.
+- **`tests/test_kb_backend_per_kb_routing.py`** — 11 tests pinning
+  the per-KB routing parser, the precedence ordering (sentinel >
+  per-kb > global), the malformed-env rejection, and the
+  `_backend_for(kb_id)` cache picking the right backend.
+- **`tests/test_read_fallback.py`** — 5 tests pinning the
+  read-fallback semantics: fallback fires when wiki/ missing &
+  chroma/ exists, the `vector_store/` alias is recognized, no
+  fallback when wiki/ is present, no fallback when neither exists,
+  and the structured stderr emission carries all 11 schema fields.
+- **`docs/migration_guide.md`** — operator guide covering when to
+  migrate, how to call `kb_migrate`, sentinel file semantics,
+  per-KB routing precedence, read-fallback behavior, the
+  embedder snapshot rationale (why Phase 5 is safe), backfill
+  procedure for legacy KBs, and a step-by-step runbook.
+
+### Changed
+
+- `KnowledgebaseService._query_embedder_for(kb_id)` now reads
+  `Database.get_embedding_snapshot(kb_id)` (the
+  `(model, provider, base_url)` triple) instead of just the model
+  name — passing the snapshot's provider + base_url into
+  `create_embedder_for_model` so an existing v0.6.0 KB ingested
+  under provider=ollama stays queryable AFTER the Phase 5 default
+  flip to provider=remote/text-embedding-3-small.
+- `KnowledgebaseService._ingest_source_locked` chunk-stamping path
+  now includes `embedding_provider` and `embed_base_url` alongside
+  the existing `embedding_model` and `kb_id` keys in
+  `chunk.metadata`. Secrets (`embed_api_key`) are intentionally
+  NOT stamped — the snapshot only carries non-secret routing
+  metadata.
+- `KnowledgebaseService.query` / `KnowledgebaseService.search` /
+  the ingest write path / the source-deletion path now route
+  through `self._backend_for(kb_id)` (Phase 4 per-KB routing)
+  instead of `self._backend` directly. The global `self._backend`
+  is preserved for legacy cross-KB scans (`get_page`,
+  `get_source`) where no specific kb_id is in scope.
+- `tests/test_redesign_contract.py::_FROZEN_MCP_TOOLS_V0_6_0` —
+  extended to include the additive `kb_migrate` tool (the
+  scaffold note at lines 152-173 explicitly anticipated this
+  Phase 4 add). The contract test is still
+  `@pytest.mark.skip`-ed scaffold; promotion is a Phase 5
+  deliverable.
+- `tests/test_knowledgebase.py::test_query_uses_per_kb_embedder_*`
+  updated to patch `Database.get_embedding_snapshot` (the new
+  Phase 4 helper) instead of `count_chunks_by_embedding_model`.
+  The fake builder now accepts the `provider` / `base_url`
+  kwargs and asserts they propagate through the snapshot.
+
+### Frozen contracts (preserved)
+
+- The 25 v0.6.0 `kb_*` MCP tools — names, parameters, response
+  shapes — all bit-for-bit identical. `kb_migrate` is purely
+  additive.
+- Decorator order on every tool including `kb_migrate`:
+  `@mcp.tool()` outer, `@_with_tool_timeout` inner. Per
+  `docs/redesign/MISTAKES.md` M-01.
+- `Settings.kb_backend` default — still `'chromadb'`. Phase 4
+  does NOT touch the global default. (The Phase 5 flip is
+  separate.)
+- `Settings.embedding_provider` default — still `'ollama'`. The
+  default flip is the Phase 5 deliverable (gated on this Phase 4
+  release being in production).
+- Probe-4 contract (`source_type`, `uri`, `dedup_key`,
+  `page_id`, `dominant_embedding_model`) on `kb_info` /
+  `kb_list_pages` / `kb_list_sources` — unchanged. Both backends'
+  `info()` responses still return the 5 keys plus their
+  backend-tagged diagnostic fields.
+- `knowledgebase_stderr_log` 11-field schema — unchanged. The
+  new `read_fallback` / `migrate_start` / `migrate_done`
+  emissions all carry the full 11-field payload.
+- Database schema is strictly additive (`ALTER TABLE ADD COLUMN`
+  with NULL defaults). Rollback SQL:
+  ```sql
+  -- Requires SQLite >= 3.35.
+  ALTER TABLE chunks DROP COLUMN IF EXISTS embedding_provider;
+  ALTER TABLE chunks DROP COLUMN IF EXISTS embed_base_url;
+  ```
+
+### NOT in scope (Phase 5+)
+
+- `embedding_provider` default flip from `'ollama'` to `'remote'`
+  — Phase 5. Phase 4 establishes the safety net (snapshot +
+  read-fallback) so the default flip is non-breaking. Phase 5
+  has an explicit gate: confirm Phase 4 is in production and
+  every existing KB has been backfilled via
+  `backfill_provider_snapshot(...)`.
+- `fastembed` provider, `embedder_version` stamping, install-size
+  optimisations — all Phase 5.
+- `LightRAGBackend` — Phase 6 (deferred).
+
 ## 0.9.0 — 2026-04-24
 
 > Phase 3 of the v2.1 redesign — opt-in Karpathy-style markdown wiki

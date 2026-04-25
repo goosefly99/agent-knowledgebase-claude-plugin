@@ -1,6 +1,6 @@
 [project]
 name = "agent-knowledgebase"
-version = "0.9.0"
+version = "0.10.0"
 description = "Personal knowledgebase plugin — ingest sources, build wiki artifacts, query with vector search"
 requires-python = ">=3.11"
 dependencies = [

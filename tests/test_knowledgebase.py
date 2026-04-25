@@ -350,7 +350,14 @@ class TestQuery:
         """When the KB's chunks were embedded with a different model than
         the globally configured embedder, query must build an embedder
         matching that model — otherwise retrieval would embed the query
-        with the wrong model and produce incoherent scores."""
+        with the wrong model and produce incoherent scores.
+
+        Phase 4 update: snapshot resolution now reads
+        :meth:`Database.get_embedding_snapshot` (which returns the
+        ``(model, provider, base_url)`` triple) instead of the older
+        :meth:`count_chunks_by_embedding_model`. The fake builder
+        accepts the new ``provider`` / ``base_url`` kwargs.
+        """
         kb = service.create_kb("Multi-Model KB")
         # Ingest one source so chunks exist (they'll be stamped with the
         # mock embedder's model name "mock-embedder").
@@ -358,18 +365,26 @@ class TestQuery:
 
         # Simulate the stored vectorstore having been built with a
         # *different* embedding model than the service's current default
-        # by patching the DB-side count helper.
+        # by patching the DB-side snapshot helper.
         ctx = service._contexts[kb.id]
         monkeypatch.setattr(
             ctx.db,
-            "count_chunks_by_embedding_model",
-            lambda _kb_id: {"legacy-model": 7},
+            "get_embedding_snapshot",
+            lambda _kb_id: ("legacy-model", "ollama", "http://127.0.0.1:11434"),
         )
 
         captured: dict[str, str] = {}
 
-        def _fake_builder(cfg: object, model_name: str | None) -> MagicMock:
+        def _fake_builder(
+            cfg: object,
+            model_name: str | None,
+            *,
+            provider: str | None = None,
+            base_url: str | None = None,
+        ) -> MagicMock:
             captured["model"] = model_name or ""
+            captured["provider"] = provider or ""
+            captured["base_url"] = base_url or ""
             new_embedder = MagicMock()
             new_embedder.embed_query.return_value = [0.9, 0.9, 0.9]
             return new_embedder
@@ -383,6 +398,10 @@ class TestQuery:
         service.query(kb.id, "test question")
 
         assert captured["model"] == "legacy-model"
+        # Phase 4: snapshot also drives provider/base_url so the
+        # rebuilt embedder uses the original ingest-time routing.
+        assert captured["provider"] == "ollama"
+        assert captured["base_url"] == "http://127.0.0.1:11434"
 
     def test_query_reuses_default_embedder_when_model_matches(
         self,

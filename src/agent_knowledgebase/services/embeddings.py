@@ -608,23 +608,48 @@ def create_embedder(config: Settings) -> Embedder:
 
 
 def create_embedder_for_model(
-    config: Settings, model_name: str | None
+    config: Settings,
+    model_name: str | None,
+    *,
+    provider: str | None = None,
+    base_url: str | None = None,
 ) -> Embedder:
     """Instantiate an :class:`Embedder` matching *model_name*.
 
     Used at query time to guarantee the query vector is produced by the
-    same model that originally ingested the vectorstore.  When
-    ``model_name`` is None or equals the configured default, the regular
-    configured embedder is returned; otherwise, a fresh embedder using
-    the same provider/base_url/api_key but overriding the model name
-    is created.
+    same embedder that originally ingested the vectorstore.
+
+    Backwards-compatible signature (Phase 4 redesign):
+
+    * Old call sites pass only ``(config, model_name)`` — provider and
+      base_url default from ``config`` (unchanged Phase 0/2/3 behavior).
+    * Phase 4+ call sites that read a per-page snapshot pass
+      ``(config, model_name, provider=..., base_url=...)`` so the
+      original embedder is faithfully rebuilt even after ``Settings``
+      defaults flip in Phase 5 (e.g. an Ollama-ingested KB stays
+      queryable after the global default switches to remote/text-
+      embedding-3-small). When provider/base_url are passed explicitly,
+      they override config; the API key still comes from
+      ``config.embed_api_key`` (secrets are not stamped per-page).
+
+    When ``model_name`` is ``None`` or equals the configured default
+    AND no overrides are supplied, the regular configured embedder is
+    returned. Any explicit override forces a fresh embedder build so
+    callers can target a non-default snapshot even if ``model_name``
+    matches the global default.
+
+    spec_id: 70ab2170-381a-4657-bcd1-28a40c6f369b
     """
-    if not model_name or model_name == config.embedding_model:
+    has_override = provider is not None or base_url is not None
+    if not has_override and (not model_name or model_name == config.embedding_model):
         return create_embedder(config)
+    effective_provider = provider if provider is not None else config.embedding_provider
+    effective_base_url = base_url if base_url is not None else config.embed_base_url
+    effective_model = model_name or config.embedding_model
     return _build_embedder(
-        provider=config.embedding_provider,
-        model=model_name,
-        base_url=config.embed_base_url,
+        provider=effective_provider,
+        model=effective_model,
+        base_url=effective_base_url,
         api_key=config.embed_api_key,
         timeout_seconds=config.embed_timeout_seconds,
         max_retries=config.embed_max_retries,

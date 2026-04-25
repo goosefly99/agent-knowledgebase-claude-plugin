@@ -817,10 +817,84 @@ class MarkdownWikiBackend:
         (markdown) re-route through :meth:`search` and rescale scores."
         Scores returned by :meth:`search` are already in ``[0, 1]``
         descending so no second rescale is needed.
+
+        Phase 4 read-fallback: when the markdown layout is missing for
+        ``kb_id`` but a chromadb collection exists on disk
+        (``<saves_dir>/<kb-name>/chroma/``), this call is silently
+        served by ChromadbBackend so an existing v0.6.0 KB ingested
+        under chromadb stays queryable even after
+        ``Settings.kb_backend`` flips to markdown. A structured
+        ``phase='read_fallback'`` line is emitted to stderr so
+        operators see the divergence.
         """
+        fallback = self._chromadb_read_fallback(kb_id)
+        if fallback is not None:
+            return fallback.query(
+                kb_id=kb_id, text=text, top_k=top_k, filters=filters
+            )
         return self.search(
             kb_id=kb_id, text=text, top_k=top_k, filters=filters
         )
+
+    def _has_wiki_layout(self, kb_id: str) -> bool:
+        """Return True when ``<kb-name>/wiki/pages/`` exists with files."""
+        pages_dir = self._pages_dir(kb_id)
+        if not pages_dir.is_dir():
+            return False
+        for _ in pages_dir.glob("*.md"):
+            return True
+        return False
+
+    def _has_chromadb_collection(self, kb_id: str) -> bool:
+        """Return True when a chromadb collection lives on disk for *kb_id*.
+
+        Looks under ``<saves_dir>/<kb-name>/chroma/`` (the conventional
+        path used by :meth:`Settings.kb_chroma_path`); the spec also
+        accepts the ``vector_store/`` alias for forward compatibility
+        with potential future renaming.
+        """
+        kb_root = self._kb_root(kb_id)
+        return (kb_root / "chroma").is_dir() or (kb_root / "vector_store").is_dir()
+
+    def _chromadb_read_fallback(self, kb_id: str):
+        """Return a :class:`ChromadbBackend` to serve a fallback read.
+
+        Returns ``None`` when no fallback is needed (either the wiki
+        layout is present so markdown can serve, OR there is no
+        chromadb collection on disk so falling back would also fail).
+        Otherwise constructs a ChromadbBackend bound to the same
+        service, emits a structured ``read_fallback`` stderr line, and
+        returns it. spec_id: 70ab2170-381a-4657-bcd1-28a40c6f369b
+        """
+        if self._has_wiki_layout(kb_id):
+            return None
+        if not self._has_chromadb_collection(kb_id):
+            return None
+        # Lazy import to avoid the circular path at module load.
+        from agent_knowledgebase.backends.chromadb_backend import ChromadbBackend
+        from agent_knowledgebase.services.stderr_log import knowledgebase_stderr_log
+
+        knowledgebase_stderr_log(
+            kb_id=kb_id,
+            op="kb_query",
+            phase="read_fallback",
+            elapsed_ms=0,
+            rows_in=0,
+            rows_ok=0,
+            rows_skipped=0,
+            rows_failed=0,
+            dedup_policy="n/a",
+            request_id=None,
+            tool_caller_version=None,
+            error_code="MARKDOWN_READ_FALLBACK_TO_CHROMADB",
+            error_message=(
+                f"kb_backend=markdown but wiki/ missing for kb_id={kb_id!r}; "
+                "serving query via chromadb fallback. Run kb_migrate(kb_id="
+                f"{kb_id!r}, target_backend='markdown') to materialise the "
+                "wiki/ layout."
+            ),
+        )
+        return ChromadbBackend(self._settings, service=self._service)
 
     def search(
         self,
@@ -847,7 +921,17 @@ class MarkdownWikiBackend:
         Concurrent ``search()`` calls on the same ``kb_id`` serialize
         on ``self._fts_lock`` — see the module docstring for the
         threading guarantee.
+
+        Phase 4 read-fallback: same semantics as :meth:`query` — if
+        ``<kb-name>/wiki/`` is missing while ``<kb-name>/chroma/``
+        exists, the ChromadbBackend serves the search and a structured
+        stderr line is emitted.
         """
+        fallback = self._chromadb_read_fallback(kb_id)
+        if fallback is not None:
+            return fallback.search(
+                kb_id=kb_id, text=text, top_k=top_k, filters=filters
+            )
         if top_k <= 0:
             return []
         cleaned = _sanitize_fts_query(text)

@@ -149,11 +149,20 @@ class KnowledgebaseService:
         # dispatches on ``self._config.kb_backend`` and returns a real
         # backend wrapping the existing chromadb pipeline (default), or
         # raises NotImplementedError for markdown / lightrag until those
-        # phases land.  Constructed ONCE here — every retrieval entry
-        # point on this service routes through ``self._backend`` so the
-        # feature flag's effect is local to this single line.
-        # spec_id: 70ab2170-381a-4657-bcd1-28a40c6f369b
+        # phases land.
+        #
+        # Phase 4 (per-KB routing): the global backend is still
+        # constructed here so legacy code paths that don't have a
+        # specific kb_id (cross-KB scans like ``get_page``,
+        # ``get_source``) keep working unchanged. Per-kb_id resolution
+        # routes through :meth:`_backend_for` which consults the
+        # ``.migrated_to`` sentinel + ``kb_backend_per_kb`` mapping +
+        # global ``kb_backend`` (in that precedence order) and caches
+        # the resulting backend per kb_id. spec_id:
+        # 70ab2170-381a-4657-bcd1-28a40c6f369b
         self._backend: RetrieverBackend = get_backend(self._config, service=self)
+        self._backends_per_kb: dict[str, RetrieverBackend] = {}
+        self._backends_per_kb_lock: threading.Lock = threading.Lock()
 
     @property
     def _embedder(self) -> Embedder:
@@ -167,22 +176,83 @@ class KnowledgebaseService:
 
         Retrieval requires the query vector to come from the same model
         that produced the stored vectors — otherwise similarity scores
-        are meaningless (and dimensions may not even match).  This
-        method resolves the dominant embedding model stamped on the
-        KB's chunks (see
-        :meth:`Database.count_chunks_by_embedding_model`) and builds an
-        embedder targeting that specific model, falling back to the
-        globally configured embedder when the KB has no chunks yet or
-        no ``embedding_model`` metadata (pre-0.7 ingestions).
+        are meaningless (and dimensions may not even match).
+
+        Phase 4 (per-page provider snapshot): the resolution now reads
+        the *(model, provider, base_url)* triple stamped on each chunk
+        at ingest time via :meth:`Database.get_embedding_snapshot`. The
+        full snapshot is passed into
+        :func:`create_embedder_for_model` so an existing v0.6.0 KB
+        ingested under ``provider=ollama`` /
+        ``base_url=http://127.0.0.1:11434`` stays queryable AFTER the
+        Phase 5 default flip to ``provider=remote`` /
+        ``base_url=...openai.com``. Falls back to the globally
+        configured embedder when the KB has no chunks yet or no
+        ``embedding_model`` metadata (pre-0.7 ingestions).
+        spec_id: 70ab2170-381a-4657-bcd1-28a40c6f369b
         """
         ctx = self._ctx(kb_id)
-        model_counts = ctx.db.count_chunks_by_embedding_model(kb_id)
-        if not model_counts:
+        snapshot = ctx.db.get_embedding_snapshot(kb_id)
+        if snapshot is None:
             return self._embedder
-        dominant = max(model_counts, key=lambda m: model_counts[m])
-        if dominant == self._embedder.model_name:
+        dominant_model, dominant_provider, dominant_base_url = snapshot
+        if dominant_model is None:
             return self._embedder
-        return create_embedder_for_model(self._config, dominant)
+        # When the snapshot's tuple matches the currently-configured
+        # embedder we can return the cached instance and skip a fresh
+        # build; otherwise rebuild via the snapshot so the right
+        # provider+base_url is wired in.
+        if (
+            dominant_model == self._embedder.model_name
+            and (
+                dominant_provider is None
+                or dominant_provider == self._config.embedding_provider
+            )
+            and (
+                dominant_base_url is None
+                or dominant_base_url == self._config.embed_base_url
+            )
+        ):
+            return self._embedder
+        return create_embedder_for_model(
+            self._config,
+            dominant_model,
+            provider=dominant_provider,
+            base_url=dominant_base_url,
+        )
+
+    def _backend_for(self, kb_id: str) -> RetrieverBackend:
+        """Return the :class:`RetrieverBackend` for *kb_id*.
+
+        Phase 4 routing: cached per kb_id; resolution precedence is
+        sentinel file > ``kb_backend_per_kb`` mapping > global
+        ``kb_backend``. Cache invalidation happens automatically when
+        ``delete_kb`` runs (see :meth:`_invalidate_backend_cache`).
+        """
+        backend = self._backends_per_kb.get(kb_id)
+        if backend is not None:
+            return backend
+        with self._backends_per_kb_lock:
+            backend = self._backends_per_kb.get(kb_id)
+            if backend is not None:
+                return backend
+            resolved = get_backend(self._config, service=self, kb_id=kb_id)
+            self._backends_per_kb[kb_id] = resolved
+            return resolved
+
+    def _invalidate_backend_cache(self, kb_id: str | None = None) -> None:
+        """Drop cached per-KB backend(s) so the next call re-resolves.
+
+        When *kb_id* is ``None`` the entire cache is cleared (used after
+        a config-level change like a ``kb_migrate`` that may flip
+        routing for the current process). When a kb_id is supplied,
+        only that entry is dropped.
+        """
+        with self._backends_per_kb_lock:
+            if kb_id is None:
+                self._backends_per_kb.clear()
+            else:
+                self._backends_per_kb.pop(kb_id, None)
 
     def _get_kb_lock(self, kb_id: str) -> threading.Lock:
         """Return (creating lazily) the per-kb_id ingestion lock.
@@ -329,6 +399,12 @@ class KnowledgebaseService:
         # the holder still owns the object; a future re-create will get a fresh one.
         with self._kb_locks_guard:
             self._kb_locks.pop(kb_id, None)
+
+        # Phase 4: drop any cached backend for this kb_id so a future
+        # re-create with the same kb_id gets a fresh backend instance
+        # (and the new directory layout the cached backend may have
+        # been pointing at is not silently shared).
+        self._invalidate_backend_cache(kb_id)
 
     # ------------------------------------------------------------------
     # Source Ingestion (Pipeline-Gated)
@@ -521,15 +597,35 @@ class KnowledgebaseService:
             # and ``kb_id`` satisfies the vectorstore's where-filter (which
             # would otherwise return zero results even though the per-KB
             # collection holds the right chunks).
+            #
+            # Phase 4 (per-page provider snapshot): also stamp
+            # ``embedding_provider`` and ``embed_base_url`` so the
+            # retrieval path can faithfully rebuild the original
+            # embedder via ``create_embedder_for_model(model, provider=...,
+            # base_url=...)`` even AFTER the Phase 5 default flip moves
+            # ``Settings.embedding_provider`` to a different value. The
+            # secret (``embed_api_key``) is intentionally NOT stamped —
+            # secrets stay in Settings/env per the FORBIDDEN_KEYS
+            # discipline; the snapshot only carries non-secret routing
+            # metadata. spec_id: 70ab2170-381a-4657-bcd1-28a40c6f369b
             for chunk in chunks:
                 chunk.metadata["embedding_model"] = self._embedder.model_name
                 chunk.metadata["kb_id"] = kb_id
+                chunk.metadata["embedding_provider"] = self._config.embedding_provider
+                if self._config.embed_base_url is not None:
+                    chunk.metadata["embed_base_url"] = self._config.embed_base_url
             # Route the index write through the RetrieverBackend
             # abstraction (Phase 2). For chromadb this is a thin wrapper
             # around ``vectorstore.add(...)``; markdown (Phase 3) /
             # lightrag (Phase 6) implementations will diverge here.
+            #
+            # Phase 4: per-KB routing via ``_backend_for(kb_id)`` so
+            # that ``AGENT_KB_BACKEND_PER_KB`` overrides + the
+            # ``.migrated_to`` sentinel both take effect. Falls through
+            # to the global default when neither is set, preserving
+            # Phase 2/3 behavior.
             if chunks:
-                self._backend.index(
+                self._backend_for(kb_id).index(
                     kb_id=kb_id,
                     documents=[
                         {
@@ -654,12 +750,13 @@ class KnowledgebaseService:
             )
             try:
                 # Delete old chunks from the backend.  Routes through
-                # ``self._backend.delete`` (Phase 2) so the markdown /
-                # lightrag backends can override the deletion path
-                # without touching this service.
+                # ``self._backend_for(kb_id).delete`` (Phase 4 per-KB
+                # routing) so the markdown / lightrag backends can
+                # override the deletion path without touching this
+                # service.
                 old_chunks = ctx.db.list_chunks(source_id)
                 if old_chunks:
-                    self._backend.delete(
+                    self._backend_for(kb_id).delete(
                         kb_id=kb_id, ids=[c.id for c in old_chunks]
                     )
                 ctx.db.delete_chunks_by_source(source_id)
@@ -700,7 +797,7 @@ class KnowledgebaseService:
 
         old_chunks = ctx.db.list_chunks(source_id)
         if old_chunks:
-            self._backend.delete(
+            self._backend_for(source.kb_id).delete(
                 kb_id=source.kb_id, ids=[c.id for c in old_chunks]
             )
 
@@ -716,8 +813,9 @@ class KnowledgebaseService:
     def query(self, kb_id: str, text: str, top_k: int | None = None) -> list[SearchResult]:
         """Semantic query across a KB.
 
-        Routes through ``self._backend.query`` (Phase 2 RetrieverBackend
-        abstraction). The chromadb default returns dicts shaped like
+        Routes through ``self._backend_for(kb_id).query`` (Phase 4
+        per-KB routing — sentinel/per-kb mapping/global default in that
+        precedence). The chromadb default returns dicts shaped like
         :class:`SearchResult`'s ``__dict__`` so we round-trip them back
         into :class:`SearchResult` instances to preserve the v0.6.0
         return type.
@@ -728,19 +826,19 @@ class KnowledgebaseService:
         # historical ValueError before the backend is consulted; the
         # backend would also raise but with a less specific message.
         self._ctx(kb_id)
-        rows = self._backend.query(kb_id=kb_id, text=text, top_k=top_k)
+        rows = self._backend_for(kb_id).query(kb_id=kb_id, text=text, top_k=top_k)
         return [SearchResult(**row) for row in rows]
 
     def search(self, kb_id: str, text: str, top_k: int | None = None) -> list[SearchResult]:
         """Keyword search across a KB.
 
-        Routes through ``self._backend.search`` (Phase 2 RetrieverBackend
-        abstraction). See :meth:`query` for the round-trip rationale.
+        Routes through ``self._backend_for(kb_id).search`` (Phase 4
+        per-KB routing). See :meth:`query` for the round-trip rationale.
         """
         if top_k is None:
             top_k = default_top_k(self._config)
         self._ctx(kb_id)
-        rows = self._backend.search(kb_id=kb_id, text=text, top_k=top_k)
+        rows = self._backend_for(kb_id).search(kb_id=kb_id, text=text, top_k=top_k)
         return [SearchResult(**row) for row in rows]
 
     def hybrid_query(self, kb_id: str, text: str, top_k: int | None = None) -> list[SearchResult]:
@@ -838,6 +936,27 @@ class KnowledgebaseService:
         """Export all wiki pages to markdown files."""
         ctx = self._ctx(kb_id)
         return ctx.exporter.export(kb_id, output_dir)
+
+    # ------------------------------------------------------------------
+    # Migration (Phase 4 — kb_migrate MCP tool entry point)
+    # ------------------------------------------------------------------
+
+    def migrate(self, *, kb_id: str, target_backend: str) -> dict:
+        """Cut over a KB to a different :class:`RetrieverBackend`.
+
+        Thin pass-through to :func:`services.migration.migrate` so the
+        MCP tool layer (``server.py::kb_migrate``) doesn't have to
+        import the migration module directly. Returns the
+        :meth:`MigrationResult.to_payload` dict for JSON serialization.
+        spec_id: 70ab2170-381a-4657-bcd1-28a40c6f369b
+        """
+        # Lazy import to keep server.py import time light — see the
+        # subagent brief's "Don't import migration.py at server.py
+        # import time" note.
+        from agent_knowledgebase.services.migration import migrate as _migrate
+
+        result = _migrate(self, kb_id=kb_id, target_backend=target_backend)
+        return result.to_payload()
 
     # ------------------------------------------------------------------
     # Pipeline Status

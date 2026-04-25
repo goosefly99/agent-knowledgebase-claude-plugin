@@ -194,6 +194,34 @@ class Database:
                 added_any = True
         if added_any:
             self._conn.commit()
+        # v0.10.0 / Phase 4 additive migration: per-page provider snapshot.
+        # `chunks` table gains `embedding_provider` and `embed_base_url`
+        # columns (both nullable TEXT) so an existing v0.6.0 KB ingested
+        # under provider=ollama/base_url=http://127.0.0.1:11434 stays
+        # queryable after the Phase 5 default flip to remote/text-
+        # embedding-3-small. The snapshot is read at query time by
+        # ``create_embedder_for_model(model_name, provider=..., base_url=...)``
+        # so the original embedder is faithfully rebuilt even after the
+        # global Settings defaults move on. Strictly ALTER ADD —
+        # non-destructive; rollback SQL documented in CHANGELOG.md.
+        # spec_id: 70ab2170-381a-4657-bcd1-28a40c6f369b
+        chunk_cols = {
+            row[1]
+            for row in self._conn.execute("PRAGMA table_info(chunks)").fetchall()
+        }
+        _CHUNK_PROVIDER_SNAPSHOT_COLUMNS: list[tuple[str, str]] = [
+            ("embedding_provider", "TEXT"),
+            ("embed_base_url", "TEXT"),
+        ]
+        added_provider_snapshot = False
+        for col_name, col_type in _CHUNK_PROVIDER_SNAPSHOT_COLUMNS:
+            if col_name not in chunk_cols:
+                self._conn.execute(
+                    f"ALTER TABLE chunks ADD COLUMN {col_name} {col_type}"
+                )
+                added_provider_snapshot = True
+        if added_provider_snapshot:
+            self._conn.commit()
 
     # ------------------------------------------------------------------
     # Connection lifecycle
@@ -532,9 +560,18 @@ class Database:
     # ------------------------------------------------------------------
 
     def insert_chunk(self, chunk: Chunk) -> None:
+        # Phase 4: stamp the per-page provider snapshot into native
+        # columns when present in chunk.metadata so the read-path's
+        # snapshot resolution (get_embedding_snapshot) sees non-NULL
+        # column values instead of having to fall back to the metadata
+        # blob. The metadata bag is left intact so older readers keep
+        # working unchanged. spec_id: 70ab2170-381a-4657-bcd1-28a40c6f369b
+        embedding_provider = chunk.metadata.get("embedding_provider") if isinstance(chunk.metadata, dict) else None
+        embed_base_url = chunk.metadata.get("embed_base_url") if isinstance(chunk.metadata, dict) else None
         self._conn.execute(
-            "INSERT INTO chunks (id, source_id, kb_id, content, metadata, embedding_id) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO chunks (id, source_id, kb_id, content, metadata, "
+            "embedding_id, embedding_provider, embed_base_url) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 chunk.id,
                 chunk.source_id,
@@ -542,6 +579,8 @@ class Database:
                 chunk.content,
                 _json_dumps(chunk.metadata),
                 chunk.embedding_id,
+                embedding_provider,
+                embed_base_url,
             ),
         )
         self._conn.commit()
@@ -825,3 +864,87 @@ class Database:
                 continue
             counts[model] = counts.get(model, 0) + 1
         return counts
+
+    # ------------------------------------------------------------------
+    # Phase 4 — per-page (per-chunk) embedding-provider snapshot
+    # ------------------------------------------------------------------
+
+    def get_embedding_snapshot(
+        self, kb_id: str
+    ) -> tuple[Optional[str], Optional[str], Optional[str]] | None:
+        """Return the *(model, provider, base_url)* snapshot for *kb_id*.
+
+        Reads the per-chunk snapshot stamped at ingest time (see Phase 4
+        spec task: "Stamp ``(embedding_provider, embed_base_url)``
+        alongside ``dominant_embedding_model`` on every page").
+
+        Resolution order, picking the dominant tuple by chunk count:
+
+        1. Native ``chunks.embedding_provider`` / ``chunks.embed_base_url``
+           columns added by the Phase 4 ALTER TABLE migration.
+        2. Fallback to ``chunks.metadata["embedding_provider"]`` /
+           ``chunks.metadata["embed_base_url"]`` so KBs ingested via the
+           metadata-bag path are still recognized.
+        3. ``chunks.metadata["embedding_model"]`` for the model name (the
+           v0.6.0 stamping path that pre-dates Phase 4).
+
+        Returns ``None`` when no chunks exist for *kb_id*. Otherwise
+        returns a 3-tuple ``(model, provider, base_url)`` where
+        ``provider`` and ``base_url`` may individually be ``None`` for
+        legacy chunks that were not backfilled.
+        """
+        rows = self._conn.execute(
+            "SELECT metadata, embedding_provider, embed_base_url "
+            "FROM chunks WHERE kb_id = ?",
+            (kb_id,),
+        ).fetchall()
+        counts: dict[
+            tuple[Optional[str], Optional[str], Optional[str]], int
+        ] = {}
+        for row in rows:
+            meta = _json_loads(row["metadata"])
+            if not isinstance(meta, dict):
+                meta = {}
+            model = meta.get("embedding_model")
+            # Prefer the native column; fall back to metadata for KBs
+            # ingested before the column was wired into the write path.
+            provider = row["embedding_provider"] or meta.get("embedding_provider")
+            base_url = row["embed_base_url"] or meta.get("embed_base_url")
+            key = (model, provider, base_url)
+            counts[key] = counts.get(key, 0) + 1
+        if not counts:
+            return None
+        return max(counts, key=lambda k: counts[k])
+
+    def backfill_embedding_snapshot(
+        self,
+        *,
+        kb_id: str,
+        provider: Optional[str],
+        base_url: Optional[str],
+    ) -> int:
+        """Backfill ``embedding_provider`` / ``embed_base_url`` columns
+        for chunks in *kb_id* that lack them.
+
+        Used by the Phase 4 backfill script (``services/migration.py``
+        ``backfill_provider_snapshot``) to populate legacy v0.6.0 KBs
+        from each KB's ``config.json`` so the snapshot read path
+        (:meth:`get_embedding_snapshot`) returns non-None values for
+        existing rows. Strictly UPDATE — non-destructive (only sets
+        columns that are currently NULL; never overwrites a stamped
+        value).
+
+        Returns the number of rows updated.
+        """
+        if provider is None and base_url is None:
+            return 0
+        # Only touch rows missing BOTH columns so a partially-backfilled
+        # KB stays consistent across reruns.
+        cur = self._conn.execute(
+            "UPDATE chunks SET embedding_provider = COALESCE(embedding_provider, ?), "
+            "embed_base_url = COALESCE(embed_base_url, ?) "
+            "WHERE kb_id = ? AND (embedding_provider IS NULL OR embed_base_url IS NULL)",
+            (provider, base_url, kb_id),
+        )
+        self._conn.commit()
+        return cur.rowcount or 0

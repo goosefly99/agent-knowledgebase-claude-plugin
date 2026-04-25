@@ -39,9 +39,14 @@ from __future__ import annotations
 import pytest
 
 # The 25 frozen kb_* MCP tools per spec.architecture.components[3] and
-# overview.objectives[4]. Any redesign change that adds or removes from this
-# list MUST fail the contract test (additive kb_migrate is allowed in Phase 4
-# — extend this list at that point, do NOT remove anything).
+# overview.objectives[4], PLUS the additive `kb_migrate` introduced by
+# Phase 4 of the v2.1 redesign (probe-4-safe — adds a new tool, does
+# NOT regress any existing one). Set is now 26 names.
+#
+# Any redesign change that adds or removes from this list MUST fail the
+# contract test below. Subsequent phases that introduce additional
+# additive tools should extend this set (NEVER shrink it). The 25 names
+# below are pinned by spec; ``kb_migrate`` is the first Phase 4 add.
 _FROZEN_MCP_TOOLS_V0_6_0 = frozenset(
     {
         "kb_create",
@@ -69,6 +74,8 @@ _FROZEN_MCP_TOOLS_V0_6_0 = frozenset(
         "kb_config_get",
         "kb_config_set",
         "kb_config_validate",
+        # Phase 4 additive (spec.implementation.phases[4]):
+        "kb_migrate",
     }
 )
 

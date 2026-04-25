@@ -476,6 +476,40 @@ def kb_export(kb_id: str, output_dir: str) -> str:
     return json.dumps([str(p) for p in paths])
 
 
+@mcp.tool()
+@_with_tool_timeout
+def kb_migrate(kb_id: str, target_backend: str) -> str:
+    """Migrate a knowledgebase between retrieval backends (Phase 4).
+
+    Cuts over the storage layout for *kb_id* to *target_backend*
+    (one of ``"chromadb"`` or ``"markdown"``) by:
+
+    1. Materialising the data on disk in the new backend's layout
+       (``<saves_dir>/<kb-name>/wiki/`` for markdown,
+       ``<saves_dir>/<kb-name>/chroma/`` for chromadb).
+    2. Writing the routing sentinel file
+       ``<saves_dir>/<kb-name>/.migrated_to`` with the target backend
+       name so future ``kb_query`` / ``kb_search`` calls route there.
+    3. Leaving the OLD backend's data untouched — rollback is
+       deleting the sentinel file. Operators reclaim disk space
+       manually.
+
+    Parameters:
+        kb_id: ID of the knowledgebase to migrate.
+        target_backend: Target backend name; one of ``"chromadb"`` or
+            ``"markdown"``. ``"lightrag"`` is rejected (Phase 6 deferred).
+
+    Returns a JSON object summarising the migration:
+    ``{"kb_id":..., "target_backend":..., "pages_migrated":N,
+    "sentinel_path":..., "notes":[...], "spec_id":...}``.
+
+    spec_id: 70ab2170-381a-4657-bcd1-28a40c6f369b
+    """
+    svc = _get_service()
+    result = svc.migrate(kb_id=kb_id, target_backend=target_backend)
+    return json.dumps(result)
+
+
 # ===================================================================
 # Read-Path Tools (Always Available)
 # ===================================================================
