@@ -1,5 +1,100 @@
 # Changelog
 
+## 0.8.0 — 2026-04-24
+
+> Phase 1 of the v2.1 redesign — Pattern A single-launcher runtime
+> bootstrap. `uv` is no longer a runtime dependency; any system
+> Python>=3.11 on PATH is sufficient.
+>
+> spec_id: `70ab2170-381a-4657-bcd1-28a40c6f369b`
+> Source spec: `pipeline_mcp_data/specs/agent-kb-redesign-spec-v2.1.json`
+
+### Changed (breaking)
+
+- **`.mcp.json` no longer invokes `uv`.** The new manifest invokes the
+  stdlib-only Pattern A launcher directly:
+
+  ```json
+  {
+    "mcpServers": {
+      "agent-knowledgebase": {
+        "command": "python",
+        "args": ["${CLAUDE_PLUGIN_ROOT}/bin/run_server.py"]
+      }
+    }
+  }
+  ```
+
+  Hosts that previously installed `uv` purely to run this plugin can
+  uninstall it. Any system Python>=3.11 on PATH boots the server.
+
+### Added
+
+- **`bin/run_server.py`** — single-file cross-platform launcher. On
+  first launch it self-bootstraps `${CLAUDE_PLUGIN_ROOT}/.venv` via
+  the stdlib `venv` module, runs `pip install -r requirements.lock`
+  inside the venv with a 30 s timeout, persists a SHA256 sentinel at
+  `<venv>/.req-sha`, and `os.execv`s the server. Subsequent launches
+  match the sentinel and skip pip install (fast path). Cross-process
+  bootstrap serialisation uses stdlib `fcntl.flock` on Unix and
+  `msvcrt.locking` on Windows — no dependency on the `filelock`
+  package, which is not yet installed when the launcher first runs.
+- **Three structured stderr error tokens** when bootstrap can't
+  proceed: `python_version` (Python<3.11 detected),
+  `network_unreachable` (pip install timed out at 30 s), and
+  `read_only_filesystem` (`${CLAUDE_PLUGIN_ROOT}` not writable).
+  Each emission is a single-line JSON document carrying the spec_id
+  for traceability.
+- **`AGENT_KB_VENDORED_DEPS=/path/to/wheels`** offline escape-hatch.
+  When set, the launcher uses `pip install --no-index --find-links`
+  so air-gapped corporate hosts can preload wheels via
+  `pip download -d wheels/ -r requirements.lock` and bootstrap with
+  no network access.
+- **Cygwin / Git-Bash detection** in the launcher
+  (`sys.platform=='win32'` AND `MSYSTEM` set) so a forward-slash
+  `${CLAUDE_PLUGIN_ROOT}` from Git-Bash is normalised to a Windows
+  path before subprocess invocation.
+- **`requirements.lock`** — fully-pinned hashed lock file produced by
+  `uv pip compile pyproject.toml --generate-hashes`. The launcher
+  hashes this file and compares against the venv sentinel to decide
+  whether to re-run pip install.
+- **`[project.scripts] agent-knowledgebase-server =
+  "agent_knowledgebase.server:main"`** so users who install the
+  package via `pipx` or `pip` get a CLI entry point alongside the
+  plugin.
+- **`tests/test_run_server_bootstrap.py`** — fresh
+  `CLAUDE_PLUGIN_ROOT` triggers venv create + sentinel write; a
+  second invocation skips pip install; `AGENT_KB_VENDORED_DEPS`
+  switches the install argv to `--no-index --find-links`.
+- **`tests/test_run_server_failure_modes.py`** — patches the three
+  failure conditions and asserts the structured stderr token plus
+  `SystemExit(1)`.
+
+### Removed
+
+- **`requirements.lock.sample`** — replaced by the real generated
+  `requirements.lock` referenced above.
+
+### Documented as alternates (not implemented)
+
+- **Pattern C (`pipx install agent-knowledgebase`)** — documented in
+  README with the explicit caveat that the Claude Code plugin
+  marketplace does not auto-run `pipx install`; the user must run it
+  manually.
+- **Pattern D (Docker GHCR image)** — mentioned in README as a
+  zero-Python-on-host alternate. No Dockerfile in this phase
+  (Phase 6 deliverable).
+
+### Frozen contracts (validated unchanged in this phase)
+
+- The 25 `kb_*` MCP tools (`tests/test_redesign_contract.py`,
+  `tests/test_tool_timeout.py`, `tests/contract/test_decorator_order.py`).
+- `knowledgebase_stderr_log` 11-field schema.
+- Decorator order: `@mcp.tool()` outer, `@_with_tool_timeout` inner
+  (per `docs/redesign/MISTAKES.md` M-01 — DO NOT swap).
+- `AGENT_KB_SAVES_DIR` semantics + the Phase 0 default-factory
+  fallback to `~/.agent-kb/saves`.
+
 ## 0.7.1 — 2026-04-24
 
 > Note: pyproject.toml was bumped 0.6.0 → 0.7.1 (skipping 0.7.0). The
@@ -85,18 +180,6 @@ regression guard against accidental future inversion (asserts
 > spec_id: `70ab2170-381a-4657-bcd1-28a40c6f369b`
 > Source spec: `pipeline_mcp_data/specs/agent-kb-redesign-spec-v2.1.json`
 > Detailed roadmap: `docs/redesign/ROADMAP.md`
-
-### Proposed (Phase 1 — Pattern A launcher)
-
-- Replace `.mcp.json` `command:uv,args:[run,...]` with single
-  cross-platform stdlib launcher: `command:python,
-  args:[${CLAUDE_PLUGIN_ROOT}/bin/run_server.py]`. The launcher
-  auto-bootstraps `.venv` via stdlib `venv` module, uses a SHA256
-  sentinel + filelock to avoid redundant pip installs, and emits
-  structured stderr for the three failure modes (`python_version`,
-  `network_unreachable`, `read_only_filesystem`).
-  `AGENT_KB_VENDORED_DEPS` provides an offline escape-hatch for
-  air-gapped installs.
 
 ### Proposed (Phase 2 — RetrieverBackend abstraction)
 

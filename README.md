@@ -6,7 +6,64 @@ Exposes an MCP server (`agent-knowledgebase`) packaged as a Claude Code plugin (
 
 ## Installation
 
-Install the plugin from the marketplace entry `agent-knowledgebase-auto-dev`. See `pyproject.toml` for Python dependencies (Python >=3.11).
+### Pattern A — Claude Code marketplace (default, since v0.8.0)
+
+Install the plugin from the marketplace entry `agent-knowledgebase-auto-dev`. The only host requirement is **Python >=3.11 on PATH**. `uv` is no longer required as a runtime dependency.
+
+On first launch the bundled `bin/run_server.py` self-bootstraps a venv at `${CLAUDE_PLUGIN_ROOT}/.venv` (using the stdlib `venv` module), runs `pip install -r requirements.lock` inside it, and persists a SHA256 sentinel so subsequent launches skip pip install entirely (fast path). The full `.mcp.json` is just:
+
+```json
+{
+  "mcpServers": {
+    "agent-knowledgebase": {
+      "command": "python",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/bin/run_server.py"]
+    }
+  }
+}
+```
+
+The launcher emits structured single-line JSON stderr if it cannot bootstrap. The three error tokens are:
+
+- `python_version` — the host Python is older than 3.11. Install Python 3.11+.
+- `network_unreachable` — pip install timed out at 30 s. Either fix network access or set `AGENT_KB_VENDORED_DEPS=/path/to/wheels` (see below).
+- `read_only_filesystem` — `${CLAUDE_PLUGIN_ROOT}` is not writable. Mount it writable or relocate the plugin root to a writable directory.
+
+#### Air-gapped / offline (`AGENT_KB_VENDORED_DEPS`)
+
+For corporate hosts behind captive portals or air-gapped environments, vendor wheels once on a connected host:
+
+```bash
+pip download -d wheels/ -r requirements.lock
+```
+
+Then ship `wheels/` to the target host and set:
+
+```bash
+export AGENT_KB_VENDORED_DEPS=/path/to/wheels
+```
+
+The launcher will use `pip install --no-index --find-links=$AGENT_KB_VENDORED_DEPS` and skip PyPI entirely.
+
+### Pattern C — `pipx install agent-knowledgebase` (alternate)
+
+If you prefer not to let the plugin manage its own venv, you can install the package directly:
+
+```bash
+pipx install agent-knowledgebase
+```
+
+This exposes the `agent-knowledgebase-server` CLI entry point (registered via `[project.scripts]`). Wire it into your own MCP host config as `command: agent-knowledgebase-server`.
+
+> **Marketplace caveat:** the Claude Code plugin marketplace does **not** auto-run `pipx install` for you. If you want this pattern, run the `pipx install` command manually before configuring the plugin. Pattern A above is what the marketplace ships out of the box and is the default for that reason.
+
+### Pattern D — Docker (alternate, zero Python on host)
+
+A future GHCR Docker image (`ghcr.io/...`) will let you run the server without any Python on the host. The Dockerfile is a Phase 6 deliverable of the v2.1 redesign and is not yet shipped — track `docs/redesign/ROADMAP.md`.
+
+### PEP-723 single-file scripts (future)
+
+PEP-723 inline-metadata single-file launchers are tracked as a future-only design and not in scope for v0.8.0.
 
 ## Ecosystem version floor
 

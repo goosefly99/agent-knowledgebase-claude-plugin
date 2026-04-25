@@ -1,6 +1,6 @@
 [project]
 name = "agent-knowledgebase"
-version = "0.7.1"
+version = "0.8.0"
 description = "Personal knowledgebase plugin — ingest sources, build wiki artifacts, query with vector search"
 requires-python = ">=3.11"
 dependencies = [
@@ -22,6 +22,9 @@ dependencies = [
 
 [project.optional-dependencies]
 pinecone = ["pinecone-client>=3.0"]
+
+[project.scripts]
+agent-knowledgebase-server = "agent_knowledgebase.server:main"
 
 [dependency-groups]
 dev = ["pytest>=8.0", "pytest-asyncio>=0.24", "ruff>=0.5"]
