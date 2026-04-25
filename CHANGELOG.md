@@ -25,7 +25,9 @@
 | Scenario | Action |
 |---|---|
 | Brand-new install | No action. New KBs default to `provider='remote'`, `model='text-embedding-3-small'`. Set `AGENT_KB_EMBED_API_KEY` + `AGENT_KB_EMBED_BASE_URL` (e.g. `https://api.openai.com/v1`). |
-| Existing v0.6.0/v0.10.x KB on Ollama | No action — Phase 4's per-chunk provider snapshot keeps the original Ollama embedder wired in for queries against that KB. New KBs created post-upgrade will pick up the new default. To keep old workflow: explicitly set `AGENT_KB_EMBEDDING_PROVIDER=ollama` + `AGENT_KB_EMBEDDING_MODEL=qwen3-embedding:8b`. |
+| Existing v0.6.0/v0.10.x KB on Ollama (Phase 4 backfill ALREADY run) | No action — Phase 4's per-chunk provider snapshot keeps the original Ollama embedder wired in for queries against that KB. New KBs created post-upgrade will pick up the new default. |
+| Existing v0.6.0 KB on Ollama, jumping v0.6.0 → v0.11.0 directly (Phase 4 backfill NEVER run) | **Auto-handled in v0.11.0.** First `kb_query` against the KB triggers an automatic backfill: chunks whose snapshot is `(qwen3-embedding..., NULL, NULL)` get `provider='ollama'` + `base_url='http://127.0.0.1:11434'` stamped retroactively, then the query proceeds normally. The auto-fix emits a structured `LEGACY_OLLAMA_KB_BACKFILLED` stderr line so operators see what happened. Defensive opt-out: explicitly set `AGENT_KB_EMBEDDING_PROVIDER=ollama` + `AGENT_KB_EMBEDDING_MODEL=qwen3-embedding:8b` env vars BEFORE first query, or manually run `backfill_provider_snapshot`, to avoid relying on the heuristic. |
+| Existing KB on a non-Ollama legacy embedder (NULL provider, non-`qwen3-embedding` model) | Auto-backfill heuristic does NOT fire. Either run `backfill_provider_snapshot` manually OR set the matching `AGENT_KB_EMBEDDING_*` env vars before first query, otherwise snapshot resolves to remote-without-API-key and raises `ValueError`. |
 | Want to switch an existing KB to a new embedder | Re-ingest under the new embedder. The mixed-version rejection (`EMBEDDER_VERSION_MISMATCH`) prevents accidental cross-embedder mixing; set `AGENT_KB_AUTO_REEMBED=1` to bypass while you re-ingest. |
 | Want local embeddings (no network) | `pip install agent-knowledgebase[embed-local-onnx]` for fastembed (~150 MB), or `pip install agent-knowledgebase[embed-local-st]` for sentence-transformers (~1.3 GB). |
 
@@ -71,20 +73,56 @@
   BEFORE any source row is inserted.
 - **`AGENT_KB_AUTO_REEMBED=1` env var** — documented bypass for the
   mixed-version rejection. Operators set this when intentionally
-  re-embedding an existing KB under a new embedder.
-- **MMR fastembed-specific lambda tuning** — two new
-  `Settings` fields:
-  - `query_mmr_lambda_default` (default 0.5) — for fp32-class
-    embedders (sentence-transformers, remote, ollama).
-  - `query_mmr_lambda_fastembed` (default 0.4) — slightly lower to
-    compensate for int8 quantization compressing the similarity
-    span between near-duplicates.
-  - New `services.query.mmr_lambda_for(settings, embedder)` helper
-    routes by `embedder_version.startswith("fastembed/")`.
-  - The current chromadb chunk path doesn't yet wire MMR through
-    `query()`; the constants + helper land now so a future MMR
-    rerank pass picks them up consistently across embedder
-    families.
+  re-embedding an existing KB under a new embedder. **IMPORTANT after
+  bypass:** the bypass disables only the rejection — chunks ingested
+  under the OLD embedder remain on disk under the OLD geometry. To
+  avoid silently-unreachable mixed-version chunks at query time, the
+  operator MUST follow up with a re-ingest of the prior chunks under
+  the new embedder (or `kb_delete` + recreate). Phase 5 emits a
+  structured `MIXED_EMBEDDER_VERSIONS_DETECTED` stderr line at most
+  once per kb_id per process when the situation is detected at query
+  time, so operators are not left guessing why a chunk that was
+  visible last week is now missing from results.
+- **Auto-backfill for legacy v0.6.0 Ollama KBs at query time (B-02).**
+  The first `kb_query` against a KB whose chunks carry only the model
+  name in metadata (NULL `embedding_provider` / NULL `embed_base_url`)
+  AND whose model name starts with `qwen3-embedding` (the historical
+  v0.6.0 Ollama default) triggers an automatic
+  `Database.backfill_embedding_snapshot` UPDATE that stamps
+  `provider='ollama'` + `base_url='http://127.0.0.1:11434'` onto the
+  matching chunks. Idempotent (per-process suppression set + the
+  underlying COALESCE-NULL filter). Emits a `LEGACY_OLLAMA_KB_BACKFILLED`
+  structured stderr line. Without this heuristic, an operator who
+  jumps v0.6.0 → v0.11.0 directly (skipping the explicit Phase 4
+  backfill) would hit `ValueError("AGENT_KB_EMBED_API_KEY required for
+  remote embeddings")` on first query.
+- **Runtime `ValueError("AGENT_KB_*")` is now wrapped as
+  `config_missing` (I-06).** The Phase 0 `_get_service` wrap covered
+  config errors raised from `Settings.resolve_paths()`. After the
+  Phase 5 default flip, fresh-install operators with no
+  `AGENT_KB_EMBED_API_KEY` hit `ValueError("AGENT_KB_EMBED_API_KEY
+  required for remote embeddings")` raised inside the embedder build —
+  not via `resolve_paths`. The `_with_tool_timeout` wrapper now also
+  catches the runtime `ValueError("AGENT_KB_*")` family and returns the
+  same `{"error":"config_missing","missing":"AGENT_KB_<var>",...}`
+  payload, so the FIRST kb_query call returns a clean structured
+  diagnostic instead of a stack trace.
+- **fastembed parity verified by Jaccard@10 test; MMR re-tuning
+  deferred until empirical need surfaces.** The v0.11.0 cut initially
+  shipped two `query_mmr_lambda_*` Settings fields + a
+  `services.query.mmr_lambda_for(settings, embedder)` helper as
+  forward-compat scaffolding for a fastembed-specific MMR diversity
+  bias. Code review (B-03) caught that nothing in
+  `QueryOrchestrator.query` / `search` / `hybrid_query` actually wires
+  MMR into the chunk path — they all use raw cosine + FTS rank — so
+  the fields + helper were dead surface and were removed in the
+  follow-up patch. The `tests/test_fastembed_recall_parity.py`
+  Jaccard@10 ≥ 0.95 result on a fixed corpus shows fastembed-int8 and
+  sentence-transformers-fp32 already produce nearly-identical
+  neighbour sets, so the spec's premise that fastembed needs
+  MMR-compensation isn't supported empirically. If a future
+  orchestrator change wires MMR into the query path, the helper +
+  Settings fields can re-appear alongside the actual rerank logic.
 - **`tests/test_embedder_version_mismatch.py`** — 9 tests covering
   the schema migration (additive + idempotent), the `insert_chunk`
   -> native column mapping, `get_embedder_versions` set semantics

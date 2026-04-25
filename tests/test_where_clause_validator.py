@@ -10,6 +10,13 @@ from __future__ import annotations
 
 import pytest
 
+# Phase 5 (B-01): sqlparse moved to the opt-in [ingest-sql] extra in
+# Phase 5. Skip the entire module gracefully on a default install
+# instead of failing pytest collection. Mirrors the
+# test_fastembed_*.py pattern. spec_id:
+# 70ab2170-381a-4657-bcd1-28a40c6f369b
+pytest.importorskip("sqlparse")
+
 from agent_knowledgebase.services.where_clause_validator import (
     CODE_ARITHMETIC,
     CODE_ATTACH,

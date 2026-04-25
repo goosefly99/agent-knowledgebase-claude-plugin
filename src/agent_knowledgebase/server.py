@@ -67,6 +67,19 @@ def _classify_config_error(exc: BaseException) -> dict[str, str]:
     ``AGENT_KB_SAVES_DIR``) and falls back to an
     ``AGENT_KB_SAVES_DIR``-flavoured payload for path-existence errors
     raised by ``resolve_paths``.
+
+    Phase 5 (I-06) — also catches the runtime
+    ``ValueError("AGENT_KB_<VAR> required for ...")`` family raised
+    inside the embedder build path (``embeddings._build_embedder``).
+    Without this wrap, a fresh-install operator who hasn't set
+    ``AGENT_KB_EMBED_API_KEY`` after the Phase 5 default flip to
+    ``provider='remote'`` would receive a raw stack trace on first
+    ``kb_query`` instead of the structured ``config_missing`` payload
+    every other config failure surfaces. The pattern is
+    ``AGENT_KB_*`` at the start of the message + the literal ``required``
+    later — anything matching is wrapped as a config error and the env
+    var name is extracted from the first whitespace-separated token.
+    spec_id: 70ab2170-381a-4657-bcd1-28a40c6f369b
     """
     if isinstance(exc, ValidationError):
         missing_field = "AGENT_KB_SAVES_DIR"
@@ -96,6 +109,16 @@ def _classify_config_error(exc: BaseException) -> dict[str, str]:
             missing="AGENT_KB_SAVES_DIR",
             detail=str(exc),
         )
+    if isinstance(exc, ValueError):
+        msg = str(exc)
+        if msg.startswith("AGENT_KB_") and "required" in msg:
+            # Extract the env var name from the leading token.
+            parts = msg.split()
+            missing_var = parts[0] if parts else "AGENT_KB_<unknown>"
+            return _config_missing_payload(
+                missing=missing_var,
+                detail=msg,
+            )
     return _config_missing_payload(
         missing="unknown",
         detail=f"{type(exc).__name__}: {exc}",
@@ -228,6 +251,27 @@ def _reset_tool_executor() -> None:
     _service = None
 
 
+def _maybe_classify_runtime_value_error(exc: BaseException) -> dict[str, str] | None:
+    """Return a config_missing payload when *exc* matches the AGENT_KB_ pattern.
+
+    Phase 5 (I-06): the embedder build path raises
+    ``ValueError("AGENT_KB_<VAR> required for ...")`` when a required
+    runtime config var is missing (e.g. ``AGENT_KB_EMBED_API_KEY`` after
+    the Phase 5 default flip to ``provider='remote'``). Without a wrap,
+    this propagates as a raw stack trace on first ``kb_query``. The
+    same payload shape that Phase 0 used for ``_get_service``-time
+    config errors is reused here so callers see one error contract.
+    Returns ``None`` for unrelated ValueErrors so they keep propagating
+    raw. spec_id: 70ab2170-381a-4657-bcd1-28a40c6f369b
+    """
+    if not isinstance(exc, ValueError):
+        return None
+    msg = str(exc)
+    if not msg.startswith("AGENT_KB_") or "required" not in msg:
+        return None
+    return _classify_config_error(exc)
+
+
 def _with_tool_timeout(func: _F) -> _F:
     """Wrap a tool with a wall-clock timeout and structured failure payload.
 
@@ -241,6 +285,12 @@ def _with_tool_timeout(func: _F) -> _F:
     and returns the structured ``config_missing`` JSON payload as the
     tool response. This converts the previous opaque MCP InternalError
     into a useful diagnostic for the caller — the Phase 0 Bug-2 fix.
+
+    Phase 5 (I-06) — also catches the runtime
+    ``ValueError("AGENT_KB_<VAR> required for ...")`` family raised
+    inside the embedder build path so the FIRST kb_query call against
+    a fresh install with no API key returns a structured
+    ``config_missing`` JSON response instead of a raw stack trace.
     """
     @wraps(func)
     def wrapper(*args: object, **kwargs: object) -> str:
@@ -251,6 +301,11 @@ def _with_tool_timeout(func: _F) -> _F:
                 return func(*args, **kwargs)
             except _ConfigMissingError as exc:
                 return json.dumps(exc.payload)
+            except ValueError as exc:
+                payload = _maybe_classify_runtime_value_error(exc)
+                if payload is not None:
+                    return json.dumps(payload)
+                raise
 
         def _run(*a: object, **kw: object) -> str:
             _in_tool_worker.active = True
@@ -272,6 +327,11 @@ def _with_tool_timeout(func: _F) -> _F:
             })
         except _ConfigMissingError as exc:
             return json.dumps(exc.payload)
+        except ValueError as exc:
+            payload = _maybe_classify_runtime_value_error(exc)
+            if payload is not None:
+                return json.dumps(payload)
+            raise
 
     return wrapper  # type: ignore[return-value]
 

@@ -25,22 +25,94 @@ structured error to the MCP tool boundary.
 from __future__ import annotations
 
 import re
-from typing import Iterable
+from typing import TYPE_CHECKING, Iterable
 
-import sqlparse
-from sqlparse import tokens as T
-from sqlparse.sql import (
-    Comparison,
-    Function,
-    Identifier,
-    IdentifierList,
-    Operation,
-    Parenthesis,
-    Statement,
-    Token,
-    TokenList,
-    Where,
-)
+# Phase 5 (B-01): ``sqlparse`` moved to the opt-in ``[ingest-sql]`` extra.
+# Importing it at module top-level would make every `import
+# agent_knowledgebase.services.where_clause_validator` fail on a default
+# install — including pytest collection of test files that import the
+# error-code constants. We defer the actual import to inside
+# :func:`validate_where_clause` so the module loads without sqlparse and
+# only the validator entrypoint requires the extra. Type checkers still
+# see the real symbols via the ``TYPE_CHECKING`` block.
+# spec_id: 70ab2170-381a-4657-bcd1-28a40c6f369b
+if TYPE_CHECKING:  # pragma: no cover - typing-only
+    from sqlparse.sql import (  # noqa: F401
+        Comparison,
+        Function,
+        Identifier,
+        IdentifierList,
+        Operation,
+        Parenthesis,
+        Statement,
+        Token,
+        TokenList,
+        Where,
+    )
+
+
+# Lazy bindings populated by ``_load_sqlparse``. Module-level so the AST
+# walk helpers can reference them without re-importing on every token.
+_sqlparse = None  # the sqlparse module
+_T = None  # sqlparse.tokens namespace
+_Comparison = None
+_Function = None
+_Identifier = None
+_IdentifierList = None
+_Operation = None
+_Parenthesis = None
+_Statement = None
+_Token = None
+_TokenList = None
+_Where = None
+
+
+def _load_sqlparse() -> None:
+    """Import sqlparse on demand and bind its symbols module-globally.
+
+    Raises a friendly ``RuntimeError`` pointing at the
+    ``[ingest-sql]`` extra when sqlparse isn't installed. The raise is
+    deferred from module-import time so test collection on a default
+    install (which lacks sqlparse) doesn't blow up the moment this
+    module is imported.
+    """
+    global _sqlparse, _T
+    global _Comparison, _Function, _Identifier, _IdentifierList
+    global _Operation, _Parenthesis, _Statement, _Token, _TokenList, _Where
+    if _sqlparse is not None:
+        return
+    try:
+        import sqlparse as _sp
+        from sqlparse import tokens as _sp_tokens
+        from sqlparse.sql import (
+            Comparison as _Comp,
+            Function as _Func,
+            Identifier as _Ident,
+            IdentifierList as _IdentList,
+            Operation as _Op,
+            Parenthesis as _Paren,
+            Statement as _Stmt,
+            Token as _Tok,
+            TokenList as _TokList,
+            Where as _Wh,
+        )
+    except ImportError as exc:  # pragma: no cover - default install case
+        raise RuntimeError(
+            "where-clause validation requires the sqlparse extra; "
+            "install via 'pip install agent-knowledgebase[ingest-sql]'"
+        ) from exc
+    _sqlparse = _sp
+    _T = _sp_tokens
+    _Comparison = _Comp
+    _Function = _Func
+    _Identifier = _Ident
+    _IdentifierList = _IdentList
+    _Operation = _Op
+    _Parenthesis = _Paren
+    _Statement = _Stmt
+    _Token = _Tok
+    _TokenList = _TokList
+    _Where = _Wh
 
 # ---------------------------------------------------------------------------
 # Public API
@@ -201,12 +273,19 @@ def validate_where_clause(where: str) -> None:
     so sqlparse produces a proper :class:`sqlparse.sql.Where` node with
     full structure; this avoids the ambiguity of parsing a bare expression.
 
+    Phase 5 (B-01): sqlparse is now an opt-in dependency from the
+    ``[ingest-sql]`` extra; the import is deferred to here so a default
+    install can still load this module (and pytest can collect tests
+    that import its error-code constants) without sqlparse on disk.
+
     Args:
         where: The raw where-clause string exactly as the caller passed it.
                Leading ``WHERE`` prefix is tolerated and stripped.
 
     Raises:
         WhereClauseValidationError: If any rejected construct is present.
+        RuntimeError: If sqlparse isn't installed (the ``[ingest-sql]``
+            extra wasn't requested).
     """
     if where is None or not str(where).strip():
         raise WhereClauseValidationError(
@@ -217,11 +296,17 @@ def validate_where_clause(where: str) -> None:
     raw = str(where).strip()
 
     # --- Pre-parse string-level guards (literal-aware) -------------------
+    # These don't need sqlparse and run first so we surface the cheap
+    # failure modes without ever loading the parser.
     _reject_backticks(raw)
     _reject_raw_comments(raw)
     non_literal = _strip_literals_and_comments(raw)
     _reject_multi_statement(non_literal)
     _reject_forbidden_keywords(non_literal)
+
+    # The AST walk needs sqlparse — load it now (raises RuntimeError if
+    # the [ingest-sql] extra isn't installed).
+    _load_sqlparse()
 
     # Tolerate a leading ``WHERE`` keyword -- the tool's uri grammar strips
     # it but be defensive.
@@ -229,7 +314,7 @@ def validate_where_clause(where: str) -> None:
 
     wrapped = f"SELECT 1 FROM _t WHERE {stripped}"
     try:
-        parsed = sqlparse.parse(wrapped)
+        parsed = _sqlparse.parse(wrapped)
     except Exception as exc:  # pragma: no cover - sqlparse is forgiving
         raise WhereClauseValidationError(
             code=CODE_PARSE_FAILED,
@@ -247,7 +332,7 @@ def validate_where_clause(where: str) -> None:
             message="where-clause must contain exactly one statement",
         )
 
-    stmt: Statement = parsed[0]
+    stmt = parsed[0]
 
     # --- Top-level sibling check -----------------------------------------
     # sqlparse puts UNION and trailing statements at the Statement level,
@@ -371,13 +456,13 @@ def _reject_forbidden_keywords(non_literal: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _validate_statement_shape(stmt: Statement) -> None:
+def _validate_statement_shape(stmt) -> None:
     """Reject anything at the Statement level that isn't ``SELECT 1 FROM _t [Where] [ws]``.
 
     The string guard already rejected UNION etc., but in case sqlparse
     ever evolves we enforce the expected siblings here too.
     """
-    allowed_top_level_types = (Where,)
+    allowed_top_level_types = (_Where,)
     # Walk the Statement's direct tokens and ensure only: SELECT, 1, FROM,
     # _t Identifier, whitespace, Where, and no other structural tokens.
     for tok in stmt.tokens:
@@ -385,15 +470,15 @@ def _validate_statement_shape(stmt: Statement) -> None:
             continue
         if isinstance(tok, allowed_top_level_types):
             continue
-        if isinstance(tok, Identifier) and tok.value == "_t":
+        if isinstance(tok, _Identifier) and tok.value == "_t":
             continue
-        if tok.ttype is T.Keyword.DML and tok.normalized.upper() == "SELECT":
+        if tok.ttype is _T.Keyword.DML and tok.normalized.upper() == "SELECT":
             continue
-        if tok.ttype is T.Keyword and tok.normalized.upper() == "FROM":
+        if tok.ttype is _T.Keyword and tok.normalized.upper() == "FROM":
             continue
-        if tok.ttype is T.Literal.Number.Integer and tok.value == "1":
+        if tok.ttype is _T.Literal.Number.Integer and tok.value == "1":
             continue
-        if tok.ttype is T.Punctuation:
+        if tok.ttype is _T.Punctuation:
             continue
         # Anything else at the top level means the caller smuggled
         # something past the string guard.
@@ -404,10 +489,10 @@ def _validate_statement_shape(stmt: Statement) -> None:
         )
 
 
-def _find_where(stmt: Statement) -> Where | None:
+def _find_where(stmt):
     """Locate the single Where node inside a wrapped SELECT statement."""
     for tok in stmt.tokens:
-        if isinstance(tok, Where):
+        if isinstance(tok, _Where):
             return tok
     return None
 
@@ -417,35 +502,35 @@ def _find_where(stmt: Statement) -> Where | None:
 # ---------------------------------------------------------------------------
 
 
-def _walk(node: TokenList) -> None:
+def _walk(node) -> None:
     """Recursively validate every token in ``node`` against the allow-list."""
     for tok in node.tokens:
         if _is_ignorable(tok):
             continue
         _check_token(tok)
-        if isinstance(tok, TokenList):
+        if isinstance(tok, _TokenList):
             # Don't recurse into constructs whose children we've already
             # validated structurally (Function already raised; Parenthesis
             # bounds were checked; Operation already raised).
-            if isinstance(tok, (Function, Operation)):
+            if isinstance(tok, (_Function, _Operation)):
                 continue
             _walk(tok)
 
 
-def _is_ignorable(tok: Token) -> bool:
+def _is_ignorable(tok) -> bool:
     """Whitespace / top-level Where-keyword / benign punctuation."""
     if tok.is_whitespace:
         return True
-    if tok.ttype in (T.Whitespace, T.Newline):
+    if tok.ttype in (_T.Whitespace, _T.Newline):
         return True
-    if tok.ttype is T.Keyword and tok.normalized.upper() == "WHERE":
+    if tok.ttype is _T.Keyword and tok.normalized.upper() == "WHERE":
         return True
-    if tok.ttype is T.Punctuation and tok.value != ";":
+    if tok.ttype is _T.Punctuation and tok.value != ";":
         return True
     return False
 
 
-def _check_token(tok: Token) -> None:
+def _check_token(tok) -> None:
     """Reject token ``tok`` if it is outside the allow-list."""
     # 1. Comments
     if tok.ttype is not None and str(tok.ttype).startswith("Token.Comment"):
@@ -457,7 +542,7 @@ def _check_token(tok: Token) -> None:
 
     # 2. Arithmetic / bitwise operations -- sqlparse wraps these in an
     # ``Operation`` TokenList node.  Reject unconditionally.
-    if isinstance(tok, Operation):
+    if isinstance(tok, _Operation):
         raise WhereClauseValidationError(
             code=CODE_ARITHMETIC,
             message="arithmetic or bitwise operations are not allowed",
@@ -465,7 +550,7 @@ def _check_token(tok: Token) -> None:
         )
 
     # 3. Subqueries: Parenthesis containing SELECT.
-    if isinstance(tok, Parenthesis):
+    if isinstance(tok, _Parenthesis):
         if _contains_select(tok):
             raise WhereClauseValidationError(
                 code=CODE_SUBQUERY,
@@ -475,7 +560,7 @@ def _check_token(tok: Token) -> None:
         return  # grouping paren: _walk will recurse
 
     # 4. Function calls.
-    if isinstance(tok, Function):
+    if isinstance(tok, _Function):
         raise WhereClauseValidationError(
             code=CODE_FUNCTION_CALL,
             message="function calls are not allowed in where-clauses",
@@ -483,7 +568,7 @@ def _check_token(tok: Token) -> None:
         )
 
     # 5. Structural TokenLists -- recursion will validate children.
-    if isinstance(tok, (Comparison, Identifier, IdentifierList)):
+    if isinstance(tok, (_Comparison, _Identifier, _IdentifierList)):
         return
 
     # 6. Keyword-level checks.  sqlparse over-tags plain identifiers as
@@ -493,7 +578,7 @@ def _check_token(tok: Token) -> None:
     # - Plain T.Keyword tokens: allowed if in ``_ALLOWED_KEYWORDS`` or
     #   in the AST denylist; otherwise treat as identifier (sqlparse
     #   false-positive).
-    if tok.ttype in (T.Keyword.DML, T.Keyword.DDL, T.Keyword.CTE):
+    if tok.ttype in (_T.Keyword.DML, _T.Keyword.DDL, _T.Keyword.CTE):
         upper = tok.normalized.upper()
         if upper in _AST_LEVEL_FORBIDDEN_KEYWORDS:
             raise WhereClauseValidationError(
@@ -511,7 +596,7 @@ def _check_token(tok: Token) -> None:
             )
         return
 
-    if tok.ttype is T.Keyword:
+    if tok.ttype is _T.Keyword:
         upper = tok.normalized.upper()
         if upper in _AST_LEVEL_FORBIDDEN_KEYWORDS:
             raise WhereClauseValidationError(
@@ -536,7 +621,7 @@ def _check_token(tok: Token) -> None:
         return
 
     # 7. Operators.
-    if tok.ttype is T.Operator.Comparison:
+    if tok.ttype is _T.Operator.Comparison:
         if tok.value in _ALLOWED_COMPARISON_OPERATORS:
             return
         upper = tok.value.upper()
@@ -547,7 +632,7 @@ def _check_token(tok: Token) -> None:
             message=f"comparison operator {tok.value!r} is not allowed",
             offending_token=tok.value,
         )
-    if tok.ttype is T.Operator:
+    if tok.ttype is _T.Operator:
         # Bare ``T.Operator`` -> arithmetic / bitwise / concat.  These
         # are usually caught at the Operation-TokenList level above, but
         # be defensive.
@@ -558,7 +643,7 @@ def _check_token(tok: Token) -> None:
         )
 
     # 8. Wildcards.
-    if tok.ttype is T.Wildcard:
+    if tok.ttype is _T.Wildcard:
         raise WhereClauseValidationError(
             code=CODE_DISALLOWED_OPERATOR,
             message="wildcards (*) are not allowed in where-clauses",
@@ -566,7 +651,7 @@ def _check_token(tok: Token) -> None:
         )
 
     # 9. Bind parameters.
-    if tok.ttype in (T.Name.Placeholder,):
+    if tok.ttype in (_T.Name.Placeholder,):
         raise WhereClauseValidationError(
             code=CODE_DISALLOWED_KEYWORD,
             message="bind parameters are not allowed in where-clauses",
@@ -598,19 +683,19 @@ def _check_token(tok: Token) -> None:
     )
 
 
-def _contains_select(node: TokenList) -> bool:
+def _contains_select(node) -> bool:
     """True if any descendant token is the ``SELECT`` keyword (DML)."""
     for tok in _iter_all_tokens(node):
         if (
-            tok.ttype in (T.Keyword.DML, T.Keyword)
+            tok.ttype in (_T.Keyword.DML, _T.Keyword)
             and tok.normalized.upper() == "SELECT"
         ):
             return True
     return False
 
 
-def _iter_all_tokens(node: TokenList) -> Iterable[Token]:
+def _iter_all_tokens(node) -> "Iterable":
     for tok in node.tokens:
         yield tok
-        if isinstance(tok, TokenList):
+        if isinstance(tok, _TokenList):
             yield from _iter_all_tokens(tok)

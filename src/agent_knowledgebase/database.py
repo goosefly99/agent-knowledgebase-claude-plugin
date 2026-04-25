@@ -236,6 +236,20 @@ class Database:
                 added_provider_snapshot = True
         if added_provider_snapshot:
             self._conn.commit()
+        # Phase 5 (I-07) — composite index on (kb_id, embedder_version)
+        # for the per-ingest mixed-version probe in
+        # :meth:`get_embedder_versions`. The probe runs once per ingest
+        # under the per-kb_id lock; without this index a 100k-chunk KB
+        # paid a full table scan because the existing single-column
+        # ``kb_id`` filter would still need a row read for each match
+        # to fetch the embedder_version. ``IF NOT EXISTS`` keeps the
+        # migration idempotent across re-opens.
+        # spec_id: 70ab2170-381a-4657-bcd1-28a40c6f369b
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_chunks_kb_embedder_version "
+            "ON chunks (kb_id, embedder_version)"
+        )
+        self._conn.commit()
 
     # ------------------------------------------------------------------
     # Connection lifecycle

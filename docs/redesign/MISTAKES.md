@@ -108,6 +108,33 @@ Source: validation finding f-11.
 
 ---
 
+### M-04 — Don't ship config knobs without their consumer
+
+> **Don't add Settings fields + helpers for behavior that isn't actually
+> wired into the runtime path.**
+
+The Phase 5 spec called for fastembed-specific MMR lambda re-tuning, so
+the initial v0.11.0 cut added `query_mmr_lambda_default` /
+`query_mmr_lambda_fastembed` Settings fields and a
+`services.query.mmr_lambda_for(settings, embedder)` helper. Code review
+(B-03) caught that **MMR was never implemented in `QueryOrchestrator`**
+— `query` / `search` / `hybrid_query` all use raw cosine + FTS rank,
+with no diversity-bias rerank pass anywhere. Shipping config surface
+without an implementation is exactly the "ship vaporware" trap a
+careful reviewer rejects.
+
+**Correct approach:** the `tests/test_fastembed_recall_parity.py`
+Jaccard@10 ≥ 0.95 result on a fixed corpus is the empirical safety net
+that makes fastembed swappable with sentence-transformers without
+rerank tuning. Delete the dead config + helper; document the deferral;
+re-introduce the knobs only when the rerank pass that would consume
+them lands in the same PR. General rule: every new Settings field
+should answer "what code path reads this *today*?"
+
+Source: code-quality reviewer Phase 5 follow-up B-03.
+
+---
+
 ## How to add new entries
 
 1. Encounter a mistake → fix it → write a one-sentence note here describing

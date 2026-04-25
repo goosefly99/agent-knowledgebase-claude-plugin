@@ -66,16 +66,17 @@ are NOT interchangeable with sentence-transformers-MiniLM-fp32
 vectors — Phase 5 enforces this via per-chunk `embedder_version`
 stamping.
 
-### `ingest-codebase` — tree-sitter (~120 MB)
+### `ingest-codebase` — placeholder (0 MB)
 
 | Package | ~Size | Why opt-in |
 |---|---|---|
-| `tree-sitter` | ~10 MB | Parser engine. |
-| `tree-sitter-languages` | ~110 MB | Pre-built grammars for ~40 langs. |
-| **Extra adds** | **~120 MB** | — |
+| _(none)_ | 0 MB | Codebase ingestion uses regex-based symbol detection — no tree-sitter dependency in v0.11.0. |
+| **Extra adds** | **0 MB** | — |
 
-When to install: you ingest `source_type=codebase`. Skip if you only
-ingest files / websites / api_endpoints.
+The `[ingest-codebase]` extra is retained as an empty placeholder for a
+future tree-sitter-backed chunker. Today, `source_type=codebase`
+ingestion needs no extra dependency — symbols are detected via regex.
+Installing this extra is a no-op on v0.11.0.
 
 ### `ingest-file` — pdfplumber (~30 MB)
 
@@ -118,10 +119,10 @@ needs neither this nor any other extra.
 | Default | ~700 MB | baseline |
 | Default + `embed-local-onnx` | ~850 MB | +150 MB |
 | Default + `embed-local-st` | ~2.0 GB | +1.3 GB |
-| Default + `ingest-codebase` | ~820 MB | +120 MB |
+| Default + `ingest-codebase` | ~700 MB | +0 MB (placeholder) |
 | Default + `ingest-file` | ~730 MB | +30 MB |
 | Default + `ingest-sql` | ~750 MB | +50 MB |
-| `all` | ~2.2 GB | +1.5 GB |
+| `all` | ~2.0 GB | +1.3 GB |
 
 ## Regenerating `requirements.lock`
 

@@ -27,10 +27,13 @@ dependencies = [
 [project.optional-dependencies]
 embed-local-onnx = ["qdrant-fastembed>=0.4"]
 embed-local-st = ["sentence-transformers>=3.0"]
-ingest-codebase = [
-    "tree-sitter>=0.22",
-    "tree-sitter-languages>=1.10",
-]
+# I-03: codebase ingestion uses regex-based symbol detection — there is
+# no tree-sitter import anywhere in src/. The extra is retained as an
+# empty placeholder so callers depending on the name don't break, and so
+# a future tree-sitter-backed chunker can land here without renaming the
+# extra group.
+# spec_id: 70ab2170-381a-4657-bcd1-28a40c6f369b
+ingest-codebase = []  # placeholder; future tree-sitter chunking will land here
 ingest-file = ["pdfplumber>=0.11"]
 ingest-sql = [
     "sqlalchemy>=2.0",
@@ -40,8 +43,6 @@ pinecone = ["pinecone-client>=3.0"]
 all = [
     "qdrant-fastembed>=0.4",
     "sentence-transformers>=3.0",
-    "tree-sitter>=0.22",
-    "tree-sitter-languages>=1.10",
     "pdfplumber>=0.11",
     "sqlalchemy>=2.0",
     "sqlparse>=0.5",

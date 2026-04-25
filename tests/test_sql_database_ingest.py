@@ -28,6 +28,14 @@ import sqlite3
 from pathlib import Path
 
 import pytest
+
+# Phase 5 (B-01): the [ingest-sql] extra is opt-in; skip the entire
+# module gracefully when sqlparse / sqlalchemy aren't installed instead
+# of failing pytest collection. Mirror the test_fastembed_*.py pattern.
+# spec_id: 70ab2170-381a-4657-bcd1-28a40c6f369b
+pytest.importorskip("sqlparse")
+pytest.importorskip("sqlalchemy")
+
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import OperationalError
 

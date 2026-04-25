@@ -330,40 +330,16 @@ class Settings(BaseSettings):
     )
 
     # --- MMR (Maximal Marginal Relevance) tuning — Phase 5 ---
-    # MMR balances result relevance (lambda close to 1.0) against
-    # diversity (lambda close to 0.0). The default is tuned for the
-    # current chromadb cosine-distance default; fastembed's int8
-    # quantization compresses vector magnitudes, which inflates the
-    # raw similarity span between near-duplicates and pushes
-    # near-equal candidates closer together. To recover the same
-    # diversity character, the fastembed-specific lambda is biased a
-    # touch lower so the diversity term has more room to operate.
-    #
-    # Validation finding f-09 sharpening: empirically, sentence-
-    # transformers fp32 MiniLM and fastembed int8 MiniLM produce
-    # Jaccard@10 >= 0.95 on a fixed small corpus (test_fastembed_
-    # recall_parity), so the underlying neighbour set is the same;
-    # the lambda delta is purely about how MMR's distance term
-    # behaves under int8 quantization noise.
-    query_mmr_lambda_default: float = Field(
-        default=0.5,
-        ge=0.0,
-        le=1.0,
-        description="MMR lambda for non-fastembed embedders (fp32-class). "
-        "Higher = more relevance-biased; lower = more diversity-biased. "
-        "spec_id: 70ab2170-381a-4657-bcd1-28a40c6f369b",
-    )
-    query_mmr_lambda_fastembed: float = Field(
-        default=0.4,
-        ge=0.0,
-        le=1.0,
-        description="MMR lambda for fastembed (int8 ONNX) embedders. "
-        "Slightly lower than the default to compensate for int8 "
-        "quantization compressing the similarity span between near-"
-        "duplicates — without the bump, MMR's diversity term loses "
-        "headroom and results feel more redundant. spec_id: "
-        "70ab2170-381a-4657-bcd1-28a40c6f369b",
-    )
+    # B-03: the v0.11.0 release initially shipped two
+    # ``query_mmr_lambda_*`` fields and a ``services.query.mmr_lambda_for``
+    # helper. Code-review caught that nothing in
+    # :class:`QueryOrchestrator` actually wires MMR into the query path,
+    # so the fields + helper were dead surface. Both were removed in the
+    # follow-up. The empirical Jaccard@10 ≥ 0.95 parity result between
+    # fastembed-int8 and ST-fp32 (see
+    # ``tests/test_fastembed_recall_parity.py``) is the live safety net
+    # for the fastembed swap; MMR re-tuning is deferred until an actual
+    # MMR rerank pass lands. spec_id: 70ab2170-381a-4657-bcd1-28a40c6f369b
 
     # --- Ingest ---
     ingest_excluded_dirs: list[str] | str = Field(

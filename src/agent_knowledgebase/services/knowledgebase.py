@@ -92,9 +92,19 @@ class EmbedderVersionMismatchError(RuntimeError):
 
     Bypass: set ``AGENT_KB_AUTO_REEMBED=1`` in the environment when
     intentionally re-embedding an existing KB under a new embedder.
-    Operators should typically follow up with a re-ingest of the
-    older chunks under the new embedder, or accept that
-    cross-version retrieval will be noisy.
+
+    **IMPORTANT after bypass.** The bypass disables *this rejection
+    only* — it does NOT touch the chunks already stored under the OLD
+    embedder version. The result is a permanently mixed-version KB
+    where the snapshot resolver picks the dominant tuple at query time
+    and the minority chunks return wrong-geometry vectors that will
+    rank arbitrarily badly. To avoid silently-unreachable chunks, the
+    operator MUST re-ingest the prior chunks under the new embedder
+    (preferred), or call ``kb_delete`` and recreate the KB before
+    re-ingesting from raw sources. Using the bypass and then leaving
+    the KB in mixed state is a footgun; Phase 5 emits a structured
+    stderr ``MIXED_EMBEDDER_VERSIONS_DETECTED`` warning at query time
+    so the situation is visible to operators.
 
     spec_id: 70ab2170-381a-4657-bcd1-28a40c6f369b
     """
@@ -116,7 +126,11 @@ class EmbedderVersionMismatchError(RuntimeError):
             f"EMBEDDER_VERSION_MISMATCH: kb_id={kb_id!r} already carries "
             f"chunks under embedder_version(s) {existing_repr}; refusing "
             f"to ingest under {incoming_version!r}. Set "
-            f"AGENT_KB_AUTO_REEMBED=1 to bypass."
+            f"AGENT_KB_AUTO_REEMBED=1 to bypass — but re-ingest the "
+            f"prior chunks under the new embedder afterwards (or "
+            f"kb_delete + recreate), otherwise the KB ends up in a "
+            f"permanently mixed state where the minority-version chunks "
+            f"are silently unreachable at query time."
         )
 
     def to_payload(self) -> dict[str, object]:
@@ -235,12 +249,136 @@ class KnowledgebaseService:
         ] = {}
         self._query_embedder_cache_lock: threading.Lock = threading.Lock()
 
+        # Phase 5 (I-04): per-process set of kb_ids for which we've
+        # already emitted the MIXED_EMBEDDER_VERSIONS_DETECTED warning,
+        # so the structured stderr line fires at most once per KB per
+        # process. Reset on per-KB backend invalidation so a kb_delete +
+        # recreate gets a fresh emission.
+        # spec_id: 70ab2170-381a-4657-bcd1-28a40c6f369b
+        self._mixed_version_warned: set[str] = set()
+        self._mixed_version_warned_lock: threading.Lock = threading.Lock()
+
+        # Phase 5 (B-02): per-process set of kb_ids we've already
+        # auto-backfilled in this process. Idempotent guard so the
+        # legacy-NULL detection runs at most once per kb_id per process,
+        # even though the snapshot read itself is also idempotent (a
+        # second backfill writes 0 rows because the COALESCE makes the
+        # WHERE NULL filter exclude already-stamped rows). The set
+        # avoids a redundant SQL UPDATE on every query.
+        # spec_id: 70ab2170-381a-4657-bcd1-28a40c6f369b
+        self._auto_backfilled_kbs: set[str] = set()
+        self._auto_backfilled_kbs_lock: threading.Lock = threading.Lock()
+
     @property
     def _embedder(self) -> Embedder:
         """Lazily instantiate the embedder on first use."""
         if self._embedder_instance is None:
             self._embedder_instance = create_embedder(self._config)
         return self._embedder_instance
+
+    @staticmethod
+    def _is_legacy_ollama_model(model_name: str) -> bool:
+        """True when *model_name* is a known historical v0.6.0 Ollama default.
+
+        The Phase 4 backfill required operators to call
+        ``backfill_provider_snapshot`` before adopting Phase 5; the
+        Phase 5 follow-up (B-02) adds an automatic backfill for the
+        single most-common case: KBs ingested under the
+        ``qwen3-embedding:8b`` Ollama default that v0.6.0 shipped with.
+        New historical defaults (if any are added) extend the prefix
+        list here. spec_id: 70ab2170-381a-4657-bcd1-28a40c6f369b
+        """
+        return model_name.startswith("qwen3-embedding")
+
+    def _auto_backfill_legacy_ollama(self, kb_id: str, model_name: str) -> None:
+        """Stamp ``provider='ollama'`` + Ollama default base_url for *kb_id*.
+
+        Idempotent — guarded by ``_auto_backfilled_kbs``. Emits a
+        structured ``LEGACY_OLLAMA_KB_BACKFILLED`` stderr line so
+        operators see the auto-fix happen. The actual UPDATE is scoped
+        to chunks whose stamped model matches *model_name* so a
+        heterogeneous KB doesn't get other-model rows misstamped.
+        spec_id: 70ab2170-381a-4657-bcd1-28a40c6f369b
+        """
+        from agent_knowledgebase.services.embeddings import DEFAULT_OLLAMA_BASE_URL
+
+        with self._auto_backfilled_kbs_lock:
+            if kb_id in self._auto_backfilled_kbs:
+                return
+            ctx = self._ctx(kb_id)
+            rows_updated = ctx.db.backfill_embedding_snapshot(
+                kb_id=kb_id,
+                provider="ollama",
+                base_url=DEFAULT_OLLAMA_BASE_URL,
+                embedding_model=model_name,
+            )
+            self._auto_backfilled_kbs.add(kb_id)
+        knowledgebase_stderr_log(
+            kb_id=kb_id,
+            op="backfill_legacy",
+            phase="auto",
+            elapsed_ms=0,
+            rows_in=rows_updated,
+            rows_ok=rows_updated,
+            rows_skipped=0,
+            rows_failed=0,
+            dedup_policy="n/a",
+            request_id=None,
+            tool_caller_version=None,
+            error_code="LEGACY_OLLAMA_KB_BACKFILLED",
+            error_message=(
+                f"auto-backfilled provider='ollama' / base_url="
+                f"{DEFAULT_OLLAMA_BASE_URL!r} for legacy v0.6.0 KB "
+                f"with model={model_name!r}; {rows_updated} chunks updated"
+            ),
+        )
+
+    def _maybe_warn_mixed_versions(self, kb_id: str) -> None:
+        """Emit MIXED_EMBEDDER_VERSIONS_DETECTED at most once per kb_id per process.
+
+        Cheap probe via :meth:`Database.get_embedder_versions` (indexed
+        on (kb_id, embedder_version) since I-07). Suppression set guards
+        against repeated emission for the same KB; the set is reset on
+        per-KB backend invalidation so a kb_delete + recreate gets a
+        fresh emission if appropriate. spec_id:
+        70ab2170-381a-4657-bcd1-28a40c6f369b
+        """
+        if kb_id in self._mixed_version_warned:
+            return
+        ctx = self._ctx(kb_id)
+        try:
+            versions = ctx.db.get_embedder_versions(kb_id)
+        except Exception:  # noqa: BLE001 — diagnostic path; never raise
+            return
+        if len(versions) <= 1:
+            return
+        with self._mixed_version_warned_lock:
+            if kb_id in self._mixed_version_warned:
+                return
+            self._mixed_version_warned.add(kb_id)
+        version_list = sorted(versions)
+        knowledgebase_stderr_log(
+            kb_id=kb_id,
+            op="snapshot_resolve",
+            phase="warn",
+            elapsed_ms=0,
+            rows_in=0,
+            rows_ok=0,
+            rows_skipped=0,
+            rows_failed=0,
+            dedup_policy="n/a",
+            request_id=None,
+            tool_caller_version=None,
+            error_code="MIXED_EMBEDDER_VERSIONS_DETECTED",
+            error_message=(
+                f"kb_id={kb_id!r} carries chunks under multiple "
+                f"embedder_version values {version_list}; the snapshot "
+                f"resolver picks the dominant tuple, so minority-version "
+                f"chunks are silently unreachable at query time. "
+                f"Re-ingest minority chunks under the dominant embedder "
+                f"or kb_delete + recreate."
+            ),
+        )
 
     def _query_embedder_for(self, kb_id: str) -> Embedder:
         """Return the :class:`Embedder` to use when querying *kb_id*.
@@ -261,6 +399,30 @@ class KnowledgebaseService:
         configured embedder when the KB has no chunks yet or no
         ``embedding_model`` metadata (pre-0.7 ingestions).
 
+        Phase 5 (B-02) — auto-backfill legacy v0.6.0 KBs. When a KB's
+        snapshot is ``(model, None, None)`` AND the model is a known
+        historical Ollama default (``qwen3-embedding...``), backfill
+        ``provider='ollama'`` + ``base_url='http://127.0.0.1:11434'``
+        for that kb_id and re-read the snapshot. Without this auto-
+        backfill, an operator who jumps v0.6.0 → v0.11.0 directly
+        without running ``backfill_provider_snapshot`` first would hit
+        ``ValueError("AGENT_KB_EMBED_API_KEY required for remote
+        embeddings")`` on first ``kb_query`` because the snapshot would
+        resolve to the post-flip default. Idempotent — guarded by an
+        in-process set so a second call skips the SQL probe entirely.
+        Emits a ``LEGACY_OLLAMA_KB_BACKFILLED`` structured stderr line
+        so operators see what happened.
+        spec_id: 70ab2170-381a-4657-bcd1-28a40c6f369b
+
+        Phase 5 (I-04) — emit a structured
+        ``MIXED_EMBEDDER_VERSIONS_DETECTED`` warning at most once per
+        kb_id per process when the KB carries chunks under more than
+        one ``embedder_version`` (the documented but dangerous result
+        of ``AGENT_KB_AUTO_REEMBED=1`` without follow-up re-ingest).
+        Minority-version chunks are silently unreachable at query time
+        because the snapshot resolver picks the dominant tuple; the
+        warning makes that visible to operators.
+
         Performance (I-01): the snapshot read uses sqlite-side
         aggregation (single index pass, no Python-side json.loads), and
         the rebuilt embedder is cached per
@@ -275,14 +437,63 @@ class KnowledgebaseService:
         if snapshot is None:
             return self._embedder
         dominant_model, dominant_provider, dominant_base_url = snapshot
+        # B-02 auto-backfill: legacy v0.6.0 KBs stamped only the model
+        # name in chunk metadata; provider + base_url are NULL. After
+        # the Phase 5 default flip to provider='remote' the snapshot
+        # would resolve to (model, None, None) and fall through to
+        # _build_embedder with the global remote config — which raises
+        # if no API key is set. Detect the legacy NULL-provider shape
+        # and stamp the historical Ollama defaults onto the kb's chunks
+        # so the snapshot becomes (model, 'ollama', '<ollama-url>') and
+        # the Phase 4 rebuild path picks up the original embedder
+        # cleanly.
+        if (
+            dominant_model is not None
+            and dominant_provider is None
+            and dominant_base_url is None
+            and self._is_legacy_ollama_model(dominant_model)
+            and kb_id not in self._auto_backfilled_kbs
+        ):
+            self._auto_backfill_legacy_ollama(kb_id, dominant_model)
+            # Re-read the snapshot now that the columns are populated.
+            snapshot = ctx.db.get_embedding_snapshot(kb_id)
+            if snapshot is None:
+                return self._embedder
+            dominant_model, dominant_provider, dominant_base_url = snapshot
+        # I-04 mixed-version detection. Cheap probe via the indexed
+        # column. We don't bail or fall back — the dominant snapshot is
+        # still our best resolution — but we surface the situation to
+        # operators so they know to re-ingest the minority chunks (or
+        # accept the silent unreachability).
+        self._maybe_warn_mixed_versions(kb_id)
         if dominant_model is None:
             return self._embedder
         # When the snapshot's tuple matches the currently-configured
         # embedder we can return the cached instance and skip a fresh
         # build; otherwise rebuild via the snapshot so the right
         # provider+base_url is wired in.
+        #
+        # B-02 ordering: when the global ``self._embedder`` is already
+        # instantiated (lazy create finished, or a test injected it
+        # directly), comparing against its ``model_name`` is the
+        # canonical historical check — preserved here for existing
+        # tests + production paths. When the global embedder has NOT
+        # been instantiated yet, fall back to
+        # ``self._config.embedding_model`` for the comparison so a
+        # legacy-Ollama-snapshot KB (which never needs the global
+        # embedder anyway) never triggers the lazy ``create_embedder``
+        # path that would raise ValueError on a broken global config
+        # (e.g. provider='remote' with no API key after the Phase 5
+        # flip). This preserves the v0.10.x behaviour where
+        # already-instantiated embedders are reused, AND fixes the
+        # B-02 startup-on-broken-global trap.
+        comparison_model_name = (
+            self._embedder_instance.model_name
+            if self._embedder_instance is not None
+            else self._config.embedding_model
+        )
         if (
-            dominant_model == self._embedder.model_name
+            dominant_model == comparison_model_name
             and (
                 dominant_provider is None
                 or dominant_provider == self._config.embedding_provider
@@ -375,6 +586,22 @@ class KnowledgebaseService:
             else:
                 self._backends_per_kb.pop(kb_id, None)
         self._invalidate_query_embedder_cache(kb_id)
+        # I-04: clear the per-process MIXED_EMBEDDER_VERSIONS_DETECTED
+        # warning suppression set so a kb_delete + recreate (or migrate
+        # cutover) gets a fresh emission if the new state is again
+        # mixed.
+        # B-02: clear the per-process auto-backfill suppression set so
+        # a recreated KB gets re-checked.
+        with self._mixed_version_warned_lock:
+            if kb_id is None:
+                self._mixed_version_warned.clear()
+            else:
+                self._mixed_version_warned.discard(kb_id)
+        with self._auto_backfilled_kbs_lock:
+            if kb_id is None:
+                self._auto_backfilled_kbs.clear()
+            else:
+                self._auto_backfilled_kbs.discard(kb_id)
 
     def _get_kb_lock(self, kb_id: str) -> threading.Lock:
         """Return (creating lazily) the per-kb_id ingestion lock.

@@ -74,29 +74,18 @@ def default_top_k(settings: "Settings") -> int:
     return settings.query_default_top_k
 
 
-def mmr_lambda_for(settings: "Settings", embedder: Embedder) -> float:
-    """Return the MMR lambda tuned for the *embedder*'s vector geometry.
-
-    Phase 5 introduced fastembed (int8 ONNX) as an opt-in provider.
-    Empirically, int8 quantization compresses the raw similarity span
-    between near-duplicates relative to fp32 sentence-transformers
-    vectors, so MMR's diversity term loses headroom under the default
-    lambda. Routing fastembed embedders through
-    ``Settings.query_mmr_lambda_fastembed`` (a touch lower than the
-    default) restores the same diversity character.
-
-    Detection is heuristic but conservative: any embedder whose
-    :attr:`Embedder.embedder_version` starts with ``"fastembed/"`` is
-    treated as fastembed-class. New ``Embedder`` implementations that
-    use int8 quantization can opt in by following the same prefix
-    convention.
-
-    spec_id: 70ab2170-381a-4657-bcd1-28a40c6f369b
-    """
-    version = getattr(embedder, "embedder_version", "")
-    if isinstance(version, str) and version.startswith("fastembed/"):
-        return settings.query_mmr_lambda_fastembed
-    return settings.query_mmr_lambda_default
+# B-03: ``mmr_lambda_for`` and the matching ``Settings.query_mmr_lambda_*``
+# fields were deleted in v0.11.0 follow-up. Nothing in
+# :class:`QueryOrchestrator` actually invokes MMR re-ranking — the chunk
+# path uses raw cosine + FTS rank — so shipping the helper + config knobs
+# without the rerank pass was unimplemented surface. The
+# ``test_fastembed_recall_parity`` Jaccard@10 ≥ 0.95 result demonstrates
+# fastembed-int8 and ST-fp32 already produce nearly-identical neighbour
+# sets, removing the empirical motivation for fastembed-specific MMR
+# tuning. If a future version of the orchestrator wires MMR into the
+# query path, the helper can be re-introduced alongside the actual
+# rerank logic.
+# spec_id: 70ab2170-381a-4657-bcd1-28a40c6f369b
 
 
 # ---------------------------------------------------------------------------
