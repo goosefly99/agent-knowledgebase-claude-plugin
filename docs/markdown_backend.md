@@ -219,6 +219,13 @@ The FTS5 connection is per-`kb_id` and **invalidated on every
 no on-disk persistence of the FTS5 index — the markdown files
 themselves are the source of truth.
 
+Connections are built with `check_same_thread=False` and all access
+to the per-`kb_id` cache and to each cached connection's sqlite
+operations is serialized through a `threading.Lock` (`_fts_lock`),
+so concurrent `search()` / `index()` / `delete()` calls on the same
+`kb_id` from different threads behave correctly — see the module
+docstring `Thread-safe:` line.
+
 ---
 
 ## Probe-4 contract
@@ -235,6 +242,15 @@ themselves are the source of truth.
 
 `None` here means **present with value `None`** — never omitted
 (validation finding f-20).
+
+> **"First page" rule.** "First page" here means the
+> **slug-alphabetical-first** page in `pages/` (the first entry
+> returned by walking `pages/*.md` sorted ascending). This is
+> deterministic but arbitrary — not the first by ingest time, not
+> the most queried. Operators wanting KB-level summary statistics
+> (counts by source_type, recent timestamps, etc.) should wait for
+> the future Phase 4 `kb_info` aggregates; today's `info()` shape is
+> pinned to the probe-4 contract for backward compatibility.
 
 Backend-diagnostic fields like `vector_count` / `embedding_provider`
 likewise surface as `None`.
@@ -263,13 +279,31 @@ The Phase 3 MVP is **deliberately small**. Future enhancements:
    `delete + index` so the round-trip works at the service level.
 4. **No `filters` pushdown beyond `source_type` / `slug`.** The
    chromadb backend's `where=` machinery is not yet mirrored.
-5. **No cross-process serialization.** The same `threading.Lock`
-   per `kb_id` from `KnowledgebaseService` protects single-process
-   ingest; multi-process deployments need the same `filelock` /
-   `flock` recipe documented in `docs/cross-process-lock-recipe.md`.
+5. **In-process threading is safe; cross-process is not.** The
+   per-`kb_id` `threading.Lock` from `KnowledgebaseService` and the
+   backend's own `_fts_lock` together serialize concurrent
+   `index()` / `search()` / `delete()` calls on the same `kb_id`
+   inside one Python process — including the MCP tool-timeout worker
+   thread that may invoke a tool from a different thread than the
+   one that built the FTS5 in-memory cache. Multi-process
+   deployments still need the `filelock` / `flock` recipe documented
+   in `docs/cross-process-lock-recipe.md`; the in-memory FTS5 cache
+   is per-process and offers no cross-process coherence.
 6. **Categories = `source_type` for v0.** Sharded index categorisation
    is a placeholder; LLM topic clustering or tag-based bucketing is
    future work.
+7. **Ingest is not transactional across files.** `_write_one` writes
+   raw → page → log as three separate calls and a multi-document
+   `index()` call writes those triples per-document, with no
+   cross-doc transaction. Each individual file write is per-file
+   atomic via `tempfile + os.replace`, so a crash mid-write never
+   produces a half-written file; but a crash mid-batch can leave
+   the wiki with an orphan raw file (crash between raw and page),
+   an unlogged page (crash between page and log), or a partially
+   ingested batch (crash between docs N and N+1). Recovery: rerun
+   `kb_ingest` / `kb_ingest_batch` for the same source_id(s) — page
+   writes are idempotent overwrites and the duplicated raw is
+   harmless.
 
 ---
 

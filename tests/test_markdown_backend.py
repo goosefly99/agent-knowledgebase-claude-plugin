@@ -425,3 +425,218 @@ def test_get_backend_factory_returns_markdown_when_settings_say_markdown(
     settings = Settings(saves_dir=saves, kb_backend="markdown").resolve_paths()
     backend = get_backend(settings)
     assert isinstance(backend, MarkdownWikiBackend)
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 review I-2: stale shard dir cleanup when delete drops below threshold
+# ---------------------------------------------------------------------------
+
+
+def test_delete_below_shard_threshold_removes_stale_shard_dir(
+    markdown_backend: MarkdownWikiBackend,
+) -> None:
+    """Going sharded then back below ``_SHARD_THRESHOLD`` (200) must
+    drop the ``wiki/index/`` shard directory and restore the flat
+    top-level ``index.md`` form.
+
+    Regression for code-quality review I-2: previously
+    ``_write_flat_index`` had a comment about cleanup but no code,
+    so stale ``wiki/index/<category>.md`` files persisted after a
+    delete that crossed back below the threshold.
+    """
+    kb_id = "kb-shrink"
+    # 1. Ingest 250 docs -> sharded form (>200 threshold).
+    docs = [
+        _make_doc(
+            source_type="file" if i % 2 == 0 else "website",
+            title=f"Article {i:03d}",
+            content=f"Body of article {i}, mentioning topic alpha.",
+            uri=f"/tmp/article-{i:03d}.txt",
+            doc_id=f"src-{i:03d}",
+        )
+        for i in range(250)
+    ]
+    markdown_backend.index(kb_id=kb_id, documents=docs)
+
+    wiki_root = markdown_backend._wiki_root(kb_id)
+    index_dir = wiki_root / "index"
+    # Pre-condition: sharded form is on disk.
+    assert index_dir.is_dir(), "expected sharded form before delete"
+    assert (index_dir / "file.md").is_file()
+    assert (index_dir / "website.md").is_file()
+    top_before = (wiki_root / "index.md").read_text(encoding="utf-8")
+    assert "Wiki Index (sharded)" in top_before
+
+    # 2. Delete enough pages to drop back below 200 (delete 100 -> 150
+    # remaining, well under threshold).
+    for i in range(100):
+        markdown_backend.delete(kb_id=kb_id, source_id=f"src-{i:03d}")
+
+    # 3. Post-condition: flat form, no shard dir.
+    assert markdown_backend.count(kb_id=kb_id) == 150
+    assert not index_dir.exists(), (
+        "expected wiki/index/ shard directory to be removed when "
+        "page count crossed back below the shard threshold"
+    )
+    top_after = (wiki_root / "index.md").read_text(encoding="utf-8")
+    assert "# Wiki Index" in top_after
+    assert "Wiki Index (sharded)" not in top_after, (
+        "top-level index.md should be the flat form, not the pointer form"
+    )
+    assert "_Pages: 150" in top_after
+
+    # info()['sharded_index'] should also reflect the cleanup.
+    info = markdown_backend.info(kb_id=kb_id)
+    assert info["sharded_index"] is False
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 review I-3: kb_id / source_id path-traversal sanitization
+# ---------------------------------------------------------------------------
+
+
+def test_kb_id_with_traversal_components_stays_inside_saves_dir(
+    tmp_path: Path,
+) -> None:
+    """A hostile ``kb_id`` (``"../escape"``) must NOT escape ``saves_dir``.
+
+    Regression for code-quality review I-3: the service-less
+    ``_kb_root`` fallback previously composed ``saves_dir / kb_id``
+    verbatim, which let ``kb_id="../escape"`` resolve to
+    ``<saves_dir>/../escape`` — outside the saves boundary.
+    """
+    saves = tmp_path / "saves"
+    saves.mkdir()
+    settings = Settings(saves_dir=saves, kb_backend="markdown").resolve_paths()
+    backend = MarkdownWikiBackend(settings, service=None)
+
+    doc = _make_doc(
+        source_type="file",
+        title="hello",
+        content="hello world",
+        uri="/tmp/hello.txt",
+        doc_id="src-hello",
+    )
+    # The hostile kb_id must NOT raise, but the resulting path MUST
+    # be inside saves_dir (the sanitizer maps "../escape" -> "escape").
+    backend.index(kb_id="../escape", documents=[doc])
+    saves_resolved = saves.resolve()
+    kb_root = backend._kb_root("../escape").resolve()
+    assert str(kb_root).startswith(str(saves_resolved)), (
+        f"kb_root {kb_root!r} escaped saves_dir {saves_resolved!r}"
+    )
+
+    # And the would-be escape path on disk must NOT exist.
+    escape_target = (saves.parent / "escape").resolve()
+    assert not escape_target.exists(), (
+        f"path-traversal target {escape_target!r} was created on disk; "
+        "kb_id sanitization failed"
+    )
+
+
+def test_source_id_with_traversal_components_stays_inside_raw_dir(
+    markdown_backend: MarkdownWikiBackend,
+) -> None:
+    """A hostile ``doc.id`` (``"../escape"``) must NOT escape ``raw/``.
+
+    Regression for code-quality review I-3: ``_write_one`` previously
+    composed ``raw_dir / f"{source_id}.{ext}"`` verbatim, so a doc
+    with ``id="../escape"`` would write to
+    ``<raw_dir>/../escape.txt`` — i.e. one level up, into ``wiki/``.
+    """
+    kb_id = "kb-traversal-sid"
+    doc = _make_doc(
+        source_type="file",
+        title="hostile",
+        content="should land safely under raw/",
+        uri="/tmp/hostile.txt",
+        doc_id="../escape",
+    )
+    markdown_backend.index(kb_id=kb_id, documents=[doc])
+
+    raw_dir = markdown_backend._raw_dir(kb_id).resolve()
+    raw_files = list(raw_dir.glob("*"))
+    assert raw_files, "expected at least one raw file under raw/"
+    for raw_file in raw_files:
+        assert str(raw_file.resolve()).startswith(str(raw_dir)), (
+            f"raw file {raw_file!r} escaped raw_dir {raw_dir!r}"
+        )
+
+    # The would-be escape target ("../escape.txt" relative to raw/)
+    # would land in the wiki/ root — assert that path was NOT created.
+    wiki_root = markdown_backend._wiki_root(kb_id)
+    assert not (wiki_root / "escape.txt").exists(), (
+        "source_id sanitization let a raw file escape into wiki/"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 review I-1: FTS5 thread safety smoke test
+# ---------------------------------------------------------------------------
+
+
+def test_concurrent_search_and_index_does_not_raise(
+    markdown_backend: MarkdownWikiBackend,
+) -> None:
+    """Concurrent ``index()`` + ``search()`` from multiple threads on
+    the same ``kb_id`` must not raise ``sqlite3.ProgrammingError``
+    or corrupt the cache.
+
+    Regression for code-quality review I-1: pre-fix, the FTS5
+    connection was built with the default ``check_same_thread=True``
+    so any cross-thread reuse raised ``ProgrammingError``; the lock
+    addition makes concurrent access serialize cleanly.
+    """
+    import threading
+
+    kb_id = "kb-thread"
+    # Seed the KB so the FTS5 cache is buildable.
+    seed_doc = _make_doc(
+        source_type="file", title="seed",
+        content="seed content for FTS5 thread test",
+        uri="/tmp/seed.txt", doc_id="src-seed",
+    )
+    markdown_backend.index(kb_id=kb_id, documents=[seed_doc])
+
+    errors: list[BaseException] = []
+    barrier = threading.Barrier(8)
+
+    def search_worker(idx: int) -> None:
+        try:
+            barrier.wait(timeout=5.0)
+            for _ in range(10):
+                markdown_backend.search(
+                    kb_id=kb_id, text="seed content", top_k=5
+                )
+        except BaseException as exc:  # noqa: BLE001 — propagate to assertion
+            errors.append(exc)
+
+    def index_worker(idx: int) -> None:
+        try:
+            barrier.wait(timeout=5.0)
+            for j in range(5):
+                doc = _make_doc(
+                    source_type="file",
+                    title=f"t{idx}-{j}",
+                    content=f"thread {idx} doc {j} payload alpha",
+                    uri=f"/tmp/t{idx}-{j}.txt",
+                    doc_id=f"src-t{idx}-{j}",
+                )
+                markdown_backend.index(kb_id=kb_id, documents=[doc])
+        except BaseException as exc:  # noqa: BLE001 — propagate to assertion
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=search_worker, args=(i,)) for i in range(4)
+    ] + [
+        threading.Thread(target=index_worker, args=(i,)) for i in range(4)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10.0)
+
+    assert not errors, f"concurrent ops raised: {errors!r}"
+    # Final state should reflect all index() inserts (4 threads * 5 docs
+    # + 1 seed = 21 pages).
+    assert markdown_backend.count(kb_id=kb_id) == 21

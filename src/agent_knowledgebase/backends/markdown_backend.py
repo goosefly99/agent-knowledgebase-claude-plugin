@@ -56,6 +56,11 @@ For the markdown backend ``dominant_embedding_model`` is ALWAYS
 ``None`` (markdown does not embed) — but the key is **present**, NOT
 omitted (validation finding f-20). Backend-diagnostic fields like
 ``vector_count`` / ``embedding_provider`` likewise return ``None``.
+
+Thread-safe: per-kb_id FTS5 cache guarded by ``_fts_lock``; concurrent
+``index()`` and ``search()`` calls on the same kb_id serialize.
+Connections are built with ``check_same_thread=False`` and every
+sqlite operation against a cached connection is held under the lock.
 """
 
 from __future__ import annotations
@@ -64,11 +69,16 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import sqlite3
+import tempfile
+import threading
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+
+from agent_knowledgebase.config import sanitize_kb_dir_name
 
 if TYPE_CHECKING:
     from agent_knowledgebase.config import Settings
@@ -273,8 +283,10 @@ class MarkdownWikiBackend:
         directory name via ``service._index`` so per-KB filesystem
         layout matches the rest of the codebase (sanitized name from
         ``Settings.kb_data_dir``). When ``service is None`` the backend
-        falls back to ``saves_dir / kb_id`` so unit tests can drive the
-        backend in isolation.
+        falls back to ``saves_dir / sanitize_kb_dir_name(kb_id)`` so
+        unit tests can drive the backend in isolation while still
+        enjoying the same path-traversal defense the service-bound
+        path inherits from :meth:`KnowledgebaseService.create`.
     """
 
     def __init__(
@@ -288,6 +300,20 @@ class MarkdownWikiBackend:
         # Per-kb_id sqlite FTS5 connections. Built lazily on first
         # search() or query() call so an empty KB doesn't pay the
         # disk-walk cost. Invalidated on index() / delete().
+        #
+        # Concurrency: the MCP server may dispatch tool calls from
+        # multiple threads (the tool-timeout worker thread, future async
+        # transports, etc). sqlite3 connections built with the default
+        # ``check_same_thread=True`` raise ProgrammingError when reused
+        # across threads, AND a single connection's execute() is racy
+        # under concurrent use even with that flag turned off. We
+        # therefore build connections with ``check_same_thread=False``
+        # and serialize ALL access to the cache and to each cached
+        # connection's sqlite operations through ``_fts_lock``. The
+        # lock spans both the ``self._fts_indexes`` dict and per-conn
+        # cursor calls, so the read/write critical section is held
+        # contiguously per ``kb_id``.
+        self._fts_lock: threading.Lock = threading.Lock()
         self._fts_indexes: dict[str, sqlite3.Connection] = {}
 
     # ------------------------------------------------------------------
@@ -299,17 +325,29 @@ class MarkdownWikiBackend:
 
         When a service back-reference is bound, prefer the same
         sanitized directory the service uses (``service._index``); fall
-        back to ``saves_dir / kb_id`` for service-less unit tests.
+        back to ``saves_dir / sanitize_kb_dir_name(kb_id)`` for
+        service-less unit tests.
+
+        The service-less branch ALWAYS routes ``kb_id`` through
+        :func:`sanitize_kb_dir_name` so a hostile or malformed ``kb_id``
+        (``"../escape"``, ``"a/b"``, ``"./foo"``) cannot escape
+        ``saves_dir`` via path-traversal — the sanitizer strips
+        anything not in ``[\\w\\s-]``, collapses whitespace, and falls
+        back to ``"unnamed"`` for empty results, matching the same
+        defense the service-bound path inherits from
+        :meth:`KnowledgebaseService.create`.
         """
         if self._service is not None:
             dir_name = self._service._index.get(kb_id)  # noqa: SLF001 — by design
             if dir_name is None:
                 # Mirror chromadb_backend's "lookup fails -> kb_id as
                 # dirname" so error messages locate the missing KB at
-                # the same path the create flow would have used.
-                dir_name = kb_id
+                # the same path the create flow would have used. We
+                # still sanitize here to keep the service-bound branch
+                # equivalent to the service-less branch on unknown ids.
+                dir_name = sanitize_kb_dir_name(kb_id)
             return self._settings.kb_data_dir(dir_name)
-        return self._settings.saves_dir / kb_id
+        return self._settings.saves_dir / sanitize_kb_dir_name(kb_id)
 
     def _wiki_root(self, kb_id: str) -> Path:
         return self._kb_root(kb_id) / "wiki"
@@ -470,47 +508,118 @@ class MarkdownWikiBackend:
         out-of-band LLM page-extraction (the spec's
         ``status=pending_extraction`` path) is deferred — see
         ``docs/markdown_backend.md``.
+
+        Atomicity caveat (multi-document batch)
+        ---------------------------------------
+        The allow-list check fires up-front for **every** document so
+        a single bad doc fails the whole batch BEFORE any write. After
+        validation passes, however, ``_write_one`` is called per
+        document in sequence with **no cross-document transaction**:
+        if the process crashes after writing document N out of M, the
+        first N pages remain on disk and the index/log reflect only
+        the successful subset. Recovery is to re-run ``kb_ingest_batch``
+        for the same batch — page writes are idempotent overwrites
+        (same ``source_id`` produces the same ``slug`` and the same
+        page file). See :meth:`_write_one` for the per-document
+        atomicity caveat (raw → page → log is also non-transactional
+        across the three files).
         """
         if not documents:
             return
         # Validate ALL documents up-front so a partially-written batch
-        # doesn't leave a half-ingested KB on disk.
+        # doesn't leave a half-ingested KB on disk because one
+        # malformed doc was rejected mid-loop. (This does NOT prevent
+        # crash-mid-batch — see Atomicity caveat in the docstring.)
         for doc in documents:
             self._check_source_allowed(doc, kb_id=kb_id)
 
         self._ensure_layout(kb_id)
 
-        for doc in documents:
-            self._write_one(kb_id=kb_id, doc=doc)
-
-        # Refresh sharded index + log + invalidate FTS cache.
-        self._rebuild_index_md(kb_id)
-        # Invalidate the FTS5 cache so subsequent search()/query()
-        # re-walks the pages directory.
-        self._fts_indexes.pop(kb_id, None)
+        # Hold the per-backend lock for the entire write+rebuild path.
+        # The spec promises concurrent index()/search() calls on the
+        # same kb_id serialize, and we need that for THREE separate
+        # reasons:
+        #   1. log.md is opened for append from each _write_one — on
+        #      POSIX that's atomic per-write but on Windows interleaved
+        #      partial lines are possible.
+        #   2. index.md is rewritten via tempfile + os.replace per
+        #      batch; on Windows two parallel os.replace() calls onto
+        #      the same target raise PermissionError.
+        #   3. The FTS5 cache is invalidated at the end and rebuilt
+        #      lazily on the next search(); a concurrent search()
+        #      between (rebuild_index_md) and (cache.pop) would see
+        #      a stale-but-still-mounted index.
+        # The lock is fine-grained per-MarkdownWikiBackend instance,
+        # not per-kb_id; in the typical single-process MCP server with
+        # one backend instance this serializes ALL ingest writes
+        # globally, which matches the behaviour of the chromadb
+        # backend's per-collection client locks.
+        with self._fts_lock:
+            for doc in documents:
+                self._write_one(kb_id=kb_id, doc=doc)
+            self._rebuild_index_md(kb_id)
+            # Invalidate the FTS5 cache so subsequent search()/query()
+            # re-walks the pages directory.
+            self._fts_indexes.pop(kb_id, None)
 
     def _write_one(self, *, kb_id: str, doc: dict[str, Any]) -> None:
-        """Write a single document: raw + page + log entry."""
+        """Write a single document: raw + page + log entry.
+
+        Atomicity caveat
+        ----------------
+        This method writes THREE files (raw dump, page markdown, log
+        entry) in sequence. There is **no** cross-file transaction. If
+        the process crashes mid-call:
+
+        * crash between (1) and (2) leaves an orphan ``raw/<id>.<ext>``
+          with no page or log entry.
+        * crash between (2) and (3) leaves a written page that is
+          missing from ``log.md`` (search/index queries still return it
+          because they walk ``pages/`` directly).
+
+        Recovery is **manual**: rerun ``kb_ingest`` for the same
+        ``source_id`` — page writes are idempotent overwrites, so the
+        same ``(raw, page, log)`` triple is produced. The orphan raw
+        file from a previous crash is harmless (it gets overwritten by
+        the rerun). True multi-file atomicity is deferred — see
+        ``docs/markdown_backend.md`` Limitations §7.
+
+        Each individual file write is per-file atomic (tempfile +
+        ``os.replace``) via :func:`_atomic_write_text` /
+        :func:`_atomic_write_bytes` so a crash MID-WRITE never produces
+        a half-written file; the ordering across files is what is not
+        transactional.
+        """
         metadata = dict(doc.get("metadata") or {})
         source_type = self._doc_source_type(doc) or "unknown"
         uri = metadata.get("uri") or doc.get("uri") or ""
         dedup_key = metadata.get("dedup_key") or doc.get("dedup_key")
         content = doc.get("content", "")
-        source_id = str(doc.get("id") or doc.get("source_id") or _stable_id(content))
+        raw_source_id = str(
+            doc.get("id") or doc.get("source_id") or _stable_id(content)
+        )
+        # Defense-in-depth: a hostile or malformed ``source_id``
+        # (``"../escape"``, ``"a/b/c"``, embedded null bytes) would
+        # otherwise compose a raw filename pointing outside ``raw/``.
+        # Sanitize through the same helper used for kb_id directory
+        # names; if sanitization yields the empty fallback "unnamed",
+        # fall back to a content hash so two distinct hostile inputs
+        # don't collide on the same file.
+        source_id = _sanitize_source_id(raw_source_id, content=content)
         title = (
             metadata.get("title")
             or doc.get("title")
             or _derive_title(uri, content)
         )
 
-        # 1. Raw dump (immutable copy of source content).
+        # 1. Raw dump (immutable copy of source content). Per-file atomic.
         raw_path = self._raw_dir(kb_id) / f"{source_id}.{_raw_ext(source_type)}"
         if isinstance(content, (bytes, bytearray)):
-            raw_path.write_bytes(bytes(content))
+            _atomic_write_bytes(raw_path, bytes(content))
         else:
-            raw_path.write_text(str(content), encoding="utf-8")
+            _atomic_write_text(raw_path, str(content))
 
-        # 2. Page markdown (deterministic transformer).
+        # 2. Page markdown (deterministic transformer). Per-file atomic.
         body = _render_page_body(source_type=source_type, content=content, uri=uri)
         slug = _slugify(title, content_hash_seed=f"{source_id}:{title}")
         page_meta = {
@@ -524,11 +633,12 @@ class MarkdownWikiBackend:
             "spec_id": _SPEC_ID,
         }
         page_text = _format_frontmatter(page_meta) + body
-        (self._pages_dir(kb_id) / f"{slug}.md").write_text(
-            page_text, encoding="utf-8"
-        )
+        _atomic_write_text(self._pages_dir(kb_id) / f"{slug}.md", page_text)
 
-        # 3. Log entry (Karpathy-style chronological op log).
+        # 3. Log entry (Karpathy-style chronological op log). Append-only,
+        # so a partial line is the only failure mode here — and that
+        # remains a possibility (we cannot atomically append). The
+        # docstring above documents the recovery path.
         ts = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%SZ")
         log_line = f"## [{ts}] ingest | {title}\n- slug: `{slug}`\n- source_type: `{source_type}`\n\n"
         with self._log_md(kb_id).open("a", encoding="utf-8") as fh:
@@ -547,7 +657,15 @@ class MarkdownWikiBackend:
         self._write_sharded_index(kb_id, pages)
 
     def _write_flat_index(self, kb_id: str, pages: list[_PageRecord]) -> None:
-        """Single-file ``index.md`` listing every page (small KB form)."""
+        """Single-file ``index.md`` listing every page (small KB form).
+
+        Drops any pre-existing ``wiki/index/`` shard directory so the
+        flat form is the ONLY remaining index representation. This
+        matters when a delete drops the page count back under
+        :data:`_SHARD_THRESHOLD` after a previous shard pass — without
+        this cleanup ``info()['sharded_index']`` and operator-facing
+        ``ls wiki/`` would still report stale shards on disk.
+        """
         lines = [
             "# Wiki Index",
             "",
@@ -560,11 +678,12 @@ class MarkdownWikiBackend:
                 f"- [{page.title}](pages/{page.slug}.md) "
                 f"`{page.source_type}`{uri_suffix}"
             )
-        # Drop any stale shard directory if we crossed back below threshold.
-        # (No-op for the typical growing-KB case.)
-        self._index_md(kb_id).write_text(
-            "\n".join(lines) + "\n", encoding="utf-8"
-        )
+        _atomic_write_text(self._index_md(kb_id), "\n".join(lines) + "\n")
+        # Drop any stale shard directory if we crossed back below
+        # threshold (no-op for the typical growing-KB case). We use
+        # ignore_errors=True so a missing shard dir or a transient OS
+        # error during cleanup doesn't fail the whole index rebuild.
+        shutil.rmtree(self._index_dir(kb_id), ignore_errors=True)
 
     def _write_sharded_index(self, kb_id: str, pages: list[_PageRecord]) -> None:
         """Sharded ``index.md`` -> ``index/<source_type>.md`` files.
@@ -591,8 +710,9 @@ class MarkdownWikiBackend:
                 shard_lines.append(
                     f"- [{page.title}](../pages/{page.slug}.md){uri_suffix}"
                 )
-            (self._index_dir(kb_id) / f"{category}.md").write_text(
-                "\n".join(shard_lines) + "\n", encoding="utf-8"
+            _atomic_write_text(
+                self._index_dir(kb_id) / f"{category}.md",
+                "\n".join(shard_lines) + "\n",
             )
 
         # Top-level index.md becomes a directory pointer.
@@ -609,9 +729,7 @@ class MarkdownWikiBackend:
             top_lines.append(
                 f"- [{category}](index/{category}.md) ({len(bucket)} pages)"
             )
-        self._index_md(kb_id).write_text(
-            "\n".join(top_lines) + "\n", encoding="utf-8"
-        )
+        _atomic_write_text(self._index_md(kb_id), "\n".join(top_lines) + "\n")
 
     # ------------------------------------------------------------------
     # Read path: page enumeration + FTS5
@@ -630,8 +748,18 @@ class MarkdownWikiBackend:
         return records
 
     def _build_fts_index(self, kb_id: str) -> sqlite3.Connection:
-        """(Re)build an in-memory sqlite FTS5 index for ``kb_id``."""
-        conn = sqlite3.connect(":memory:")
+        """(Re)build an in-memory sqlite FTS5 index for ``kb_id``.
+
+        Connections are built with ``check_same_thread=False`` so the
+        same connection can be reused from a different thread (the MCP
+        tool-timeout worker thread, for example). Concurrent execute()
+        calls on a single sqlite connection are still racy, so callers
+        MUST hold ``self._fts_lock`` for the entire read/write critical
+        section. :meth:`_get_fts_conn` and the search path below already
+        do this; tests that drop the lock are responsible for
+        re-acquiring it before issuing further sqlite calls.
+        """
+        conn = sqlite3.connect(":memory:", check_same_thread=False)
         conn.row_factory = sqlite3.Row
         conn.execute(
             "CREATE VIRTUAL TABLE pages USING fts5("
@@ -656,7 +784,15 @@ class MarkdownWikiBackend:
         return conn
 
     def _get_fts_conn(self, kb_id: str) -> sqlite3.Connection:
-        """Return cached FTS5 conn, building lazily on first use."""
+        """Return cached FTS5 conn, building lazily on first use.
+
+        MUST be called with ``self._fts_lock`` held — the lock spans
+        both the cache lookup and the build path so a second thread
+        racing on the same ``kb_id`` doesn't construct two parallel
+        in-memory indexes. The lock also keeps the returned connection
+        from being concurrently mutated by another thread for the
+        duration of the caller's sqlite operations.
+        """
         conn = self._fts_indexes.get(kb_id)
         if conn is None:
             conn = self._build_fts_index(kb_id)
@@ -707,24 +843,35 @@ class MarkdownWikiBackend:
         ``slug``; other keys are silently ignored (markdown has no
         general filter pushdown). FTS5 ``rank`` is converted to a
         ``[0, 1]`` descending score via ``score = 1 / (1 + abs(rank))``.
+
+        Concurrent ``search()`` calls on the same ``kb_id`` serialize
+        on ``self._fts_lock`` — see the module docstring for the
+        threading guarantee.
         """
         if top_k <= 0:
             return []
-        conn = self._get_fts_conn(kb_id)
         cleaned = _sanitize_fts_query(text)
         if not cleaned:
             return []
-        try:
-            rows = conn.execute(
-                "SELECT slug, page_id, source_id, source_type, uri, title, "
-                "content, rank FROM pages WHERE pages MATCH ? "
-                "ORDER BY rank LIMIT ?",
-                (cleaned, top_k),
-            ).fetchall()
-        except sqlite3.OperationalError:
-            # Empty in-memory index or malformed query syntax — return
-            # an empty result rather than blowing up the MCP call.
-            return []
+        # Hold the lock for both _get_fts_conn (cache mutation) and the
+        # subsequent sqlite execute() — a single sqlite3.Connection is
+        # NOT safe under concurrent execute() even with
+        # check_same_thread=False, and the cache may be invalidated by
+        # a parallel index()/delete() between the two calls.
+        with self._fts_lock:
+            conn = self._get_fts_conn(kb_id)
+            try:
+                rows = conn.execute(
+                    "SELECT slug, page_id, source_id, source_type, uri, "
+                    "title, content, rank FROM pages WHERE pages MATCH ? "
+                    "ORDER BY rank LIMIT ?",
+                    (cleaned, top_k),
+                ).fetchall()
+            except sqlite3.OperationalError:
+                # Empty in-memory index or malformed query syntax —
+                # return an empty result rather than blowing up the
+                # MCP call.
+                return []
 
         results: list[dict[str, Any]] = []
         for row in rows:
@@ -765,6 +912,10 @@ class MarkdownWikiBackend:
 
         At least one of ``ids`` or ``source_id`` must be supplied
         (mirrors :class:`ChromadbBackend.delete`).
+
+        Concurrent ``delete()`` calls on the same ``kb_id`` serialize
+        on ``self._fts_lock`` — same threading guarantee as
+        :meth:`index` and :meth:`search`.
         """
         if ids is None and source_id is None:
             raise ValueError(
@@ -775,22 +926,27 @@ class MarkdownWikiBackend:
         if not pages_dir.is_dir():
             return
         target_ids: set[str] = set(ids or [])
-        deleted_any = False
-        for path in pages_dir.glob("*.md"):
-            rec = _parse_page(path)
-            if rec is None:
-                continue
-            if rec.page_id in target_ids or (
-                source_id is not None and rec.source_id == source_id
-            ):
-                path.unlink()
-                # Also clean the raw dump (best-effort).
-                for raw in self._raw_dir(kb_id).glob(f"{rec.source_id}.*"):
-                    raw.unlink()
-                deleted_any = True
-        if deleted_any:
-            self._rebuild_index_md(kb_id)
-            self._fts_indexes.pop(kb_id, None)
+        # Hold the lock across the page scan + unlink + index rebuild
+        # + cache invalidation. See index() for the rationale on why
+        # the rebuild step in particular MUST be serialized (Windows
+        # PermissionError on parallel os.replace onto index.md).
+        with self._fts_lock:
+            deleted_any = False
+            for path in pages_dir.glob("*.md"):
+                rec = _parse_page(path)
+                if rec is None:
+                    continue
+                if rec.page_id in target_ids or (
+                    source_id is not None and rec.source_id == source_id
+                ):
+                    path.unlink()
+                    # Also clean the raw dump (best-effort).
+                    for raw in self._raw_dir(kb_id).glob(f"{rec.source_id}.*"):
+                        raw.unlink()
+                    deleted_any = True
+            if deleted_any:
+                self._rebuild_index_md(kb_id)
+                self._fts_indexes.pop(kb_id, None)
 
     # ------------------------------------------------------------------
     # RetrieverBackend Protocol — metadata / health
@@ -802,6 +958,18 @@ class MarkdownWikiBackend:
         Returns the v0.6.0 probe-4 contract fields PLUS markdown-backend
         diagnostics. Inapplicable embedding fields are ``None`` (NOT
         omitted) per validation finding f-20.
+
+        Probe-4 fields (``source_type``, ``uri``, ``dedup_key``,
+        ``page_id``) reflect the **slug-alphabetical-first** page in
+        ``pages/`` (the first entry returned by
+        :meth:`_read_all_pages`, which sorts the ``pages/*.md`` glob
+        ascending). This is **deterministic but arbitrary** — the
+        first page by slug ordering, not the first page by ingest
+        time, not the most-queried page. Operators wanting KB-level
+        summary statistics (page count by source_type, recent ingest
+        timestamps, etc) should wait for the future Phase 4
+        ``kb_info`` aggregates; the current ``info()`` shape is pinned
+        to the probe-4 contract for backward compatibility.
         """
         pages = self._read_all_pages(kb_id)
         first = pages[0] if pages else None
@@ -955,6 +1123,87 @@ def _probe_fts5_available() -> bool:
         return False
     except Exception:  # noqa: BLE001 — degraded path
         return False
+
+
+# ---------------------------------------------------------------------------
+# Path-safety + atomic-write helpers
+# ---------------------------------------------------------------------------
+
+
+def _sanitize_source_id(raw: str, *, content: Any) -> str:
+    """Sanitize a caller-supplied ``source_id`` for safe use as a filename.
+
+    Routes through :func:`sanitize_kb_dir_name` so a hostile or
+    malformed ``source_id`` (``"../escape"``, ``"a/b/c"``, embedded
+    control chars) cannot escape the ``raw/`` directory or collide
+    with a different doc by walking upward via ``..``. If the
+    sanitizer falls back to its empty-input default ``"unnamed"``
+    AND the original ``raw`` was non-empty (e.g. ``raw="../"`` →
+    sanitizer strips everything → ``"unnamed"``), we substitute a
+    content-derived stable id so two distinct hostile inputs don't
+    collide on the same file. An originally-empty ``raw`` already
+    routes through :func:`_stable_id` upstream so the ``"unnamed"``
+    branch only applies to non-empty hostile input.
+    """
+    safe = sanitize_kb_dir_name(raw)
+    if safe == "unnamed" and raw and raw != "unnamed":
+        return _stable_id(content)
+    return safe
+
+
+def _atomic_write_text(path: Path, content: str) -> None:
+    """Atomically write ``content`` (utf-8) to ``path``.
+
+    Writes to a same-directory tempfile then ``os.replace()`` it onto
+    the target so a crash mid-write never produces a half-written
+    file. Caller is responsible for ensuring ``path.parent`` exists
+    (the wiki layout calls ``_ensure_layout`` up-front so this is
+    already guaranteed for ingest writes).
+    """
+    parent = path.parent
+    parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=str(parent),
+    )
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(content)
+        os.replace(tmp_path, path)
+    except Exception:
+        # Best-effort cleanup of the tempfile on failure — propagate
+        # the original exception either way.
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def _atomic_write_bytes(path: Path, content: bytes) -> None:
+    """Atomically write raw bytes to ``path`` (binary analogue of
+    :func:`_atomic_write_text`).
+    """
+    parent = path.parent
+    parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=str(parent),
+    )
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(content)
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+        raise
 
 
 __all__ = [
