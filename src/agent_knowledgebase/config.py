@@ -6,7 +6,7 @@ import re
 from pathlib import Path
 from typing import Literal, Optional
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import AliasChoices, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict
 
 from agent_knowledgebase.config_files import (
@@ -47,10 +47,37 @@ class Settings(BaseSettings):
         "vars; resolve_paths() still requires the directory to exist on disk.",
     )
 
-    # --- Vector store ---
+    # --- Retrieval backend (Phase 2 redesign) ---
+    kb_backend: Literal["chromadb", "markdown", "lightrag"] = Field(
+        default="chromadb",
+        validation_alias=AliasChoices(
+            "kb_backend",
+            "AGENT_KB_BACKEND",
+            "AGENT_KB_KB_BACKEND",
+        ),
+        description="Retrieval backend selector (AGENT_KB_BACKEND, also "
+        "accepted as AGENT_KB_KB_BACKEND for env_prefix consistency). "
+        "Picks the high-level retrieval strategy that wraps "
+        "ingest/query/search/delete: 'chromadb' (default; vector + FTS via "
+        "the existing chromadb pipeline), 'markdown' (Phase 3, opt-in "
+        "Karpathy-style wiki backend), or 'lightrag' (Phase 6, deferred). "
+        "Disambiguation: this is NOT the same as the 'vectorstore' field. "
+        "'kb_backend' selects the retrieval-strategy abstraction "
+        "(RetrieverBackend); 'vectorstore' selects the chromadb-internal "
+        "vector-store provider in {chromadb, pinecone}, used only by the "
+        "ChromadbBackend. The two compose: kb_backend='chromadb' + "
+        "vectorstore='pinecone' would route through ChromadbBackend with a "
+        "Pinecone-backed VectorStore.",
+    )
+
+    # --- Vector store (chromadb-internal provider selection) ---
     vectorstore: Literal["chromadb", "pinecone"] = Field(
         default="chromadb",
-        description="Vector store backend",
+        description="Vector store provider used INSIDE the ChromadbBackend "
+        "to back the per-KB vector collection: 'chromadb' (local "
+        "PersistentClient, default) or 'pinecone' (remote, requires "
+        "AGENT_KB_PINECONE_* credentials). This is NOT the same setting "
+        "as 'kb_backend' — see kb_backend's docstring for the layering.",
     )
 
     # --- Pinecone ---

@@ -70,6 +70,7 @@ def resolve_project_config_path() -> Path:
 
 # Dotted JSON paths → flat Settings field names.  See design spec §5.2.
 DOT_TO_FLAT: dict[str, str] = {
+    "kb_backend": "kb_backend",
     "vectorstore": "vectorstore",
     "embedding.provider": "embedding_provider",
     "embedding.model": "embedding_model",

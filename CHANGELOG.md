@@ -1,5 +1,73 @@
 # Changelog
 
+## 0.8.1 — 2026-04-24
+
+> Phase 2 of the v2.1 redesign — RetrieverBackend abstraction with the
+> chromadb backend wired as the default. **Zero behavior change** for
+> existing v0.6.0 KBs; the full v0.6.0 test suite passes unchanged.
+>
+> spec_id: `70ab2170-381a-4657-bcd1-28a40c6f369b`
+> Source spec: `pipeline_mcp_data/specs/agent-kb-redesign-spec-v2.1.json`
+
+### Added
+
+- New `RetrieverBackend` Protocol and `get_backend(settings)` factory in
+  `src/agent_knowledgebase/backends/__init__.py`. The Protocol defines
+  the seven retrieval entry points (`index`, `query`, `search`, `delete`,
+  `info`, `count`, `health_check`) every backend must satisfy.
+- New `ChromadbBackend` in `src/agent_knowledgebase/backends/chromadb_backend.py`
+  — a thin wrapper that delegates to the existing `QueryOrchestrator` /
+  `VectorStore` / `WikiManager` / `Database` so the v0.6.0 fast-path is
+  preserved bit-for-bit. The wrapper holds a back-reference to the owning
+  `KnowledgebaseService` so per-KB lifecycle (`_KBContext`, lazy
+  embedder, vectorstore cache, per-`kb_id` lock) stays in one place.
+- New `Settings.kb_backend: Literal['chromadb','markdown','lightrag']`
+  field (default `chromadb`), accepting both `AGENT_KB_BACKEND` (the
+  spec name) and `AGENT_KB_KB_BACKEND` (the conventional pydantic-settings
+  prefix form) as env aliases. Disambiguated from the existing
+  `Settings.vectorstore` field which remains the chromadb-internal
+  vector-store-provider choice in `{chromadb, pinecone}`.
+- `tests/test_retriever_backend_protocol.py` — Protocol-conformance tests
+  for every concrete backend (currently chromadb), parameterised so
+  Phase 3's markdown backend slots in mechanically.
+- `tests/contract/test_probe4_response_shape.py` — pins the probe-4
+  contract (`source_type`, `uri`, `dedup_key`, `page_id`,
+  `dominant_embedding_model`) across `kb_info` / `kb_list_pages` /
+  `kb_list_sources` AND on the new `RetrieverBackend.info()` directly.
+- `tests/contract/test_stderr_schema.py` — captures every emission
+  during a representative `kb_ingest_batch` and asserts each line carries
+  exactly the 11 required fields (no extras, no omissions).
+
+### Changed
+
+- `KnowledgebaseService.__init__` now calls `get_backend(self._config,
+  service=self)` ONCE at construction time and stores the result as
+  `self._backend`. All retrieval entry points (`query`, `search`, the
+  ingest write path's chunk-add step, and the source-deletion path)
+  now route through that instance instead of touching the chromadb
+  helpers directly. With `kb_backend='chromadb'` (default) the runtime
+  behavior is bit-for-bit identical to v0.8.0.
+- `kb_backend` is exposed via `kb_config_get` / `kb_config_set` /
+  `kb_config_show` (added to `DOT_TO_FLAT` in `config_files.py`).
+
+### Coordination
+
+- **data-etl-orchestrator >= v0.4.0 must accept
+  `dominant_embedding_model = null`** before Phase 3 ships the markdown
+  backend. The chromadb backend continues to populate this field once the
+  KB has at least one ingested chunk; the markdown backend will always
+  return `null` since it does not embed. The empty-KB branch of the
+  Phase 2 chromadb behavior already exercises the `null` shape, so
+  consumer-side support can land any time before Phase 3.
+
+### NOT in scope (Phase 3+)
+
+- `backends/markdown_backend.py` — Phase 3 deliverable.
+- `backends/lightrag_backend.py` — Phase 6 stub.
+- `services/migration.py` + `kb_migrate` MCP tool — Phase 4.
+- Embedding default flip + `embedder_version` stamping — Phase 5.
+- Decorator order swap — explicitly NOT changed (M-01).
+
 ## 0.8.0 — 2026-04-24
 
 > Phase 1 of the v2.1 redesign — Pattern A single-launcher runtime

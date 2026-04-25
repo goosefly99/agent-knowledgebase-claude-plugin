@@ -39,6 +39,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Optional
 
+from agent_knowledgebase.backends import RetrieverBackend, get_backend
 from agent_knowledgebase.config import Settings, sanitize_kb_dir_name
 from agent_knowledgebase.database import Database
 from agent_knowledgebase.models import (
@@ -143,6 +144,16 @@ class KnowledgebaseService:
         # so two threads discovering the same kb_id for the first time don't race.
         self._kb_locks: dict[str, threading.Lock] = {}
         self._kb_locks_guard: threading.Lock = threading.Lock()
+
+        # RetrieverBackend abstraction (Phase 2 redesign).  The factory
+        # dispatches on ``self._config.kb_backend`` and returns a real
+        # backend wrapping the existing chromadb pipeline (default), or
+        # raises NotImplementedError for markdown / lightrag until those
+        # phases land.  Constructed ONCE here — every retrieval entry
+        # point on this service routes through ``self._backend`` so the
+        # feature flag's effect is local to this single line.
+        # spec_id: 70ab2170-381a-4657-bcd1-28a40c6f369b
+        self._backend: RetrieverBackend = get_backend(self._config, service=self)
 
     @property
     def _embedder(self) -> Embedder:
@@ -505,7 +516,6 @@ class KnowledgebaseService:
             # Phase 4: embed
             texts = [c.content for c in chunks]
             embeddings = self._embedder.embed(texts) if texts else []
-            vs = self._get_vectorstore(kb_id)
             # Stamp per-chunk metadata that the retrieval path depends on:
             # ``embedding_model`` drives per-KB embedder selection on query,
             # and ``kb_id`` satisfies the vectorstore's where-filter (which
@@ -514,12 +524,22 @@ class KnowledgebaseService:
             for chunk in chunks:
                 chunk.metadata["embedding_model"] = self._embedder.model_name
                 chunk.metadata["kb_id"] = kb_id
+            # Route the index write through the RetrieverBackend
+            # abstraction (Phase 2). For chromadb this is a thin wrapper
+            # around ``vectorstore.add(...)``; markdown (Phase 3) /
+            # lightrag (Phase 6) implementations will diverge here.
             if chunks:
-                vs.add(
-                    ids=[c.id for c in chunks],
-                    embeddings=embeddings,
-                    documents=texts,
-                    metadatas=[c.metadata for c in chunks],
+                self._backend.index(
+                    kb_id=kb_id,
+                    documents=[
+                        {
+                            "id": c.id,
+                            "content": text,
+                            "metadata": c.metadata,
+                            "embedding": emb,
+                        }
+                        for c, text, emb in zip(chunks, texts, embeddings)
+                    ],
                 )
             for chunk in chunks:
                 ctx.db.insert_chunk(chunk)
@@ -628,11 +648,15 @@ class KnowledgebaseService:
                 tool_caller_version=None,
             )
             try:
-                # Delete old chunks from vectorstore
+                # Delete old chunks from the backend.  Routes through
+                # ``self._backend.delete`` (Phase 2) so the markdown /
+                # lightrag backends can override the deletion path
+                # without touching this service.
                 old_chunks = ctx.db.list_chunks(source_id)
                 if old_chunks:
-                    vs = self._get_vectorstore(kb_id)
-                    vs.delete([c.id for c in old_chunks])
+                    self._backend.delete(
+                        kb_id=kb_id, ids=[c.id for c in old_chunks]
+                    )
                 ctx.db.delete_chunks_by_source(source_id)
 
                 return self._ingest_source_locked(
@@ -655,7 +679,15 @@ class KnowledgebaseService:
                 )
 
     def remove_source(self, source_id: str) -> None:
-        """Remove a source and its chunks/vectors from the KB."""
+        """Remove a source and its chunks/vectors from the KB.
+
+        The vector deletion routes through the
+        :class:`~agent_knowledgebase.backends.RetrieverBackend`
+        abstraction so future backends (markdown, lightrag) can swap
+        their own deletion semantics in. SQL-level cleanup
+        (pipeline_runs, chunks, page_sources, source rows) stays here
+        since those tables are backend-agnostic.
+        """
         ctx, _ = self._find_context_by_source(source_id)
         source = ctx.db.get_source(source_id)
         if source is None:
@@ -663,8 +695,9 @@ class KnowledgebaseService:
 
         old_chunks = ctx.db.list_chunks(source_id)
         if old_chunks:
-            vs = self._get_vectorstore(source.kb_id)
-            vs.delete([c.id for c in old_chunks])
+            self._backend.delete(
+                kb_id=source.kb_id, ids=[c.id for c in old_chunks]
+            )
 
         ctx.db.delete_pipeline_runs_by_source(source_id)
         ctx.db.delete_chunks_by_source(source_id)
@@ -676,27 +709,46 @@ class KnowledgebaseService:
     # ------------------------------------------------------------------
 
     def query(self, kb_id: str, text: str, top_k: int | None = None) -> list[SearchResult]:
-        """Semantic query across a KB."""
+        """Semantic query across a KB.
+
+        Routes through ``self._backend.query`` (Phase 2 RetrieverBackend
+        abstraction). The chromadb default returns dicts shaped like
+        :class:`SearchResult`'s ``__dict__`` so we round-trip them back
+        into :class:`SearchResult` instances to preserve the v0.6.0
+        return type.
+        """
         if top_k is None:
             top_k = default_top_k(self._config)
-        ctx = self._ctx(kb_id)
-        vs = self._get_vectorstore(kb_id)
-        embedder = self._query_embedder_for(kb_id)
-        orchestrator = QueryOrchestrator(vs, embedder, ctx.wiki)
-        return orchestrator.query(text, kb_id, top_k=top_k)
+        # Resolve the kb context here so a missing kb_id raises the
+        # historical ValueError before the backend is consulted; the
+        # backend would also raise but with a less specific message.
+        self._ctx(kb_id)
+        rows = self._backend.query(kb_id=kb_id, text=text, top_k=top_k)
+        return [SearchResult(**row) for row in rows]
 
     def search(self, kb_id: str, text: str, top_k: int | None = None) -> list[SearchResult]:
-        """Keyword search across a KB."""
+        """Keyword search across a KB.
+
+        Routes through ``self._backend.search`` (Phase 2 RetrieverBackend
+        abstraction). See :meth:`query` for the round-trip rationale.
+        """
         if top_k is None:
             top_k = default_top_k(self._config)
-        ctx = self._ctx(kb_id)
-        vs = self._get_vectorstore(kb_id)
-        embedder = self._query_embedder_for(kb_id)
-        orchestrator = QueryOrchestrator(vs, embedder, ctx.wiki)
-        return orchestrator.search(text, kb_id, top_k=top_k)
+        self._ctx(kb_id)
+        rows = self._backend.search(kb_id=kb_id, text=text, top_k=top_k)
+        return [SearchResult(**row) for row in rows]
 
     def hybrid_query(self, kb_id: str, text: str, top_k: int | None = None) -> list[SearchResult]:
-        """Combined semantic + keyword search."""
+        """Combined semantic + keyword search.
+
+        The hybrid composition itself stays in
+        :class:`QueryOrchestrator` since the merge / weighting logic is
+        backend-agnostic; the per-leg vector + FTS calls are still the
+        v0.6.0 chromadb path because ``self._backend`` defaults to
+        chromadb and ``QueryOrchestrator`` reads through the same
+        helpers the backend wraps. Phase 3 may revisit if the markdown
+        backend ships a different hybrid story.
+        """
         if top_k is None:
             top_k = default_top_k(self._config)
         vector_weight, fts_weight, fetch_mult = hybrid_weights_from(self._config)
