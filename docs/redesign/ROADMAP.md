@@ -257,6 +257,9 @@ python -m agent_knowledgebase.services.migration --backfill-providers --kb-id=<i
 
 ## Phase 5 — Embedding defaults: remote-only default, fastembed optional
 
+> **STATUS: SHIPPED in v0.11.0** (2026-04-24). See `CHANGELOG.md` for the
+> full deliverable list, migration story, and frozen-contract checklist.
+>
 > **REQUIRES** Phase 4 read-fallback + per-page provider snapshot to ALREADY be
 > in production. Block PR merge if Phase 4 has not landed.
 

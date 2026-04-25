@@ -188,7 +188,10 @@ class TestLayeringPrecedence:
         monkeypatch.setenv("AGENT_KB_USER_CONFIG", str(tmp_path / "no_user.json"))
         monkeypatch.setenv("AGENT_KB_PROJECT_CONFIG", str(tmp_path / "no_proj.json"))
         cfg = Settings()
-        assert cfg.embedding_model == "qwen3-embedding:8b"
+        # Phase 5 default-flip (v0.11.0): default model flipped from
+        # 'qwen3-embedding:8b' to 'text-embedding-3-small'.
+        # spec_id: 70ab2170-381a-4657-bcd1-28a40c6f369b
+        assert cfg.embedding_model == "text-embedding-3-small"
         assert cfg.chunk_size == 512
 
     def test_user_file_overrides_default(
@@ -287,4 +290,6 @@ class TestLoadSettingsHelper:
         monkeypatch.setenv("AGENT_KB_USER_CONFIG", str(tmp_path / "none.json"))
         monkeypatch.setenv("AGENT_KB_PROJECT_CONFIG", str(tmp_path / "none2.json"))
         cfg = load_settings()
-        assert cfg.embedding_model == "qwen3-embedding:8b"
+        # Phase 5 default-flip (v0.11.0). spec_id:
+        # 70ab2170-381a-4657-bcd1-28a40c6f369b
+        assert cfg.embedding_model == "text-embedding-3-small"

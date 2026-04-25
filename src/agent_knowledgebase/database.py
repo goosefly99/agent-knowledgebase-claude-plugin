@@ -204,7 +204,19 @@ class Database:
         # so the original embedder is faithfully rebuilt even after the
         # global Settings defaults move on. Strictly ALTER ADD —
         # non-destructive; rollback SQL documented in CHANGELOG.md.
-        # spec_id: 70ab2170-381a-4657-bcd1-28a40c6f369b
+        #
+        # v0.11.0 / Phase 5 additive migration: per-chunk
+        # ``embedder_version`` column. Stamped at ingest time by
+        # ``KnowledgebaseService._ingest_source_locked`` so a KB whose
+        # chunks were ingested under e.g. ``fastembed/MiniLM-L6-v2-int8``
+        # cannot be silently mixed with chunks ingested under
+        # ``sentence-transformers/all-MiniLM-L6-v2@hf-fp32`` — same
+        # nominal model_name, different vector geometry. The mixed-
+        # version rejection at ingest time uses
+        # :meth:`get_embedder_versions` (below); the
+        # ``AGENT_KB_AUTO_REEMBED=1`` env var is the documented
+        # bypass. Strictly ALTER ADD — non-destructive — and idempotent
+        # across re-opens. spec_id: 70ab2170-381a-4657-bcd1-28a40c6f369b
         chunk_cols = {
             row[1]
             for row in self._conn.execute("PRAGMA table_info(chunks)").fetchall()
@@ -212,6 +224,8 @@ class Database:
         _CHUNK_PROVIDER_SNAPSHOT_COLUMNS: list[tuple[str, str]] = [
             ("embedding_provider", "TEXT"),
             ("embed_base_url", "TEXT"),
+            # Phase 5 (v0.11.0):
+            ("embedder_version", "TEXT"),
         ]
         added_provider_snapshot = False
         for col_name, col_type in _CHUNK_PROVIDER_SNAPSHOT_COLUMNS:
@@ -566,12 +580,20 @@ class Database:
         # column values instead of having to fall back to the metadata
         # blob. The metadata bag is left intact so older readers keep
         # working unchanged. spec_id: 70ab2170-381a-4657-bcd1-28a40c6f369b
-        embedding_provider = chunk.metadata.get("embedding_provider") if isinstance(chunk.metadata, dict) else None
-        embed_base_url = chunk.metadata.get("embed_base_url") if isinstance(chunk.metadata, dict) else None
+        #
+        # Phase 5 (v0.11.0): also stamp ``embedder_version`` so the
+        # mixed-version rejection in
+        # ``KnowledgebaseService._ingest_source_locked`` can compare
+        # the incoming embedder against the kb's existing embedders
+        # cheaply via :meth:`get_embedder_versions`.
+        meta = chunk.metadata if isinstance(chunk.metadata, dict) else {}
+        embedding_provider = meta.get("embedding_provider")
+        embed_base_url = meta.get("embed_base_url")
+        embedder_version = meta.get("embedder_version")
         self._conn.execute(
             "INSERT INTO chunks (id, source_id, kb_id, content, metadata, "
-            "embedding_id, embedding_provider, embed_base_url) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "embedding_id, embedding_provider, embed_base_url, embedder_version) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 chunk.id,
                 chunk.source_id,
@@ -581,6 +603,7 @@ class Database:
                 chunk.embedding_id,
                 embedding_provider,
                 embed_base_url,
+                embedder_version,
             ),
         )
         self._conn.commit()
@@ -982,3 +1005,46 @@ class Database:
             )
         self._conn.commit()
         return cur.rowcount or 0
+
+    # ------------------------------------------------------------------
+    # Phase 5 — embedder_version stamping
+    # ------------------------------------------------------------------
+
+    def get_embedder_versions(self, kb_id: str) -> set[str]:
+        """Return the set of distinct ``embedder_version`` values for *kb_id*.
+
+        Used by ``KnowledgebaseService._ingest_source_locked`` to detect
+        mixed-version ingests: when a KB already carries chunks under
+        embedder version ``A`` and a new ingest would write chunks under
+        embedder version ``B`` (``A != B``), the ingest is rejected with
+        ``EMBEDDER_VERSION_MISMATCH`` unless ``AGENT_KB_AUTO_REEMBED=1``
+        is set.
+
+        The version string is opaque to this layer — the embedder
+        provides it via :attr:`Embedder.embedder_version` (Phase 5)
+        with a format like ``"fastembed/MiniLM-L6-v2-int8"`` or
+        ``"sentence-transformers/all-MiniLM-L6-v2@hf-fp32"``.
+
+        NULL values (legacy v0.6.0/v0.10.x chunks ingested before the
+        Phase 5 column existed) are silently ignored so a legacy KB
+        can still receive new ingests under whatever embedder is
+        configured today.
+
+        Resolution order, mirroring :meth:`get_embedding_snapshot`:
+
+        1. Native ``chunks.embedder_version`` column.
+        2. Fallback to ``json_extract(metadata, '$.embedder_version')``
+           so chunks stamped via the metadata-only path are still
+           recognized.
+
+        spec_id: 70ab2170-381a-4657-bcd1-28a40c6f369b
+        """
+        rows = self._conn.execute(
+            "SELECT DISTINCT COALESCE("
+            "  embedder_version, "
+            "  json_extract(metadata, '$.embedder_version')"
+            ") AS version "
+            "FROM chunks WHERE kb_id = ?",
+            (kb_id,),
+        ).fetchall()
+        return {row["version"] for row in rows if row["version"] is not None}

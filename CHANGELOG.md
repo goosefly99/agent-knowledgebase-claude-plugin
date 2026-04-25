@@ -1,5 +1,192 @@
 # Changelog
 
+## 0.11.0 — 2026-04-24
+
+> Phase 5 of the v2.1 redesign — embedding default-flip
+> (`ollama/qwen3-embedding:8b` -> `remote/text-embedding-3-small`),
+> opt-in `fastembed` provider, per-chunk `embedder_version` stamping,
+> and a wholesale restructure of `pyproject.toml` to move
+> `sentence-transformers`, `tree-sitter*`, `pdfplumber`, `sqlalchemy`,
+> and `sqlparse` from default dependencies into opt-in extras.
+>
+> **BREAKING DEFAULT CHANGE.** Operators with v0.6.0/v0.10.x KBs
+> ingested under the default Ollama embedder MUST stay on Phase 4
+> (v0.10.0) before adopting Phase 5. The Phase 4 per-chunk provider
+> snapshot is the safety net that keeps existing Ollama-ingested KBs
+> queryable AFTER this default flip — without Phase 4, every existing
+> KB would silently dimension-mismatch on the first `kb_query` after
+> upgrade.
+>
+> spec_id: `70ab2170-381a-4657-bcd1-28a40c6f369b`
+> Source spec: `pipeline_mcp_data/specs/agent-kb-redesign-spec-v2.1.json`
+
+### Migration story for existing operators
+
+| Scenario | Action |
+|---|---|
+| Brand-new install | No action. New KBs default to `provider='remote'`, `model='text-embedding-3-small'`. Set `AGENT_KB_EMBED_API_KEY` + `AGENT_KB_EMBED_BASE_URL` (e.g. `https://api.openai.com/v1`). |
+| Existing v0.6.0/v0.10.x KB on Ollama | No action — Phase 4's per-chunk provider snapshot keeps the original Ollama embedder wired in for queries against that KB. New KBs created post-upgrade will pick up the new default. To keep old workflow: explicitly set `AGENT_KB_EMBEDDING_PROVIDER=ollama` + `AGENT_KB_EMBEDDING_MODEL=qwen3-embedding:8b`. |
+| Want to switch an existing KB to a new embedder | Re-ingest under the new embedder. The mixed-version rejection (`EMBEDDER_VERSION_MISMATCH`) prevents accidental cross-embedder mixing; set `AGENT_KB_AUTO_REEMBED=1` to bypass while you re-ingest. |
+| Want local embeddings (no network) | `pip install agent-knowledgebase[embed-local-onnx]` for fastembed (~150 MB), or `pip install agent-knowledgebase[embed-local-st]` for sentence-transformers (~1.3 GB). |
+
+### Added
+
+- **New `'fastembed'` embedding provider** in
+  `services/embeddings.py`. Lazy-imports `qdrant-fastembed` only
+  inside `FastembedEmbedder.__init__`; raises a friendly `RuntimeError`
+  pointing at `pip install agent-knowledgebase[embed-local-onnx]` if
+  the extra isn't installed. Same `Embedder` Protocol surface as the
+  remote / ollama / sentence-transformers providers.
+- **Per-chunk `embedder_version` stamping** — additive ALTER ADD
+  migration adds one column to `chunks`:
+  ```sql
+  ALTER TABLE chunks ADD COLUMN embedder_version TEXT;
+  ```
+  Stamped on every newly-inserted chunk by `Database.insert_chunk`
+  from `chunk.metadata['embedder_version']` (mirroring the Phase 4
+  `embedding_provider` / `embed_base_url` columns). Strictly ALTER
+  ADD — non-destructive — and idempotent across re-opens.
+- **`Database.get_embedder_versions(kb_id)`** — returns the distinct
+  set of stamped `embedder_version` values for a KB. Used by
+  `KnowledgebaseService._ingest_source_locked` to detect mixed-
+  version ingests; falls back to `json_extract(metadata,
+  '$.embedder_version')` for chunks stamped via the metadata-only
+  path.
+- **`Embedder.embedder_version` Protocol property** — opaque
+  string identifying the embedder's vector geometry. Format
+  convention: `"<library>/<model_name>[@<quant_or_provider>]"`. The
+  built-in providers report:
+  - `RemoteEmbedder` → `"remote/<model>@<base_url>"`
+  - `OllamaEmbedder` → `"ollama/<model>@<base_url>"`
+  - `SentenceTransformerEmbedder` → `"sentence-transformers/<model>@hf-fp32"`
+  - `FastembedEmbedder` → `"fastembed/<model>-int8"`
+- **`EmbedderVersionMismatchError`** in
+  `services/knowledgebase.py` (error_code
+  `EMBEDDER_VERSION_MISMATCH`). Raised at the top of
+  `_ingest_source_locked` when the incoming embedder's version
+  doesn't match any version already stamped on the KB's chunks AND
+  `AGENT_KB_AUTO_REEMBED=1` is not set. Carries `kb_id`,
+  `existing_versions`, `incoming_version`, and a `to_payload()`
+  method for JSON serialization. Non-destructive: the check runs
+  BEFORE any source row is inserted.
+- **`AGENT_KB_AUTO_REEMBED=1` env var** — documented bypass for the
+  mixed-version rejection. Operators set this when intentionally
+  re-embedding an existing KB under a new embedder.
+- **MMR fastembed-specific lambda tuning** — two new
+  `Settings` fields:
+  - `query_mmr_lambda_default` (default 0.5) — for fp32-class
+    embedders (sentence-transformers, remote, ollama).
+  - `query_mmr_lambda_fastembed` (default 0.4) — slightly lower to
+    compensate for int8 quantization compressing the similarity
+    span between near-duplicates.
+  - New `services.query.mmr_lambda_for(settings, embedder)` helper
+    routes by `embedder_version.startswith("fastembed/")`.
+  - The current chromadb chunk path doesn't yet wire MMR through
+    `query()`; the constants + helper land now so a future MMR
+    rerank pass picks them up consistently across embedder
+    families.
+- **`tests/test_embedder_version_mismatch.py`** — 9 tests covering
+  the schema migration (additive + idempotent), the `insert_chunk`
+  -> native column mapping, `get_embedder_versions` set semantics
+  (distinct + dedup + NULL-skip + metadata fallback), the
+  same-version pass, the different-version rejection (with
+  `error_code` / `to_payload` shape), the
+  `AGENT_KB_AUTO_REEMBED=1` bypass, and the legacy-NULL KB pass.
+- **`tests/test_fastembed_dimension_compat.py`** — 4 tests
+  pinning fastembed-MiniLM-class dimensionality (384), the
+  dimension-cache property semantics, the int8-marker on
+  `embedder_version`, and the Python-list return type.
+  `pytest.importorskip("fastembed")` at the top — skipped when
+  the `[embed-local-onnx]` extra is not installed.
+- **`tests/test_fastembed_recall_parity.py`** — Jaccard@10
+  parity test between fastembed-MiniLM-int8 and
+  sentence-transformers-MiniLM-fp32 on a fixed 50-doc corpus,
+  asserting >= 0.95 (validation finding f-09 sharpening). Skipped
+  when either local-embedding extra is missing.
+- **`docs/install_size.md`** — per-extra install-size table,
+  cumulative table, regeneration command, and methodology. Per
+  `docs/redesign/MISTAKES.md` M-03: do not quote install-size
+  numbers without enumerating which deps stay vs move. Realistic
+  default install ~700 MB (chromadb dominates); `[embed-local-st]`
+  adds ~1.3 GB; `[embed-local-onnx]` adds ~150 MB.
+
+### Changed
+
+- **`Settings.embedding_provider`** default flipped from `'ollama'`
+  to `'remote'`. The Literal type also gains `'fastembed'`. Existing
+  v0.6.0/v0.10.x KBs continue to query under their original embedder
+  via the Phase 4 per-chunk snapshot — proven by the unchanged
+  `tests/test_per_page_provider_snapshot.py::test_query_embedder_for_uses_snapshot_after_default_flip`
+  which still passes after this flip.
+- **`Settings.embedding_model`** default flipped from
+  `'qwen3-embedding:8b'` to `'text-embedding-3-small'`.
+- **`SentenceTransformerEmbedder.__init__`** now lazy-imports
+  `sentence_transformers` and raises a friendly `RuntimeError`
+  pointing at `pip install agent-knowledgebase[embed-local-st]` if
+  the extra is missing. The class itself stays — operators who
+  install the extra still get the same surface.
+- **`pyproject.toml`** restructured. Defaults now carry only the
+  minimal-viable-retrieval set (`mcp`, `pydantic`,
+  `pydantic-settings`, `chromadb`, `trafilatura`, `gitpython`,
+  `httpx`, `tiktoken`). New `[project.optional-dependencies]`
+  groups: `embed-local-onnx`, `embed-local-st`, `ingest-codebase`,
+  `ingest-file`, `ingest-sql`, plus an `all` convenience extra.
+  `pinecone` extra retained.
+- **`KnowledgebaseService._ingest_source_locked`** — gains the
+  Phase 5 mixed-version rejection at the top (BEFORE any source
+  row is inserted) and stamps `embedder_version` on each chunk's
+  metadata in the embed loop. Defensive `isinstance(version, str)`
+  check keeps test mocks (whose `MagicMock.embedder_version`
+  returns a MagicMock) from poisoning the stamping path.
+- **`Database.insert_chunk`** stamps `embedder_version` from
+  `chunk.metadata` into the new native column alongside the Phase
+  4 `embedding_provider` / `embed_base_url` stamps.
+- **`create_embedder_for_model`** signature gains an optional
+  `version` kwarg (Phase 5 forward-compat — accepted and ignored
+  today). The Phase 4 `(model_name, provider, base_url)` signature
+  is preserved bit-for-bit.
+
+### Frozen contracts (preserved)
+
+- The 25 v0.6.0 `kb_*` MCP tools + Phase 4's `kb_migrate` =
+  **26 tools surface**. Names, parameters, response shapes — all
+  bit-for-bit identical. No new MCP tools in Phase 5.
+- Decorator order on every tool: `@mcp.tool()` outer,
+  `@_with_tool_timeout` inner. Per `docs/redesign/MISTAKES.md` M-01.
+- `Settings.kb_backend` default — still `'chromadb'`. Phase 5
+  changes embedding defaults, NOT backend default.
+- Probe-4 contract (`source_type`, `uri`, `dedup_key`, `page_id`,
+  `dominant_embedding_model`) on `kb_info` / `kb_list_pages` /
+  `kb_list_sources` — unchanged.
+- `knowledgebase_stderr_log` 11-field schema — unchanged.
+- Database schema is strictly additive (`ALTER TABLE ADD COLUMN`
+  with NULL defaults). Rollback SQL:
+  ```sql
+  -- Requires SQLite >= 3.35.
+  ALTER TABLE chunks DROP COLUMN IF EXISTS embedder_version;
+  ```
+
+### Deferred
+
+- **`requirements.lock` regeneration** — neither `uv` nor
+  `pip-compile` was on the test environment's PATH at release-cut
+  time. The pyproject.toml `[project] dependencies` and
+  `[project.optional-dependencies]` blocks are the single source
+  of truth for runtime resolution. To regenerate locally:
+  ```bash
+  uv pip compile pyproject.toml --generate-hashes -o requirements.lock
+  # OR:
+  pip install pip-tools && pip-compile --generate-hashes -o requirements.lock pyproject.toml
+  ```
+  Operators wanting a hash-pinned install should run the command
+  from a clean checkout. Documented in `docs/install_size.md`.
+
+### NOT in scope (Phase 6+)
+
+- `LightRAGBackend` — Phase 6 (deferred, conditional on adoption
+  signal). Stub-only delivery — no production LightRAG path in
+  this release.
+
 ## 0.10.0 — 2026-04-24
 
 > Phase 4 of the v2.1 redesign — migration tooling + dual-backend

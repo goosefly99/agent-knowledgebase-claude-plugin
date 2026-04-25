@@ -183,18 +183,33 @@ class Settings(BaseSettings):
     )
 
     # --- Embeddings ---
-    embedding_provider: Literal["ollama", "sentence-transformers", "remote"] = Field(
-        default="ollama",
-        description="Embedding provider: 'ollama' (default — native /api/embed, "
-        "no API key), 'sentence-transformers' (local, offline), or 'remote' "
-        "(HTTP endpoint speaking the OpenAI-compatible /v1/embeddings JSON "
-        "contract — e.g. vLLM, LocalAI, or Ollama's /v1 surface).",
+    embedding_provider: Literal[
+        "ollama", "sentence-transformers", "remote", "fastembed"
+    ] = Field(
+        default="remote",
+        description="Embedding provider: 'remote' (default since v0.11.0 — "
+        "HTTP endpoint speaking the OpenAI-compatible /v1/embeddings JSON "
+        "contract — e.g. OpenAI proper, vLLM, LocalAI, or Ollama's /v1 "
+        "surface), 'ollama' (native /api/embed, no API key), "
+        "'sentence-transformers' (local, offline; install via "
+        "'pip install agent-knowledgebase[embed-local-st]'), or "
+        "'fastembed' (local ONNX runtime; install via "
+        "'pip install agent-knowledgebase[embed-local-onnx]'). "
+        "The Phase 5 default-flip from 'ollama' to 'remote' relies on "
+        "the Phase 4 per-chunk provider snapshot — existing v0.6.0 KBs "
+        "ingested under 'ollama' stay queryable post-flip because the "
+        "snapshot rebuilds the original embedder via "
+        "create_embedder_for_model(model, provider=..., base_url=...). "
+        "spec_id: 70ab2170-381a-4657-bcd1-28a40c6f369b",
     )
     embedding_model: str = Field(
-        default="qwen3-embedding:8b",
-        description="Embedding model name. Default targets the Ollama "
-        "'qwen3-embedding:8b' model; switch to e.g. 'all-MiniLM-L6-v2' "
-        "when embedding_provider = 'sentence-transformers'.",
+        default="text-embedding-3-small",
+        description="Embedding model name. Default since v0.11.0 targets "
+        "OpenAI's 'text-embedding-3-small' (1536-dim). Switch to e.g. "
+        "'qwen3-embedding:8b' when embedding_provider = 'ollama', "
+        "'all-MiniLM-L6-v2' for sentence-transformers, or "
+        "'BAAI/bge-small-en-v1.5' for fastembed. spec_id: "
+        "70ab2170-381a-4657-bcd1-28a40c6f369b",
     )
     embed_api_key: Optional[str] = Field(
         default=None,
@@ -312,6 +327,42 @@ class Settings(BaseSettings):
         default=2,
         ge=1,
         description="Over-fetch multiplier used to merge hybrid results before trimming to top_k",
+    )
+
+    # --- MMR (Maximal Marginal Relevance) tuning — Phase 5 ---
+    # MMR balances result relevance (lambda close to 1.0) against
+    # diversity (lambda close to 0.0). The default is tuned for the
+    # current chromadb cosine-distance default; fastembed's int8
+    # quantization compresses vector magnitudes, which inflates the
+    # raw similarity span between near-duplicates and pushes
+    # near-equal candidates closer together. To recover the same
+    # diversity character, the fastembed-specific lambda is biased a
+    # touch lower so the diversity term has more room to operate.
+    #
+    # Validation finding f-09 sharpening: empirically, sentence-
+    # transformers fp32 MiniLM and fastembed int8 MiniLM produce
+    # Jaccard@10 >= 0.95 on a fixed small corpus (test_fastembed_
+    # recall_parity), so the underlying neighbour set is the same;
+    # the lambda delta is purely about how MMR's distance term
+    # behaves under int8 quantization noise.
+    query_mmr_lambda_default: float = Field(
+        default=0.5,
+        ge=0.0,
+        le=1.0,
+        description="MMR lambda for non-fastembed embedders (fp32-class). "
+        "Higher = more relevance-biased; lower = more diversity-biased. "
+        "spec_id: 70ab2170-381a-4657-bcd1-28a40c6f369b",
+    )
+    query_mmr_lambda_fastembed: float = Field(
+        default=0.4,
+        ge=0.0,
+        le=1.0,
+        description="MMR lambda for fastembed (int8 ONNX) embedders. "
+        "Slightly lower than the default to compensate for int8 "
+        "quantization compressing the similarity span between near-"
+        "duplicates — without the bump, MMR's diversity term loses "
+        "headroom and results feel more redundant. spec_id: "
+        "70ab2170-381a-4657-bcd1-28a40c6f369b",
     )
 
     # --- Ingest ---

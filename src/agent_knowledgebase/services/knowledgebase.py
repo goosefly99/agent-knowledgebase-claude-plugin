@@ -31,6 +31,7 @@ event loop, so it would be wrong here.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import threading
 import time
@@ -71,6 +72,62 @@ from agent_knowledgebase.services.query import (
 from agent_knowledgebase.services.stderr_log import knowledgebase_stderr_log
 from agent_knowledgebase.services.vectorstore import VectorStore, create_vectorstore
 from agent_knowledgebase.services.wiki import WikiManager
+
+
+# ---------------------------------------------------------------------------
+# Phase 5 — mixed embedder_version rejection
+# ---------------------------------------------------------------------------
+
+
+class EmbedderVersionMismatchError(RuntimeError):
+    """Ingest under embedder *V_new* into a KB carrying chunks under *V_old*.
+
+    Phase 5 introduces per-chunk ``embedder_version`` stamping so two
+    embedders with the same nominal model_name but different
+    quantization or library (e.g. fastembed-MiniLM-int8 vs
+    sentence-transformers-MiniLM-fp32) cannot be silently mixed in the
+    same KB. Vectors from different embedder versions don't compose
+    correctly under cosine similarity even when their dimensions
+    match.
+
+    Bypass: set ``AGENT_KB_AUTO_REEMBED=1`` in the environment when
+    intentionally re-embedding an existing KB under a new embedder.
+    Operators should typically follow up with a re-ingest of the
+    older chunks under the new embedder, or accept that
+    cross-version retrieval will be noisy.
+
+    spec_id: 70ab2170-381a-4657-bcd1-28a40c6f369b
+    """
+
+    error_code = "EMBEDDER_VERSION_MISMATCH"
+
+    def __init__(
+        self,
+        *,
+        kb_id: str,
+        existing_versions: set[str],
+        incoming_version: str,
+    ) -> None:
+        self.kb_id = kb_id
+        self.existing_versions = set(existing_versions)
+        self.incoming_version = incoming_version
+        existing_repr = sorted(self.existing_versions)
+        super().__init__(
+            f"EMBEDDER_VERSION_MISMATCH: kb_id={kb_id!r} already carries "
+            f"chunks under embedder_version(s) {existing_repr}; refusing "
+            f"to ingest under {incoming_version!r}. Set "
+            f"AGENT_KB_AUTO_REEMBED=1 to bypass."
+        )
+
+    def to_payload(self) -> dict[str, object]:
+        return {
+            "error": "embedder_version_mismatch",
+            "error_code": self.error_code,
+            "kb_id": self.kb_id,
+            "existing_versions": sorted(self.existing_versions),
+            "incoming_version": self.incoming_version,
+            "bypass_env": "AGENT_KB_AUTO_REEMBED=1",
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -605,6 +662,35 @@ class KnowledgebaseService:
         if kb is None:
             raise ValueError(f"KB {kb_id} not found")
 
+        # Phase 5 — mixed embedder_version rejection.
+        # Inspect the incoming embedder's version against any version(s)
+        # already stamped on this KB's chunks. If the KB carries chunks
+        # under a different embedder_version AND the operator has not
+        # opted into AGENT_KB_AUTO_REEMBED=1, refuse the ingest with
+        # EMBEDDER_VERSION_MISMATCH. The check runs BEFORE any source
+        # row is inserted so the rejection is non-destructive.
+        #
+        # Defensive: only enforce when the embedder reports a *string*
+        # version. Test mocks may return non-string sentinels (e.g.
+        # MagicMock attributes) that can't be JSON-serialized later.
+        # The Phase 5 Protocol says embedder_version is a str; treat
+        # anything else as "no version stamped" so legacy mocks keep
+        # working unchanged.
+        # spec_id: 70ab2170-381a-4657-bcd1-28a40c6f369b
+        incoming_version = getattr(self._embedder, "embedder_version", None)
+        if isinstance(incoming_version, str) and incoming_version:
+            existing_versions = ctx.db.get_embedder_versions(kb_id)
+            if (
+                existing_versions
+                and incoming_version not in existing_versions
+                and os.environ.get("AGENT_KB_AUTO_REEMBED") != "1"
+            ):
+                raise EmbedderVersionMismatchError(
+                    kb_id=kb_id,
+                    existing_versions=existing_versions,
+                    incoming_version=incoming_version,
+                )
+
         policy_value = (
             dedup_policy.value if isinstance(dedup_policy, DedupPolicy) else str(dedup_policy)
         )
@@ -692,12 +778,31 @@ class KnowledgebaseService:
             # secrets stay in Settings/env per the FORBIDDEN_KEYS
             # discipline; the snapshot only carries non-secret routing
             # metadata. spec_id: 70ab2170-381a-4657-bcd1-28a40c6f369b
+            # Phase 5: also stamp embedder_version (the opaque
+            # quantization/library discriminator) so the per-KB
+            # mixed-version rejection at the top of the next ingest
+            # has a per-chunk anchor to compare against. Pulled from
+            # the embedder via Embedder.embedder_version (Phase 5
+            # Protocol addition). Defensive isinstance() check keeps
+            # test mocks (MagicMock attributes return MagicMocks, not
+            # strings) from poisoning the JSON-serialized chunk
+            # metadata. spec_id:
+            # 70ab2170-381a-4657-bcd1-28a40c6f369b
+            embedder_version_for_stamp = getattr(
+                self._embedder, "embedder_version", None
+            )
+            stamp_version = (
+                isinstance(embedder_version_for_stamp, str)
+                and bool(embedder_version_for_stamp)
+            )
             for chunk in chunks:
                 chunk.metadata["embedding_model"] = self._embedder.model_name
                 chunk.metadata["kb_id"] = kb_id
                 chunk.metadata["embedding_provider"] = self._config.embedding_provider
                 if self._config.embed_base_url is not None:
                     chunk.metadata["embed_base_url"] = self._config.embed_base_url
+                if stamp_version:
+                    chunk.metadata["embedder_version"] = embedder_version_for_stamp
             # Route the index write through the RetrieverBackend
             # abstraction (Phase 2). For chromadb this is a thin wrapper
             # around ``vectorstore.add(...)``; markdown (Phase 3) /

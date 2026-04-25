@@ -754,8 +754,11 @@ class TestKbConfigShow:
         result = json.loads(srv.kb_config_show("defaults"))
         # Literal defaults
         assert result["vectorstore"] == "chromadb"
-        assert result["embedding"]["provider"] == "ollama"
-        assert result["embedding"]["model"] == "qwen3-embedding:8b"
+        # Phase 5 default-flip (v0.11.0): provider 'ollama' -> 'remote',
+        # model 'qwen3-embedding:8b' -> 'text-embedding-3-small'.
+        # spec_id: 70ab2170-381a-4657-bcd1-28a40c6f369b
+        assert result["embedding"]["provider"] == "remote"
+        assert result["embedding"]["model"] == "text-embedding-3-small"
         assert result["chunk"]["size"] == 512
         assert result["chunk"]["overlap"] == 64
         assert result["query"]["default_top_k"] == 10

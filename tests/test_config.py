@@ -63,10 +63,18 @@ class TestDefaults:
         assert test_config.vectorstore == "chromadb"
 
     def test_default_embedding_provider(self, test_config: Settings) -> None:
-        assert test_config.embedding_provider == "ollama"
+        # Phase 5 default-flip (v0.11.0): default flipped from 'ollama' to
+        # 'remote'. Existing v0.6.0 KBs ingested under 'ollama' stay
+        # queryable post-flip via the Phase 4 per-chunk provider snapshot.
+        # spec_id: 70ab2170-381a-4657-bcd1-28a40c6f369b
+        assert test_config.embedding_provider == "remote"
 
     def test_default_embedding_model(self, test_config: Settings) -> None:
-        assert test_config.embedding_model == "qwen3-embedding:8b"
+        # Phase 5 default-flip (v0.11.0): paired with the
+        # embedding_provider flip — default model flipped from
+        # 'qwen3-embedding:8b' (Ollama) to 'text-embedding-3-small'
+        # (OpenAI-compat).
+        assert test_config.embedding_model == "text-embedding-3-small"
 
     def test_default_chunk_size(self, test_config: Settings) -> None:
         assert test_config.chunk_size == 512

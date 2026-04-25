@@ -1,27 +1,52 @@
 [project]
 name = "agent-knowledgebase"
-version = "0.10.0"
+version = "0.11.0"
 description = "Personal knowledgebase plugin — ingest sources, build wiki artifacts, query with vector search"
 requires-python = ">=3.11"
+# Phase 5 default install — minimal viable retrieval. chromadb stays
+# (default vectorstore); httpx + pydantic + mcp + tiktoken + trafilatura
+# are runtime essentials. sentence-transformers, tree-sitter*,
+# pdfplumber, sqlalchemy, sqlparse have moved into [optional-dependencies]
+# extras to drop the default install size. spec_id:
+# 70ab2170-381a-4657-bcd1-28a40c6f369b
 dependencies = [
     "mcp>=1.0.0",
     "pydantic>=2.0",
     "pydantic-settings>=2.0",
     "chromadb>=0.5",
-    "sentence-transformers>=3.0",
     "trafilatura>=1.0",
-    "tree-sitter>=0.23",
-    "tree-sitter-languages>=1.10",
     "gitpython>=3.1",
-    "sqlalchemy>=2.0",
-    "sqlparse>=0.5",
     "httpx>=0.27",
-    "pdfplumber>=0.11",
     "tiktoken>=0.7",
 ]
 
+# Phase 5 — opt-in extras. See docs/install_size.md for per-extra
+# install-size tables. The 'all' convenience extra pulls every
+# optional dep group at once. spec_id:
+# 70ab2170-381a-4657-bcd1-28a40c6f369b
 [project.optional-dependencies]
+embed-local-onnx = ["qdrant-fastembed>=0.4"]
+embed-local-st = ["sentence-transformers>=3.0"]
+ingest-codebase = [
+    "tree-sitter>=0.22",
+    "tree-sitter-languages>=1.10",
+]
+ingest-file = ["pdfplumber>=0.11"]
+ingest-sql = [
+    "sqlalchemy>=2.0",
+    "sqlparse>=0.5",
+]
 pinecone = ["pinecone-client>=3.0"]
+all = [
+    "qdrant-fastembed>=0.4",
+    "sentence-transformers>=3.0",
+    "tree-sitter>=0.22",
+    "tree-sitter-languages>=1.10",
+    "pdfplumber>=0.11",
+    "sqlalchemy>=2.0",
+    "sqlparse>=0.5",
+    "pinecone-client>=3.0",
+]
 
 [project.scripts]
 agent-knowledgebase-server = "agent_knowledgebase.server:main"

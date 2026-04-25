@@ -2,15 +2,37 @@
 
 Supported providers:
 
-* ``ollama`` (default) — POSTs to Ollama's native ``/api/embed`` endpoint.
+* ``remote`` (default — Phase 5 flip) — POSTs to an HTTP
+  ``/v1/embeddings`` endpoint speaking the OpenAI-compatible
+  embeddings JSON contract (``{"input": [...], "model": ...}`` →
+  ``{"data": [{"index": N, "embedding": [...]}]}``). Works with
+  vLLM, LocalAI, OpenAI, Azure OpenAI, Ollama's ``/v1`` surface, etc.
+* ``ollama`` — POSTs to Ollama's native ``/api/embed`` endpoint.
   Requires only ``base_url`` (default ``http://127.0.0.1:11434``); no API
   key. Parses the Ollama response shape ``{"embeddings": [[...]]}``.
-* ``remote`` — POSTs to an HTTP ``/v1/embeddings`` endpoint speaking the
-  OpenAI-compatible embeddings JSON contract (``{"input": [...], "model":
-  ...}`` → ``{"data": [{"index": N, "embedding": [...]}]}``). Works with
-  vLLM, LocalAI, OpenAI, Azure OpenAI, Ollama's ``/v1`` surface, etc.
 * ``sentence-transformers`` — Local embedder backed by the
-  ``sentence-transformers`` library (offline-capable).
+  ``sentence-transformers`` library (offline-capable). Moved to opt-in
+  ``[embed-local-st]`` extra in Phase 5; install via
+  ``pip install agent-knowledgebase[embed-local-st]``.
+* ``fastembed`` (Phase 5, opt-in) — Local ONNX-runtime embedder backed
+  by ``qdrant-fastembed``. Install via
+  ``pip install agent-knowledgebase[embed-local-onnx]``. Lazy-imports
+  ``fastembed`` only inside :class:`FastembedEmbedder` so the rest of
+  the embeddings module loads even when fastembed isn't installed.
+
+Embedder version (Phase 5)
+--------------------------
+
+Every embedder exposes :attr:`Embedder.embedder_version` — an opaque
+string that uniquely identifies the embedder's vector geometry beyond
+just its model name. Two embedders with the same nominal model_name
+(e.g. ``"all-MiniLM-L6-v2"``) but different libraries / quantizations
+(e.g. fastembed-int8 vs HF-fp32) MUST report different
+``embedder_version`` values. Stamped on every ingested chunk by
+:class:`Database.insert_chunk` so
+``KnowledgebaseService._ingest_source_locked`` can detect mixed-
+version ingests via :meth:`Database.get_embedder_versions`. The
+``AGENT_KB_AUTO_REEMBED=1`` env var bypasses the rejection.
 """
 
 from __future__ import annotations
@@ -198,6 +220,27 @@ class Embedder(Protocol):
         """Return the name of the embedding model."""
         ...
 
+    @property
+    def embedder_version(self) -> str:
+        """Return an opaque version string identifying the embedder's geometry.
+
+        Two embedders with the same nominal :attr:`model_name` but
+        different libraries / quantizations MUST report different
+        version strings — fastembed-MiniLM-int8 is NOT
+        interchangeable with sentence-transformers' MiniLM-fp32 even
+        though both report ``model_name='all-MiniLM-L6-v2'``. The
+        per-chunk stamp lives in :attr:`Database.insert_chunk` so the
+        Phase 5 mixed-version rejection in
+        ``KnowledgebaseService._ingest_source_locked`` can detect
+        mismatches early.
+
+        Format convention (not enforced, but recommended):
+        ``"<library>/<model_name>[@<quant_or_provider>]"``.
+
+        spec_id: 70ab2170-381a-4657-bcd1-28a40c6f369b
+        """
+        ...
+
     def probe_dimension(self) -> int:
         """Return the dimensionality of vectors produced by this embedder.
 
@@ -220,10 +263,23 @@ class Embedder(Protocol):
 
 
 class SentenceTransformerEmbedder:
-    """Local embedder backed by the ``sentence-transformers`` library."""
+    """Local embedder backed by the ``sentence-transformers`` library.
+
+    Phase 5: this provider is no longer in the default install. Install
+    via ``pip install agent-knowledgebase[embed-local-st]`` to use.
+    Lazy-imports ``sentence_transformers`` inside ``__init__`` so the
+    rest of the embeddings module loads cleanly when the extra is
+    not installed.
+    """
 
     def __init__(self, model_name: str = "all-MiniLM-L6-v2") -> None:
-        from sentence_transformers import SentenceTransformer
+        try:
+            from sentence_transformers import SentenceTransformer
+        except ImportError as exc:
+            raise RuntimeError(
+                "sentence-transformers provider requires "
+                "'pip install agent-knowledgebase[embed-local-st]'"
+            ) from exc
 
         self._model_name = model_name
         self._model = SentenceTransformer(model_name)
@@ -246,6 +302,11 @@ class SentenceTransformerEmbedder:
     def model_name(self) -> str:
         """Return the name of the loaded SentenceTransformer model."""
         return self._model_name
+
+    @property
+    def embedder_version(self) -> str:
+        """Version string distinguishing HF-fp32 from other quantizations."""
+        return f"sentence-transformers/{self._model_name}@hf-fp32"
 
     def probe_dimension(self) -> int:
         """Return the embedding dimension; the loaded model reports it directly."""
@@ -423,6 +484,17 @@ class RemoteEmbedder:
         """Return the name of the remote embedding model."""
         return self._model_name
 
+    @property
+    def embedder_version(self) -> str:
+        """Version string identifying the remote OpenAI-compat endpoint.
+
+        Includes the base_url so two RemoteEmbedders pointed at
+        different OpenAI-compat servers (e.g. OpenAI proper vs vLLM)
+        for the same nominal model are still treated as distinct
+        embedders for the Phase 5 mixed-version rejection.
+        """
+        return f"remote/{self._model_name}@{self._base_url}"
+
 
 # ---------------------------------------------------------------------------
 # Ollama native provider (/api/embed)
@@ -584,6 +656,114 @@ class OllamaEmbedder:
         """Return the Ollama model identifier."""
         return self._model_name
 
+    @property
+    def embedder_version(self) -> str:
+        """Version string identifying this Ollama endpoint+model pair."""
+        return f"ollama/{self._model_name}@{self._base_url}"
+
+
+# ---------------------------------------------------------------------------
+# Fastembed local-ONNX provider (Phase 5, opt-in)
+# ---------------------------------------------------------------------------
+
+
+class FastembedEmbedder:
+    """Local ONNX-runtime embedder backed by ``qdrant-fastembed``.
+
+    Phase 5 (opt-in). Install via
+    ``pip install agent-knowledgebase[embed-local-onnx]``. The
+    ``fastembed`` import is deliberately deferred to ``__init__`` so
+    the rest of this module loads even when the extra is not
+    installed.
+
+    fastembed produces vectors of the same dimensionality as the
+    matching sentence-transformers model (e.g. ``MiniLM-L6-v2`` → 384)
+    but the int8-quantized ONNX path produces VECTORS THAT ARE NOT
+    INTERCHANGEABLE with the fp32 sentence-transformers vectors. Same
+    nominal model_name; different geometry. The Phase 5
+    :attr:`embedder_version` discrimination is what keeps the
+    :meth:`Database.get_embedder_versions`-driven mixed-version
+    rejection from silently accepting cross-quantization mixes.
+
+    spec_id: 70ab2170-381a-4657-bcd1-28a40c6f369b
+    """
+
+    def __init__(
+        self,
+        model_name: str = "BAAI/bge-small-en-v1.5",
+    ) -> None:
+        try:
+            from fastembed import TextEmbedding
+        except ImportError as exc:
+            raise RuntimeError(
+                "fastembed provider requires "
+                "'pip install agent-knowledgebase[embed-local-onnx]'"
+            ) from exc
+
+        self._model_name = model_name
+        self._model = TextEmbedding(model_name=model_name)
+        self._dimension_cache: int | None = None
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        """Batch-embed *texts* via fastembed's ONNX runtime."""
+        if not texts:
+            return []
+        # ``embed`` returns a generator of numpy arrays.
+        vectors = [vec.tolist() for vec in self._model.embed(texts)]
+        if vectors and self._dimension_cache is None:
+            self._dimension_cache = len(vectors[0])
+        return vectors
+
+    def embed_query(self, text: str) -> list[float]:
+        """Embed a single query string."""
+        # Some fastembed model families ship a separate ``query_embed``
+        # method with a query-prefix prompt; fall back to ``embed`` when
+        # not available so generic models keep working.
+        query_embed = getattr(self._model, "query_embed", None)
+        if callable(query_embed):
+            vectors = [vec.tolist() for vec in query_embed([text])]
+        else:
+            vectors = self.embed([text])
+        if vectors and self._dimension_cache is None:
+            self._dimension_cache = len(vectors[0])
+        return vectors[0]
+
+    def probe_dimension(self) -> int:
+        """Return the embedding dimension, probing a one-text embed."""
+        if self._dimension_cache is not None:
+            return self._dimension_cache
+        vectors = self.embed([_PROBE_TEXT])
+        if not vectors or not vectors[0]:
+            raise RuntimeError(
+                f"fastembed model {self._model_name!r} returned an "
+                f"empty embedding on probe"
+            )
+        self._dimension_cache = len(vectors[0])
+        return self._dimension_cache
+
+    @property
+    def dimension(self) -> int:
+        """Return the embedding dimension, probing on first access."""
+        if self._dimension_cache is None:
+            self.probe_dimension()
+        assert self._dimension_cache is not None
+        return self._dimension_cache
+
+    @property
+    def model_name(self) -> str:
+        """Return the fastembed model identifier."""
+        return self._model_name
+
+    @property
+    def embedder_version(self) -> str:
+        """Version string flagging the int8 ONNX quantization.
+
+        fastembed's MiniLM-int8 vectors are NOT interchangeable with
+        sentence-transformers' MiniLM-fp32 vectors — the mixed-
+        version rejection uses this to keep them apart.
+        """
+        return f"fastembed/{self._model_name}-int8"
+
 
 # ---------------------------------------------------------------------------
 # Factory
@@ -613,6 +793,7 @@ def create_embedder_for_model(
     *,
     provider: str | None = None,
     base_url: str | None = None,
+    version: str | None = None,
 ) -> Embedder:
     """Instantiate an :class:`Embedder` matching *model_name*.
 
@@ -631,6 +812,13 @@ def create_embedder_for_model(
       embedding-3-small). When provider/base_url are passed explicitly,
       they override config; the API key still comes from
       ``config.embed_api_key`` (secrets are not stamped per-page).
+    * Phase 5 adds the optional ``version`` kwarg — purely informational
+      today. Future use: when a snapshot's stamped ``embedder_version``
+      doesn't match the embedder this factory would produce, the
+      caller (or a future version of this factory) can warn / refuse /
+      auto-switch. The current implementation accepts and ignores
+      ``version`` so test harnesses can pass it through without
+      breaking the Phase 4 contract.
 
     When ``model_name`` is ``None`` or equals the configured default
     AND no overrides are supplied, the regular configured embedder is
@@ -640,6 +828,11 @@ def create_embedder_for_model(
 
     spec_id: 70ab2170-381a-4657-bcd1-28a40c6f369b
     """
+    # ``version`` is accepted for forward-compat (Phase 5) but the
+    # current builder is deterministic from (provider, model, base_url)
+    # so we don't route on it. Keep the param so downstream callers
+    # can pass it through without TypeError.
+    _ = version
     has_override = provider is not None or base_url is not None
     if not has_override and (not model_name or model_name == config.embedding_model):
         return create_embedder(config)
@@ -668,6 +861,12 @@ def _build_embedder(
     """Internal builder shared by :func:`create_embedder` variants."""
     if provider == "sentence-transformers":
         return SentenceTransformerEmbedder(model_name=model)
+    if provider == "fastembed":
+        # Phase 5 opt-in. The class itself raises a friendly RuntimeError
+        # pointing at ``pip install agent-knowledgebase[embed-local-onnx]``
+        # if fastembed isn't installed; we don't need to repeat the
+        # check here.
+        return FastembedEmbedder(model_name=model)
     if provider == "ollama":
         return OllamaEmbedder(
             model_name=model,
