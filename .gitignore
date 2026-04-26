@@ -5,6 +5,7 @@ __pycache__/
 dist/
 build/
 .venv/
+.venv.lock
 
 # IDE
 .idea/
@@ -26,3 +27,4 @@ htmlcov/
 
 # Project
 *.db
+docs/superpowers/
