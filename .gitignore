@@ -28,3 +28,7 @@ htmlcov/
 # Project
 *.db
 docs/superpowers/
+.tmp_saves/
+
+# Integration smoke run outputs
+tests/integration/fixtures/ingest_summary.json
