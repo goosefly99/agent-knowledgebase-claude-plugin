@@ -85,6 +85,13 @@ _BACKEND_NAME = "textvec"
 _SPEC_VERSION = "2.2"
 _SPEC_ID = "70ab2170-381a-4657-bcd1-28a40c6f369b"
 
+# Module-level set tracking which kb_ids have already received the
+# "rebuild_recommended" legacy-embedding hint within this process lifetime.
+# Intentional session-scoped state: we emit the hint once per kb_id per
+# process to avoid log spam on every query, but do NOT persist it to disk
+# (the hint is informational, not operational). A process restart resets this.
+_rebuild_hint_emitted_kbs: set[str] = set()
+
 # Scalar primitive types accepted as filter values.
 # See _validate_filter_dict docstring and module-level "Filter validation"
 # note above for the rationale on copying vs. importing from chromadb_backend.
@@ -485,7 +492,7 @@ class TextvecBackend:
 
         sql = (
             "SELECT chunks.id, chunks.source_id, chunks.kb_id, "
-            "chunks.content, chunks.metadata, rank "
+            "chunks.content, chunks.metadata, chunks.embedding_provider, rank "
             "FROM chunks "
             "JOIN chunks_fts ON chunks.rowid = chunks_fts.rowid "
             f"WHERE chunks_fts MATCH ? AND chunks.kb_id = ?{filter_suffix} "
@@ -524,6 +531,13 @@ class TextvecBackend:
                     },
                 }
             )
+
+        # Read-fallback hint: check if any returned rows carry non-NULL
+        # embedding_provider (legacy chromadb-stamped KB). This check is
+        # performed on already-fetched rows — no extra SQL round-trip.
+        # Emitted at most once per kb_id per process (module-level set).
+        _maybe_emit_rebuild_hint(kb_id, rows)
+
         return results
 
     def delete(
@@ -652,6 +666,59 @@ class TextvecBackend:
 # ---------------------------------------------------------------------------
 # Module-level helpers
 # ---------------------------------------------------------------------------
+
+
+def _maybe_emit_rebuild_hint(kb_id: str, rows: list) -> None:
+    """Emit a once-per-session rebuild-recommended hint for legacy chromadb-stamped KBs.
+
+    Checks whether any of the already-fetched ``chunks`` rows have a non-NULL
+    ``embedding_provider`` column — which indicates the KB was ingested under
+    the legacy chromadb backend and its ``chunks`` rows carry embedder metadata
+    that is irrelevant under TextvecBackend.
+
+    The hint is emitted AT MOST ONCE per ``kb_id`` per process lifetime
+    (tracked in the module-level ``_rebuild_hint_emitted_kbs`` set).
+    Subsequent queries on the same kb_id in the same process do NOT
+    re-emit. Emission is best-effort: if the sentinel check or the log
+    call raises, the exception is suppressed so the query result is
+    always returned to the caller regardless.
+
+    No extra SQL is issued — the check is a boolean scan over the
+    already-fetched sqlite3.Row objects (O(k) where k = top_k ≤ ~100),
+    so latency impact is negligible.
+    """
+    if kb_id in _rebuild_hint_emitted_kbs:
+        return
+    try:
+        has_legacy = any(row["embedding_provider"] is not None for row in rows)
+    except Exception:  # noqa: BLE001 — column may not exist in edge cases
+        return
+    if not has_legacy:
+        return
+    # Mark as emitted before the log call so a concurrent thread racing here
+    # cannot double-emit even on a very fast second query.
+    _rebuild_hint_emitted_kbs.add(kb_id)
+    try:
+        knowledgebase_stderr_log(
+            kb_id=kb_id,
+            op="textvec_query",
+            phase="query",
+            elapsed_ms=0,
+            rows_in=0,
+            rows_ok=0,
+            rows_skipped=0,
+            rows_failed=0,
+            dedup_policy="n/a",
+            request_id=None,
+            tool_caller_version=None,
+            error_code="REBUILD_RECOMMENDED",
+            error_message=(
+                "legacy chromadb-stamped chunks detected; "
+                "run kb_rebuild_index --backend=textvec to clean up embedder columns"
+            ),
+        )
+    except Exception:  # noqa: BLE001 — hint emission must never block results
+        pass
 
 
 def _probe_fts5_available() -> bool:

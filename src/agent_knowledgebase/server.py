@@ -10,7 +10,7 @@ import threading
 from dataclasses import asdict
 from functools import wraps
 from pathlib import Path
-from typing import Callable, TypeVar
+from typing import Callable, Literal, TypeVar
 
 from mcp.server.fastmcp import FastMCP
 
@@ -619,34 +619,53 @@ def kb_export(kb_id: str, output_dir: str) -> str:
 
 @mcp.tool()
 @_with_tool_timeout
-def kb_migrate(kb_id: str, target_backend: str) -> str:
-    """Migrate a knowledgebase between retrieval backends (Phase 4).
+def kb_migrate(
+    kb_id: str,
+    target_backend: Literal["markdown", "chromadb", "textvec"],
+) -> str:
+    """Migrate a knowledgebase between retrieval backends (Phase 4 / Phase C).
 
-    Cuts over the storage layout for *kb_id* to *target_backend*
-    (one of ``"chromadb"`` or ``"markdown"``) by:
+    Cuts over the storage layout for *kb_id* to *target_backend*.
 
-    1. Materialising the data on disk in the new backend's layout
+    For ``"markdown"`` and ``"chromadb"``:
+    1. Materialises the data on disk in the new backend's layout
        (``<saves_dir>/<kb-name>/wiki/`` for markdown,
        ``<saves_dir>/<kb-name>/chroma/`` for chromadb).
-    2. Writing the routing sentinel file
+    2. Writes the routing sentinel file
        ``<saves_dir>/<kb-name>/.migrated_to`` with the target backend
        name so future ``kb_query`` / ``kb_search`` calls route there.
-    3. Leaving the OLD backend's data untouched — rollback is
+    3. Leaves the OLD backend's data untouched — rollback is
        deleting the sentinel file. Operators reclaim disk space
        manually.
 
+    For ``"textvec"`` (Phase C additive):
+    Backfills the SQLite FTS5 index (``chunks_fts``) from the existing
+    ``chunks`` table rows for legacy chromadb-stamped KBs, then writes
+    the routing sentinel. Idempotent — a second call returns
+    ``{"status": "already_migrated"}``. Cross-process-safe via filelock.
+
     Parameters:
         kb_id: ID of the knowledgebase to migrate.
-        target_backend: Target backend name; one of ``"chromadb"`` or
-            ``"markdown"``. ``"lightrag"`` is rejected (Phase 6 deferred).
+        target_backend: Target backend name — ``"chromadb"``, ``"markdown"``,
+            or ``"textvec"``. ``"lightrag"`` is rejected (Phase 6 deferred).
 
-    Returns a JSON object summarising the migration:
+    Returns a JSON object summarising the migration.
+    For ``markdown``/``chromadb``:
     ``{"kb_id":..., "target_backend":..., "pages_migrated":N,
     "sentinel_path":..., "notes":[...], "spec_id":...}``.
+    For ``textvec``:
+    ``{"status": "migrated"|"already_migrated"|"deferred",
+    "rows": N, "elapsed_ms": M}``.
 
     spec_id: 70ab2170-381a-4657-bcd1-28a40c6f369b
     """
+    from agent_knowledgebase.services import migration
+
     svc = _get_service()
+
+    if target_backend == "textvec":
+        return json.dumps(migration.migrate_to_textvec(kb_id, svc))
+
     result = svc.migrate(kb_id=kb_id, target_backend=target_backend)
     return json.dumps(result)
 

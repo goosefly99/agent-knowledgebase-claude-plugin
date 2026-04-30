@@ -66,6 +66,15 @@ if TYPE_CHECKING:
 _VALID_BACKENDS = frozenset({"chromadb", "markdown"})
 _SPEC_ID = "70ab2170-381a-4657-bcd1-28a40c6f369b"
 
+# Sentinel value written inside the .migrated_to file for textvec migration.
+_TEXTVEC_SENTINEL_CONTENT = "textvec"
+
+# Lock filename for cross-process coordination (see docs/cross-process-lock-recipe.md).
+_INGEST_LOCK_FILENAME = ".ingest.lock"
+
+# Filelock timeout in seconds: 0 = try-once (non-blocking), return deferred on contention.
+_MIGRATION_FILELOCK_TIMEOUT = 0
+
 
 # ---------------------------------------------------------------------------
 # Result dataclass
@@ -357,13 +366,15 @@ def export_chromadb_dump(
         chunks.extend(ctx.db.list_chunks(source.id))
     rows: list[dict[str, Any]] = []
     for chunk in chunks:
-        rows.append({
-            "id": chunk.id,
-            "source_id": chunk.source_id,
-            "content": chunk.content,
-            "metadata": chunk.metadata,
-            "embedding_id": chunk.embedding_id,
-        })
+        rows.append(
+            {
+                "id": chunk.id,
+                "source_id": chunk.source_id,
+                "content": chunk.content,
+                "metadata": chunk.metadata,
+                "embedding_id": chunk.embedding_id,
+            }
+        )
     dest = Path(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -399,14 +410,11 @@ def import_chromadb_dump(
     payload = json.loads(src.read_text(encoding="utf-8"))
     if not isinstance(payload, dict):
         raise ValueError(
-            f"chromadb dump at {src} is not a JSON object — got "
-            f"{type(payload).__name__}"
+            f"chromadb dump at {src} is not a JSON object — got {type(payload).__name__}"
         )
     rows = payload.get("rows", [])
     if not isinstance(rows, list):
-        raise ValueError(
-            f"chromadb dump at {src} has rows={rows!r}; expected list"
-        )
+        raise ValueError(f"chromadb dump at {src} has rows={rows!r}; expected list")
     ctx = service._ctx(kb_id)  # noqa: SLF001
     inserted = 0
     for row in rows:
@@ -605,9 +613,7 @@ def migrate(
                 # The path is <saves_dir>/<dir_name>/wiki/, which matches
                 # MarkdownWikiBackend's natural layout.
                 pages_migrated = export_to_markdown(service, kb_id, kb_root)
-                notes.append(
-                    f"wrote {pages_migrated} markdown pages under {kb_root / 'wiki'}"
-                )
+                notes.append(f"wrote {pages_migrated} markdown pages under {kb_root / 'wiki'}")
             elif target_backend == "chromadb":
                 # Reverse direction: re-ingest pages/*.md back into chromadb.
                 # ``_lock_already_held=True`` so the import bypasses
@@ -617,9 +623,7 @@ def migrate(
                 pages_migrated = import_from_markdown(
                     service, kb_id, kb_root, _lock_already_held=True
                 )
-                notes.append(
-                    f"re-ingested {pages_migrated} markdown pages back into chromadb"
-                )
+                notes.append(f"re-ingested {pages_migrated} markdown pages back into chromadb")
 
             sentinel = _write_migrated_sentinel(kb_root, target_backend)
             notes.append(f"wrote sentinel {sentinel.name}={target_backend}")
@@ -666,6 +670,228 @@ def migrate(
     )
 
 
+# ---------------------------------------------------------------------------
+# Phase C — textvec migration (FTS5 backfill for legacy chromadb-stamped KBs)
+# ---------------------------------------------------------------------------
+
+
+def migrate_to_textvec(kb_id: str, service: "KnowledgebaseService") -> dict:
+    """Backfill ``chunks_fts`` for a legacy chromadb-stamped KB.
+
+    Idempotent via sentinel guard: if
+    ``<saves_dir>/<kb-dir>/.migrated_to`` already contains ``"textvec"``,
+    return early with ``status='already_migrated'`` without touching
+    ``chunks_fts``. Otherwise: acquire per-kb cross-process filelock,
+    call :meth:`Database.rebuild_fts5`, write the sentinel, emit a
+    structured stderr-log line, and return a summary dict.
+
+    The sentinel is the same ``.migrated_to`` file used by the existing
+    chromadb→markdown migration path.  Once written, future
+    ``kb_query`` / ``kb_search`` calls that route through
+    :func:`~agent_knowledgebase.backends.resolve_backend_name` will
+    automatically select :class:`TextvecBackend` for this KB because the
+    sentinel takes precedence over both ``kb_backend_per_kb`` and the
+    global ``kb_backend`` default.
+
+    Cross-process lock
+    ------------------
+
+    Uses :class:`filelock.FileLock` keyed on
+    ``<kb-root>/.ingest.lock`` (the same path recipe documented in
+    ``docs/cross-process-lock-recipe.md``).  The lock is acquired with a
+    zero-second timeout so that a concurrent ingest holding the lock
+    causes an immediate return with ``status='deferred'`` rather than a
+    raise — the MCP caller can retry at a safe moment.
+
+    Returns
+    -------
+    dict
+        ``{"status": "migrated"|"already_migrated"|"deferred", "rows": N, "elapsed_ms": M}``
+        with an optional ``"warning"`` key when ``rows == 0`` on a non-empty KB.
+        On ``status='deferred'``, an additional ``"reason": "ingest_in_progress"`` key
+        is included.
+
+    spec_id: 70ab2170-381a-4657-bcd1-28a40c6f369b
+    """
+    t0 = time.monotonic()
+
+    def _elapsed_ms() -> int:
+        return int((time.monotonic() - t0) * 1000)
+
+    kb_root = _resolve_kb_dir(service, kb_id)
+    kb_root.mkdir(parents=True, exist_ok=True)
+
+    # Sentinel guard (idempotency): check before acquiring the lock.
+    sentinel_path = kb_root / MIGRATED_SENTINEL_FILENAME
+    if sentinel_path.is_file():
+        try:
+            content = sentinel_path.read_text(encoding="utf-8").strip()
+        except OSError:
+            content = ""
+        if content == _TEXTVEC_SENTINEL_CONTENT:
+            elapsed = _elapsed_ms()
+            knowledgebase_stderr_log(
+                kb_id=kb_id,
+                op="kb_migrate",
+                phase="migration",
+                elapsed_ms=elapsed,
+                rows_in=0,
+                rows_ok=0,
+                rows_skipped=0,
+                rows_failed=0,
+                dedup_policy="n/a",
+                request_id=None,
+                tool_caller_version=None,
+                error_code=None,
+                error_message="kb already migrated",
+            )
+            return {"status": "already_migrated", "rows": 0, "elapsed_ms": elapsed}
+
+    # Cross-process filelock: timeout=0 → non-blocking try-once.
+    lock_path = kb_root / _INGEST_LOCK_FILENAME
+    try:
+        from filelock import FileLock
+    except ImportError:
+        # filelock is in requirements.lock but guard defensively.
+        FileLock = None  # type: ignore[assignment]
+
+    try:
+        if FileLock is not None:
+            lock = FileLock(str(lock_path), timeout=_MIGRATION_FILELOCK_TIMEOUT)
+            lock.acquire()
+        else:
+            lock = None  # type: ignore[assignment]
+    except Exception as exc:  # noqa: BLE001
+        # FilelockTimeout or any acquire failure → deferred.
+        elapsed = _elapsed_ms()
+        knowledgebase_stderr_log(
+            kb_id=kb_id,
+            op="kb_migrate",
+            phase="migration",
+            elapsed_ms=elapsed,
+            rows_in=0,
+            rows_ok=0,
+            rows_skipped=0,
+            rows_failed=0,
+            dedup_policy="n/a",
+            request_id=None,
+            tool_caller_version=None,
+            error_code="MIGRATION_DEFERRED",
+            error_message=str(exc),
+        )
+        return {
+            "status": "deferred",
+            "reason": "ingest_in_progress",
+            "rows": 0,
+            "elapsed_ms": elapsed,
+        }
+
+    try:
+        # Re-check sentinel inside the lock to handle TOCTOU race.
+        if sentinel_path.is_file():
+            try:
+                content = sentinel_path.read_text(encoding="utf-8").strip()
+            except OSError:
+                content = ""
+            if content == _TEXTVEC_SENTINEL_CONTENT:
+                elapsed = _elapsed_ms()
+                knowledgebase_stderr_log(
+                    kb_id=kb_id,
+                    op="kb_migrate",
+                    phase="migration",
+                    elapsed_ms=elapsed,
+                    rows_in=0,
+                    rows_ok=0,
+                    rows_skipped=0,
+                    rows_failed=0,
+                    dedup_policy="n/a",
+                    request_id=None,
+                    tool_caller_version=None,
+                    error_code=None,
+                    error_message="kb already migrated",
+                )
+                return {"status": "already_migrated", "rows": 0, "elapsed_ms": elapsed}
+
+        # Run FTS5 backfill via Database.rebuild_fts5().
+        ctx = service._ctx(kb_id)  # noqa: SLF001 — by design
+        try:
+            rows = ctx.db.rebuild_fts5(kb_id)
+        except Exception as exc:  # noqa: BLE001
+            elapsed = _elapsed_ms()
+            knowledgebase_stderr_log(
+                kb_id=kb_id,
+                op="kb_migrate",
+                phase="migration",
+                elapsed_ms=elapsed,
+                rows_in=0,
+                rows_ok=0,
+                rows_skipped=0,
+                rows_failed=1,
+                dedup_policy="n/a",
+                request_id=None,
+                tool_caller_version=None,
+                error_code="MIGRATION_FAILED",
+                error_message=str(exc),
+            )
+            raise
+
+        # Write .migrated_to sentinel (atomic via mkstemp + os.replace).
+        _write_migrated_sentinel(kb_root, _TEXTVEC_SENTINEL_CONTENT)
+
+        # Invalidate the per-KB backend cache so the next query routes through
+        # TextvecBackend immediately (the sentinel now controls routing).
+        service._invalidate_backend_cache(kb_id)  # noqa: SLF001
+
+        elapsed = _elapsed_ms()
+
+        # Warn when no chunks were backfilled on a KB that has chunk rows
+        # (e.g. chunks.content is NULL / empty on every row — edge case).
+        result: dict[str, object] = {
+            "status": "migrated",
+            "rows": rows,
+            "elapsed_ms": elapsed,
+        }
+        error_code: str | None = None
+        error_message: str | None = "kb migrated to textvec backend"
+        if rows == 0:
+            # Check whether the KB is genuinely empty or anomalous.
+            try:
+                chunk_count_row = ctx.db._conn.execute(  # noqa: SLF001
+                    "SELECT COUNT(*) AS cnt FROM chunks WHERE kb_id = ?", (kb_id,)
+                ).fetchone()
+                total_chunks = int(chunk_count_row["cnt"]) if chunk_count_row else 0
+            except Exception:  # noqa: BLE001
+                total_chunks = 0
+            if total_chunks > 0:
+                error_code = "MIGRATION_NO_ROWS"
+                error_message = "no_chunks_text"
+                result["warning"] = "no_chunks_text"
+
+        knowledgebase_stderr_log(
+            kb_id=kb_id,
+            op="kb_migrate",
+            phase="migration",
+            elapsed_ms=elapsed,
+            rows_in=0,
+            rows_ok=rows,
+            rows_skipped=0,
+            rows_failed=0,
+            dedup_policy="n/a",
+            request_id=None,
+            tool_caller_version=None,
+            error_code=error_code,
+            error_message=error_message,
+        )
+        return result
+
+    finally:
+        if lock is not None:
+            try:
+                lock.release()
+            except Exception:  # noqa: BLE001
+                pass
+
+
 __all__ = [
     "MigrationResult",
     "backfill_provider_snapshot",
@@ -674,4 +900,5 @@ __all__ = [
     "import_chromadb_dump",
     "import_from_markdown",
     "migrate",
+    "migrate_to_textvec",
 ]
