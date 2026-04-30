@@ -204,11 +204,8 @@ class ChromadbBackend:
         embedder = service._query_embedder_for(kb_id)  # noqa: SLF001
 
         if filters is not None:
-            # Build the merged where= dict: start with the kb_id isolation
-            # filter (the invariant the v0.6.0 path relies on) and overlay
-            # the caller-supplied filter keys. Caller keys with the same
-            # name as "kb_id" are silently overridden by the kb_id value
-            # to preserve per-KB isolation — callers must not subvert it.
+            # start with the caller-supplied filter keys and overlay the kb_id
+            # isolation filter last so per-KB isolation cannot be subverted by collision.
             where = {**filters, "kb_id": kb_id}
             embedding = embedder.embed_query(text)
             raw_results = vs.query(embedding, top_k=top_k, where=where)
@@ -244,23 +241,24 @@ class ChromadbBackend:
         """FTS search over wiki pages — delegates to
         :meth:`QueryOrchestrator.search`.
 
-        ``filters`` is accepted and validated when non-None (Phase A).
-        The FTS search path runs through the wiki index and does not use
-        a chromadb where= filter; ``filters`` is validated for structural
-        safety then noted but not forwarded to the FTS path (wiki FTS does
-        not support key-value metadata filtering). This satisfies the
-        RetrieverBackend Protocol contract without raising while keeping
-        the FTS path unchanged.
+        ``filters`` MUST be ``None``. The FTS search path runs through the
+        wiki index and has no metadata-filter support; passing a non-None
+        ``filters`` raises :exc:`ValueError` rather than silently dropping
+        the caller's intent.
+
+        Use :meth:`query` with ``filters=`` for vector-search with metadata
+        filtering.
 
         Raises
         ------
         ValueError
-            If any filter key is not a non-empty string.
-        TypeError
-            If any filter value is not a primitive scalar (str/int/float/bool).
+            If ``filters`` is not ``None``.
         """
         if filters is not None:
-            _validate_filter_dict(filters)
+            raise ValueError(
+                "ChromadbBackend.search does not honor filters; the wiki/FTS path "
+                "has no metadata-filter support. Pass filters=None or use query()."
+            )
 
         from agent_knowledgebase.services.query import QueryOrchestrator
 

@@ -77,6 +77,12 @@ from agent_knowledgebase.services.stderr_log import knowledgebase_stderr_log
 from agent_knowledgebase.services.vectorstore import VectorStore, create_vectorstore
 from agent_knowledgebase.services.wiki import WikiManager
 
+# Phase A: hoisted here to avoid deferred imports inside warmup_all_chromadb_kbs.
+# resolve_backend_name is exported from backends/__init__.py and has no circular-import risk.
+from concurrent.futures import ALL_COMPLETED, ThreadPoolExecutor, wait
+
+from agent_knowledgebase.backends import resolve_backend_name
+
 
 # ---------------------------------------------------------------------------
 # Phase 5 — mixed embedder_version rejection
@@ -1395,13 +1401,15 @@ class KnowledgebaseService:
         ``Settings.chromadb_eager_warm``: must be ``True`` (default) or
             the entire call returns immediately with all counts = 0.
 
+        Workers still running after 30 s are abandoned via
+        ``executor.shutdown(wait=False, cancel_futures=True)``; the
+        ``with ThreadPoolExecutor`` form is intentionally NOT used here
+        because its ``__exit__`` calls ``shutdown(wait=True)``, which
+        would block indefinitely past the timeout.
+
         Phase A — vectorstore robustness.
         spec_id: 70ab2170-381a-4657-bcd1-28a40c6f369b
         """
-        from concurrent.futures import ThreadPoolExecutor, wait, ALL_COMPLETED
-
-        from agent_knowledgebase.backends import resolve_backend_name
-
         # Fast path: flag disabled.
         if not getattr(self._config, "chromadb_eager_warm", True):
             kb_count = len(self._index)
@@ -1433,12 +1441,21 @@ class KnowledgebaseService:
         if not kb_ids:
             return {"warmed_count": 0, "skipped_count": 0, "failed_count": 0}
 
-        with ThreadPoolExecutor(
+        # Phase A — concurrent caller pattern note: _get_vectorstore is not yet
+        # thread-safe for concurrent callers; see follow-up tracking item.
+        executor = ThreadPoolExecutor(
             max_workers=max(1, len(kb_ids)),
             thread_name_prefix="kb_eager_warm",
-        ) as executor:
+        )
+        try:
             future_to_kb = {executor.submit(_do_warmup, kb_id): kb_id for kb_id in kb_ids}
             done, _ = wait(future_to_kb, timeout=30, return_when=ALL_COMPLETED)
+        finally:
+            # shutdown(wait=False, cancel_futures=True) abandons workers still
+            # running after the 30 s cap and cancels any not-yet-started futures.
+            # Using `with ThreadPoolExecutor` would call shutdown(wait=True) on
+            # __exit__, blocking indefinitely past the timeout.
+            executor.shutdown(wait=False, cancel_futures=True)
 
         for future, kb_id in future_to_kb.items():
             if future in done:

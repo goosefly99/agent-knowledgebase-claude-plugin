@@ -79,7 +79,12 @@ class TestFilterNoLongerRaises:
         # Result shape: list of dicts.
         assert isinstance(result, list)
 
-    def test_search_with_filter_does_not_raise(self, test_config: Settings) -> None:
+    def test_search_with_filter_raises_value_error(self, test_config: Settings) -> None:
+        """search() must raise ValueError on non-None filters (I-3 fix).
+
+        The FTS/wiki path has no metadata-filter support; silently dropping
+        the caller's filters was a misleading contract. Now it raises loudly.
+        """
         from agent_knowledgebase.backends.chromadb_backend import ChromadbBackend
 
         svc = _make_service(test_config)
@@ -89,14 +94,15 @@ class TestFilterNoLongerRaises:
 
         backend = ChromadbBackend(test_config, service=svc)
 
-        # Should not raise NotImplementedError.
-        result = backend.search(
-            kb_id=kb.id,
-            text="test search",
-            top_k=5,
-            filters={"source_type": "file"},
-        )
-        assert isinstance(result, list)
+        with pytest.raises(ValueError, match="does not honor filters"):
+            backend.search(
+                kb_id=kb.id,
+                text="test search",
+                top_k=5,
+                filters={"source_type": "file"},
+            )
+        # The vectorstore must NOT have been reached.
+        assert not mock_vs.query.called, "FTS path reached chromadb despite filters"
 
     def test_query_without_filter_still_works(self, test_config: Settings) -> None:
         """Passing filters=None (the default) must keep working."""

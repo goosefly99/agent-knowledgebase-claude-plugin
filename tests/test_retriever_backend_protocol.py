@@ -314,12 +314,15 @@ def test_chromadb_backend_query_rejects_invalid_filter_dict(tmp_path: Path) -> N
         backend.query(kb_id="x", text="t", top_k=1, filters={123: "v"})  # type: ignore[dict-item]
 
 
-def test_chromadb_backend_search_accepts_valid_filters_kwarg(tmp_path: Path) -> None:
-    """Phase A fix: ChromadbBackend.search no longer raises NotImplementedError
-    for a valid ``filters`` dict — mirrors the query fix.
+def test_chromadb_backend_search_rejects_non_none_filters(tmp_path: Path) -> None:
+    """I-3 fix: ChromadbBackend.search raises ValueError on non-None filters.
+
+    The FTS/wiki path has no metadata-filter support; silently dropping the
+    caller's filters was a misleading contract. ValueError is raised before
+    any service or chromadb call so no KnowledgebaseService is needed.
     """
     saves_dir = tmp_path / "saves"
     saves_dir.mkdir()
     backend = _build_chromadb_backend(saves_dir)
-    with pytest.raises(RuntimeError, match="without a KnowledgebaseService"):
+    with pytest.raises(ValueError, match="does not honor filters"):
         backend.search(kb_id="x", text="t", top_k=1, filters={"a": 1})

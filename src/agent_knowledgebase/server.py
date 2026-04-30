@@ -190,7 +190,7 @@ def _trigger_eager_warm(service: KnowledgebaseService) -> None:
             knowledgebase_stderr_log(
                 kb_id="__server__",
                 op="eager_warm",
-                phase="start",
+                phase="eager_warm_start",
                 elapsed_ms=0,
                 rows_in=0,
                 rows_ok=0,
@@ -199,14 +199,14 @@ def _trigger_eager_warm(service: KnowledgebaseService) -> None:
                 dedup_policy="n/a",
                 request_id=None,
                 tool_caller_version=None,
-                error_code="eager_warm_started",
+                error_code=None,
                 error_message="chromadb eager-warm started",
             )
             summary = service.warmup_all_chromadb_kbs()
             knowledgebase_stderr_log(
                 kb_id="__server__",
                 op="eager_warm",
-                phase="complete",
+                phase="eager_warm_complete",
                 elapsed_ms=0,
                 rows_in=summary.get("warmed_count", 0),
                 rows_ok=summary.get("warmed_count", 0),
@@ -215,11 +215,25 @@ def _trigger_eager_warm(service: KnowledgebaseService) -> None:
                 dedup_policy="n/a",
                 request_id=None,
                 tool_caller_version=None,
-                error_code="eager_warm_completed",
+                error_code=None,
                 error_message=(f"chromadb eager-warm completed: {summary}"),
             )
-        except Exception:  # noqa: BLE001 — warmup failures must not block startup
-            pass
+        except Exception as exc:  # noqa: BLE001 — warmup failures must not block startup
+            knowledgebase_stderr_log(
+                kb_id="__server__",
+                op="eager_warm",
+                phase="eager_warm_start",
+                elapsed_ms=0,
+                rows_in=0,
+                rows_ok=0,
+                rows_skipped=0,
+                rows_failed=1,
+                dedup_policy="n/a",
+                request_id=None,
+                tool_caller_version=None,
+                error_code="EAGER_WARM_TRIGGER_FAILED",
+                error_message=str(exc),
+            )
 
     t = threading.Thread(
         target=_run_warmup,

@@ -166,18 +166,8 @@ class TestServerEagerWarmWiring:
 
         monkeypatch.setattr(server_mod, "_get_service", _fake_get_service)
 
-        # Import and call the real _trigger_eager_warm helper if it exists,
-        # otherwise call the internal startup-warm path.
-        if hasattr(server_mod, "_trigger_eager_warm"):
-            server_mod._trigger_eager_warm(fake_service)
-        else:
-            # Fire warmup as the server would: non-blocking daemon thread.
-            t = threading.Thread(
-                target=fake_service.warmup_all_chromadb_kbs,
-                daemon=True,
-                name="test_eager_warm",
-            )
-            t.start()
+        # _trigger_eager_warm must be present; fail loudly if it has been removed or renamed.
+        server_mod._trigger_eager_warm(fake_service)
 
         # Warmup must complete within 5 s (mocked; not a real cold-load).
         warmup_started.wait(timeout=5)
@@ -277,3 +267,74 @@ class TestChromadbBackendWarmup:
 
         # Must not raise.
         backend.warmup(kb.id)
+
+
+# ---------------------------------------------------------------------------
+# C-2 regression: 30 s wallclock cap is actually enforced
+# ---------------------------------------------------------------------------
+
+
+class TestWarmupTimeoutCap:
+    """Regression test for C-1 fix: warmup_all_chromadb_kbs must return within
+    the 30 s cap even when worker threads sleep indefinitely.
+
+    Uses a threading.Event that is never set so the worker blocks, then asserts
+    the call returns well under the 30 s cap (we patch the internal timeout down
+    to 2 s to keep CI fast). The executor's shutdown(wait=False, cancel_futures=True)
+    must abandon the blocking worker rather than joining it.
+    """
+
+    def test_warmup_timeout_abandons_slow_workers(
+        self,
+        test_config: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """warmup_all_chromadb_kbs() returns within the wallclock cap even
+        when a warmup worker blocks indefinitely."""
+        import agent_knowledgebase.services.knowledgebase as kb_mod
+
+        svc = _make_service(test_config)
+        svc.create_kb("slow-warm-kb")
+
+        # A threading.Event that is never set — the worker will block for 60 s.
+        slow_event = threading.Event()
+
+        original_backend_for = svc._backend_for
+
+        def _patched_backend_for(kb_id: str):  # type: ignore[return]
+            backend = original_backend_for(kb_id)
+
+            def _slow_warmup(wkb_id: str) -> None:
+                slow_event.wait(60)  # blocks until set or 60 s — never set in test
+
+            backend.warmup = _slow_warmup
+            return backend
+
+        svc._backend_for = _patched_backend_for  # type: ignore[method-assign]
+
+        # Patch the 30 s wait() timeout down to 2 s so the test runs fast.
+        import concurrent.futures as cf
+
+        real_wait = cf.wait
+
+        def _fast_wait(fs, timeout=None, return_when=cf.ALL_COMPLETED):
+            return real_wait(fs, timeout=2, return_when=return_when)
+
+        monkeypatch.setattr(kb_mod, "wait", _fast_wait)
+
+        start = time.monotonic()
+        summary = svc.warmup_all_chromadb_kbs()
+        elapsed = time.monotonic() - start
+
+        # Must return within 2 s cap + small overhead (generous 5 s ceiling).
+        assert elapsed < 5, (
+            f"warmup_all_chromadb_kbs blocked for {elapsed:.2f}s — "
+            "executor.shutdown(wait=False) is not abandoning slow workers"
+        )
+        # The slow KB must land in failed (timed out) rather than warmed.
+        assert summary["failed_count"] >= 1 or summary["warmed_count"] == 0, (
+            f"Expected slow KB to be failed/not-warmed; got summary={summary!r}"
+        )
+
+        # Clean up: set the event so the daemon worker can exit.
+        slow_event.set()
