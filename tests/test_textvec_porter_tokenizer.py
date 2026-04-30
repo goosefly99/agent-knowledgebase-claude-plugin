@@ -55,9 +55,7 @@ def test_fts5_porter_tokenizer_available() -> None:
     """Verify the porter tokenizer is available in the local sqlite build."""
     conn = sqlite3.connect(":memory:")
     try:
-        conn.execute(
-            "CREATE VIRTUAL TABLE t USING fts5(x, tokenize='porter unicode61')"
-        )
+        conn.execute("CREATE VIRTUAL TABLE t USING fts5(x, tokenize='porter unicode61')")
     except sqlite3.OperationalError as exc:
         pytest.skip(f"porter tokenizer not available: {exc}")
     finally:
@@ -91,8 +89,7 @@ def test_porter_stem_running_runner_runs(tmp_path: Path) -> None:
 
     results_runner = backend.search(kb_id=kb_id, text="runner", top_k=5)
     assert len(results_runner) > 0, (
-        "Expected 'runner' to match document containing 'running' "
-        "via Porter stemming"
+        "Expected 'runner' to match document containing 'running' via Porter stemming"
     )
 
 
@@ -125,9 +122,7 @@ def test_unicode61_normalisation(tmp_path: Path) -> None:
     """
     conn = sqlite3.connect(":memory:")
     try:
-        conn.execute(
-            "CREATE VIRTUAL TABLE t USING fts5(x, tokenize='porter unicode61')"
-        )
+        conn.execute("CREATE VIRTUAL TABLE t USING fts5(x, tokenize='porter unicode61')")
         conn.execute("INSERT INTO t(rowid, x) VALUES (1, 'café au lait')")
         rows = conn.execute("SELECT * FROM t WHERE t MATCH 'cafe'").fetchall()
         # If unicode61 normalises café→cafe, rows should be non-empty.

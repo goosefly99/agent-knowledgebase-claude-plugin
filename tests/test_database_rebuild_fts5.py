@@ -144,7 +144,9 @@ class TestRebuildFts5:
         ).fetchone()
         assert rows["cnt"] == 3, f"expected 3 FTS matches after rebuild, got {rows['cnt']}"
 
-    def test_rebuild_fts5_no_cross_kb_bleed(self, db: Database, kb_id: str, settings: Settings) -> None:
+    def test_rebuild_fts5_no_cross_kb_bleed(
+        self, db: Database, kb_id: str, settings: Settings
+    ) -> None:
         """rebuild_fts5() only backfills rows for the specified kb_id."""
         other_kb_id = f"other-{uuid.uuid4().hex[:8]}"
         now = datetime.utcnow().isoformat()
@@ -158,7 +160,14 @@ class TestRebuildFts5:
         db._conn.execute(
             "INSERT OR IGNORE INTO sources (id, kb_id, source_type, uri, dedup_key, status) "
             "VALUES (?, ?, ?, ?, ?, ?)",
-            (f"src-{other_kb_id}", other_kb_id, "file", "/tmp/other.txt", "other-dedup", "ingested"),
+            (
+                f"src-{other_kb_id}",
+                other_kb_id,
+                "file",
+                "/tmp/other.txt",
+                "other-dedup",
+                "ingested",
+            ),
         )
         db._conn.commit()
 

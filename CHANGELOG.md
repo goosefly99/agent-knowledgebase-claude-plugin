@@ -5,10 +5,6 @@
 > Vectorstore robustness + TextvecBackend opt-in. Three additive phases
 > (A/B/C) shipped as one release. Default `Settings.kb_backend` stays
 > `'chromadb'`; `'textvec'` is opt-in. No breaking changes.
->
-> Source spec: `docs/superpowers/specs/2026-04-30-kb-retrieval-next-update-design.md`
-> Parent spec: `pipeline_mcp_data/specs/agent-kb-textvec-spec-v2.2.json`
-> (validated 2026-04-28; PASS, 13 VERIFIED / 2 PARTIAL)
 
 ### Added
 
@@ -69,9 +65,9 @@
   `{markdown, chromadb}` to `{markdown, chromadb, textvec}`. The
   `@mcp.tool()` outer + `@_with_tool_timeout` inner decorator order
   is preserved (frozen contract, pinned by
-  `tests/contract/test_decorator_order.py`). `kb_migrate` is NOT
-  among the 26 frozen `kb_*` tool surface — additive widening
-  allowed.
+  `tests/contract/test_decorator_order.py`). The widening is purely
+  additive — the existing `markdown` and `chromadb` arms behave
+  bit-for-bit as before; only the new `textvec` arm is new.
 
 ### Frozen contracts (unchanged)
 
@@ -90,7 +86,8 @@
 
 ### Tests
 
-- 39 new tests across Phases A/B/C: `test_chromadb_eager_warm.py`,
+- 11 new test files (~124 new tests) across Phases A/B/C:
+  `test_chromadb_eager_warm.py`,
   `test_chromadb_filter_passthrough.py`, `test_textvec_backend.py`,
   `test_textvec_fts5_recall.py`, `test_textvec_porter_tokenizer.py`,
   `test_textvec_metadata_filter_compose.py`,
