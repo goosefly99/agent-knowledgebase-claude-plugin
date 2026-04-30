@@ -118,12 +118,8 @@ _EXPECTED_SIGNATURES = {
         ("ids", inspect.Parameter.KEYWORD_ONLY),
         ("source_id", inspect.Parameter.KEYWORD_ONLY),
     ),
-    "info": (
-        ("kb_id", inspect.Parameter.KEYWORD_ONLY),
-    ),
-    "count": (
-        ("kb_id", inspect.Parameter.KEYWORD_ONLY),
-    ),
+    "info": (("kb_id", inspect.Parameter.KEYWORD_ONLY),),
+    "count": (("kb_id", inspect.Parameter.KEYWORD_ONLY),),
     "health_check": (),
 }
 
@@ -134,9 +130,7 @@ _EXPECTED_SIGNATURES = {
 
 
 @pytest.mark.parametrize("backend_name", sorted(_BACKEND_FACTORIES))
-def test_backend_satisfies_runtime_checkable_protocol(
-    backend_name: str, tmp_path: Path
-) -> None:
+def test_backend_satisfies_runtime_checkable_protocol(backend_name: str, tmp_path: Path) -> None:
     """Every concrete backend must satisfy ``isinstance(backend,
     RetrieverBackend)`` (the Protocol is decorated ``@runtime_checkable``).
     """
@@ -167,20 +161,15 @@ def test_backend_method_signatures_match_protocol(
 
     method = getattr(backend, method_name, None)
     assert method is not None, (
-        f"{type(backend).__name__} is missing required method "
-        f"{method_name!r}"
+        f"{type(backend).__name__} is missing required method {method_name!r}"
     )
-    assert callable(method), (
-        f"{type(backend).__name__}.{method_name} exists but is not callable"
-    )
+    assert callable(method), f"{type(backend).__name__}.{method_name} exists but is not callable"
 
     sig = inspect.signature(method)
     expected = _EXPECTED_SIGNATURES[method_name]
 
     # On a bound method, ``self`` is already removed by inspect.signature.
-    actual = tuple(
-        (name, param.kind) for name, param in sig.parameters.items()
-    )
+    actual = tuple((name, param.kind) for name, param in sig.parameters.items())
 
     assert actual == expected, (
         f"{type(backend).__name__}.{method_name} signature mismatch.\n"
@@ -297,24 +286,40 @@ def test_chromadb_backend_per_kb_methods_raise_clearly_without_service(
         backend.info(kb_id="missing-kb")
 
 
-def test_chromadb_backend_query_rejects_filters_kwarg(tmp_path: Path) -> None:
-    """ChromadbBackend.query MUST raise NotImplementedError when ``filters``
-    is supplied — the Protocol accepts the kwarg for Phase 3 markdown
-    backend compatibility, but ChromadbBackend does not yet honor it.
-    Silently dropping it would create a contract-mismatch bug the moment
-    a caller starts relying on filters.
+def test_chromadb_backend_query_accepts_valid_filters_kwarg(tmp_path: Path) -> None:
+    """Phase A fix: ChromadbBackend.query no longer raises NotImplementedError
+    when a valid ``filters`` dict is supplied.  The structural validator runs
+    first; a valid dict proceeds to the service.  Constructing the backend
+    without a service still raises RuntimeError (existing contract) — the
+    test confirms the old NotImplementedError is gone and the new path raises
+    RuntimeError (no service) instead of NotImplementedError (filter rejected).
     """
     saves_dir = tmp_path / "saves"
     saves_dir.mkdir()
     backend = _build_chromadb_backend(saves_dir)
-    with pytest.raises(NotImplementedError, match="does not yet honor filters"):
+    # Valid filter dict: structural validation passes; RuntimeError (no
+    # service) is raised before any chromadb call — NOT NotImplementedError.
+    with pytest.raises(RuntimeError, match="without a KnowledgebaseService"):
         backend.query(kb_id="x", text="t", top_k=1, filters={"a": 1})
 
 
-def test_chromadb_backend_search_rejects_filters_kwarg(tmp_path: Path) -> None:
-    """Symmetric guard for ChromadbBackend.search — same contract."""
+def test_chromadb_backend_query_rejects_invalid_filter_dict(tmp_path: Path) -> None:
+    """Phase A: structural filter validation rejects non-string keys and
+    non-primitive values before any chromadb or service call.
+    """
     saves_dir = tmp_path / "saves"
     saves_dir.mkdir()
     backend = _build_chromadb_backend(saves_dir)
-    with pytest.raises(NotImplementedError, match="does not yet honor filters"):
+    with pytest.raises((ValueError, TypeError)):
+        backend.query(kb_id="x", text="t", top_k=1, filters={123: "v"})  # type: ignore[dict-item]
+
+
+def test_chromadb_backend_search_accepts_valid_filters_kwarg(tmp_path: Path) -> None:
+    """Phase A fix: ChromadbBackend.search no longer raises NotImplementedError
+    for a valid ``filters`` dict — mirrors the query fix.
+    """
+    saves_dir = tmp_path / "saves"
+    saves_dir.mkdir()
+    backend = _build_chromadb_backend(saves_dir)
+    with pytest.raises(RuntimeError, match="without a KnowledgebaseService"):
         backend.search(kb_id="x", text="t", top_k=1, filters={"a": 1})

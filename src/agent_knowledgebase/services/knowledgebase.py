@@ -53,7 +53,11 @@ from agent_knowledgebase.models import (
     SourceType,
     WikiPage,
 )
-from agent_knowledgebase.services.dedup_service import DEFAULT_DEDUP_POLICY, DedupPolicy, resolve_dedup_action
+from agent_knowledgebase.services.dedup_service import (
+    DEFAULT_DEDUP_POLICY,
+    DedupPolicy,
+    resolve_dedup_action,
+)
 from agent_knowledgebase.services.embeddings import (
     Embedder,
     create_embedder,
@@ -496,14 +500,8 @@ class KnowledgebaseService:
         )
         if (
             dominant_model == comparison_model_name
-            and (
-                dominant_provider is None
-                or dominant_provider == self._config.embedding_provider
-            )
-            and (
-                dominant_base_url is None
-                or dominant_base_url == self._config.embed_base_url
-            )
+            and (dominant_provider is None or dominant_provider == self._config.embedding_provider)
+            and (dominant_base_url is None or dominant_base_url == self._config.embed_base_url)
         ):
             return self._embedder
         # Snapshot diverges from the configured embedder; consult the
@@ -1017,12 +1015,9 @@ class KnowledgebaseService:
             # strings) from poisoning the JSON-serialized chunk
             # metadata. spec_id:
             # 70ab2170-381a-4657-bcd1-28a40c6f369b
-            embedder_version_for_stamp = getattr(
-                self._embedder, "embedder_version", None
-            )
-            stamp_version = (
-                isinstance(embedder_version_for_stamp, str)
-                and bool(embedder_version_for_stamp)
+            embedder_version_for_stamp = getattr(self._embedder, "embedder_version", None)
+            stamp_version = isinstance(embedder_version_for_stamp, str) and bool(
+                embedder_version_for_stamp
             )
             for chunk in chunks:
                 chunk.metadata["embedding_model"] = self._embedder.model_name
@@ -1048,9 +1043,7 @@ class KnowledgebaseService:
                 # the per-KB cache so writes don't get re-routed back
                 # into the OLD backend by the still-valid sentinel.
                 target_backend = (
-                    explicit_backend
-                    if explicit_backend is not None
-                    else self._backend_for(kb_id)
+                    explicit_backend if explicit_backend is not None else self._backend_for(kb_id)
                 )
                 target_backend.index(
                     kb_id=kb_id,
@@ -1190,9 +1183,7 @@ class KnowledgebaseService:
                 # service.
                 old_chunks = ctx.db.list_chunks(source_id)
                 if old_chunks:
-                    self._backend_for(kb_id).delete(
-                        kb_id=kb_id, ids=[c.id for c in old_chunks]
-                    )
+                    self._backend_for(kb_id).delete(kb_id=kb_id, ids=[c.id for c in old_chunks])
                 ctx.db.delete_chunks_by_source(source_id)
 
                 return self._ingest_source_locked(
@@ -1370,6 +1361,107 @@ class KnowledgebaseService:
         """Export all wiki pages to markdown files."""
         ctx = self._ctx(kb_id)
         return ctx.exporter.export(kb_id, output_dir)
+
+    # ------------------------------------------------------------------
+    # Eager-warm (Phase A — vectorstore robustness)
+    # ------------------------------------------------------------------
+
+    def warmup_all_chromadb_kbs(self) -> dict[str, int]:
+        """Eager-warm chromadb collections at MCP server startup.
+
+        Iterates all KBs in the index, resolves each KB's effective
+        backend (honoring the ``.migrated_to`` sentinel and the
+        ``kb_backend_per_kb`` mapping), and calls
+        :meth:`ChromadbBackend.warmup` on each chromadb-backed KB so
+        the HNSW cold-load is amortised into server-init time rather
+        than the first tool call.
+
+        Warmup calls run concurrently via a :class:`ThreadPoolExecutor`
+        (one thread per KB) with a 30 s wall-clock cap across all KBs —
+        workers still running after 30 s are abandoned.  Failures are
+        absorbed (they land in ``failed_count``) so a single broken KB
+        does not block the others.
+
+        Returns
+        -------
+        dict with keys:
+            ``warmed_count``: number of KBs successfully warmed.
+            ``skipped_count``: number of KBs skipped (non-chromadb or
+                flag disabled).
+            ``failed_count``: number of KBs whose warmup raised.
+
+        Honoured settings
+        -----------------
+        ``Settings.chromadb_eager_warm``: must be ``True`` (default) or
+            the entire call returns immediately with all counts = 0.
+
+        Phase A — vectorstore robustness.
+        spec_id: 70ab2170-381a-4657-bcd1-28a40c6f369b
+        """
+        from concurrent.futures import ThreadPoolExecutor, wait, ALL_COMPLETED
+
+        from agent_knowledgebase.backends import resolve_backend_name
+
+        # Fast path: flag disabled.
+        if not getattr(self._config, "chromadb_eager_warm", True):
+            kb_count = len(self._index)
+            return {
+                "warmed_count": 0,
+                "skipped_count": kb_count,
+                "failed_count": 0,
+            }
+
+        warmed: list[str] = []
+        skipped: list[str] = []
+        failed: list[str] = []
+
+        def _do_warmup(kb_id: str) -> str:
+            """Return 'warmed', 'skipped', or 'failed'."""
+            backend_name = resolve_backend_name(self._config, kb_id=kb_id, service=self)
+            if backend_name != "chromadb":
+                return "skipped"
+            backend = self._backend_for(kb_id)
+            if not hasattr(backend, "warmup"):
+                return "skipped"
+            try:
+                backend.warmup(kb_id)
+                return "warmed"
+            except Exception:  # noqa: BLE001 — absorbed; backend.warmup already logs
+                return "failed"
+
+        kb_ids = list(self._index.keys())
+        if not kb_ids:
+            return {"warmed_count": 0, "skipped_count": 0, "failed_count": 0}
+
+        with ThreadPoolExecutor(
+            max_workers=max(1, len(kb_ids)),
+            thread_name_prefix="kb_eager_warm",
+        ) as executor:
+            future_to_kb = {executor.submit(_do_warmup, kb_id): kb_id for kb_id in kb_ids}
+            done, _ = wait(future_to_kb, timeout=30, return_when=ALL_COMPLETED)
+
+        for future, kb_id in future_to_kb.items():
+            if future in done:
+                try:
+                    outcome = future.result()
+                except Exception:  # noqa: BLE001
+                    outcome = "failed"
+            else:
+                # Timed out — treat as failed.
+                outcome = "failed"
+
+            if outcome == "warmed":
+                warmed.append(kb_id)
+            elif outcome == "skipped":
+                skipped.append(kb_id)
+            else:
+                failed.append(kb_id)
+
+        return {
+            "warmed_count": len(warmed),
+            "skipped_count": len(skipped),
+            "failed_count": len(failed),
+        }
 
     # ------------------------------------------------------------------
     # Migration (Phase 4 — kb_migrate MCP tool entry point)

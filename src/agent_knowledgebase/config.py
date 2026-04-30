@@ -70,6 +70,17 @@ class Settings(BaseSettings):
         "Pinecone-backed VectorStore.",
     )
 
+    # --- Vectorstore robustness (Phase A) ---
+    chromadb_eager_warm: bool = Field(
+        default=True,
+        description="Eager-warm chromadb collections at MCP server startup "
+        "(AGENT_KB_CHROMADB_EAGER_WARM). When True, all chromadb-backed KB "
+        "collections are loaded into memory on server init via a non-blocking "
+        "daemon thread, amortising the ~180s HNSW cold-load into startup "
+        "time rather than the first tool call. Set to False to disable "
+        "(opt-out). spec_id: 70ab2170-381a-4657-bcd1-28a40c6f369b",
+    )
+
     # --- Per-KB retrieval backend overrides (Phase 4 redesign) ---
     kb_backend_per_kb: dict[str, str] = Field(
         default_factory=dict,
@@ -116,6 +127,7 @@ class Settings(BaseSettings):
             # on parse failure.
             if text.startswith("{"):
                 import json as _json
+
                 try:
                     parsed = _json.loads(text)
                 except ValueError:
@@ -137,8 +149,7 @@ class Settings(BaseSettings):
                 backend = backend.strip()
                 if not kb_id or not backend:
                     raise ValueError(
-                        f"AGENT_KB_BACKEND_PER_KB entry {pair!r} has "
-                        f"an empty kb_id or backend"
+                        f"AGENT_KB_BACKEND_PER_KB entry {pair!r} has an empty kb_id or backend"
                     )
                 out[kb_id] = backend
             return out
@@ -146,9 +157,7 @@ class Settings(BaseSettings):
 
     @field_validator("kb_backend_per_kb", mode="after")
     @classmethod
-    def _validate_kb_backend_per_kb_values(
-        cls, value: dict[str, str]
-    ) -> dict[str, str]:
+    def _validate_kb_backend_per_kb_values(cls, value: dict[str, str]) -> dict[str, str]:
         valid = {"chromadb", "markdown", "lightrag"}
         for kb_id, backend in value.items():
             if backend not in valid:
@@ -183,9 +192,7 @@ class Settings(BaseSettings):
     )
 
     # --- Embeddings ---
-    embedding_provider: Literal[
-        "ollama", "sentence-transformers", "remote", "fastembed"
-    ] = Field(
+    embedding_provider: Literal["ollama", "sentence-transformers", "remote", "fastembed"] = Field(
         default="remote",
         description="Embedding provider: 'remote' (default since v0.11.0 — "
         "HTTP endpoint speaking the OpenAI-compatible /v1/embeddings JSON "
@@ -293,10 +300,7 @@ class Settings(BaseSettings):
         benign even when ``kb_backend != 'chromadb'`` (it's the field
         default and may simply be unset).
         """
-        if (
-            self.kb_backend in {"markdown", "lightrag"}
-            and self.vectorstore != "chromadb"
-        ):
+        if self.kb_backend in {"markdown", "lightrag"} and self.vectorstore != "chromadb":
             msg = (
                 f"vectorstore={self.vectorstore!r} is meaningless when "
                 f"kb_backend={self.kb_backend!r}; only set vectorstore "
@@ -344,10 +348,22 @@ class Settings(BaseSettings):
     # --- Ingest ---
     ingest_excluded_dirs: list[str] | str = Field(
         default_factory=lambda: [
-            "__pycache__", "node_modules", ".git", ".venv",
-            ".mypy_cache", ".pytest_cache", "dist", "build",
-            "venv", ".tox", ".ruff_cache", ".eggs",
-            ".idea", ".vscode", ".hg", ".svn",
+            "__pycache__",
+            "node_modules",
+            ".git",
+            ".venv",
+            ".mypy_cache",
+            ".pytest_cache",
+            "dist",
+            "build",
+            "venv",
+            ".tox",
+            ".ruff_cache",
+            ".eggs",
+            ".idea",
+            ".vscode",
+            ".hg",
+            ".svn",
         ],
         description="Directory names to skip during recursive ingestion. "
         "This is a full replacement of the default list when set.",
@@ -388,9 +404,7 @@ class Settings(BaseSettings):
                 updates[field_name] = Path(value).expanduser().resolve()
         resolved = self.model_copy(update=updates)
         if not resolved.saves_dir.exists():
-            raise FileNotFoundError(
-                f"AGENT_KB_SAVES_DIR does not exist: {resolved.saves_dir}"
-            )
+            raise FileNotFoundError(f"AGENT_KB_SAVES_DIR does not exist: {resolved.saves_dir}")
         if not resolved.saves_dir.is_dir():
             raise NotADirectoryError(
                 f"AGENT_KB_SAVES_DIR exists but is not a directory: {resolved.saves_dir}"
@@ -425,9 +439,7 @@ class Settings(BaseSettings):
         dotenv_settings: PydanticBaseSettingsSource,
         file_secret_settings: PydanticBaseSettingsSource,
     ) -> tuple[PydanticBaseSettingsSource, ...]:
-        user_source = NestedJsonConfigSettingsSource(
-            settings_cls, path=resolve_user_config_path()
-        )
+        user_source = NestedJsonConfigSettingsSource(settings_cls, path=resolve_user_config_path())
         project_source = NestedJsonConfigSettingsSource(
             settings_cls, path=resolve_project_config_path()
         )

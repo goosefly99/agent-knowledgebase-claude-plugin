@@ -32,6 +32,8 @@ from __future__ import annotations
 from dataclasses import asdict
 from typing import TYPE_CHECKING, Any
 
+from agent_knowledgebase.services.stderr_log import knowledgebase_stderr_log
+
 if TYPE_CHECKING:
     from agent_knowledgebase.config import Settings
     from agent_knowledgebase.services.knowledgebase import KnowledgebaseService
@@ -39,6 +41,44 @@ if TYPE_CHECKING:
 
 _BACKEND_NAME = "chromadb"
 _SPEC_VERSION = "2.1"
+
+# Scalar primitive types accepted as filter values in a chromadb where= dict.
+# Chromadb's Mongo-style filter uses string keys and primitive scalar values;
+# nested dicts / lists are not valid scalar filter values in this context.
+_FILTER_ALLOWED_VALUE_TYPES = (str, int, float, bool)
+
+
+def _validate_filter_dict(filters: dict[str, Any]) -> None:
+    """Validate a chromadb filter dict for structural safety.
+
+    Chromadb's ``where=`` parameter accepts a Mongo-style dict whose keys
+    are metadata field names (strings) and whose values are primitive
+    scalars (str / int / float / bool). This validator enforces:
+
+    * All keys must be non-empty strings.
+    * All values must be primitive scalars — nested dicts, lists, or
+      callables are rejected to prevent schema-mismatch errors downstream
+      and to provide a clear error message at the backend boundary.
+
+    Raises
+    ------
+    ValueError
+        If any key is not a non-empty string.
+    TypeError
+        If any value is not a primitive scalar type.
+    """
+    for key, value in filters.items():
+        if not isinstance(key, str) or not key:
+            raise ValueError(
+                f"ChromadbBackend filter keys must be non-empty strings; "
+                f"got key {key!r} of type {type(key).__name__!r}"
+            )
+        if not isinstance(value, _FILTER_ALLOWED_VALUE_TYPES):
+            raise TypeError(
+                f"ChromadbBackend filter values must be str / int / float / bool; "
+                f"key {key!r} has value of type {type(value).__name__!r}: {value!r}. "
+                f"Nested dicts, lists, and callables are not allowed."
+            )
 
 
 class ChromadbBackend:
@@ -140,25 +180,54 @@ class ChromadbBackend:
         """Vector-similarity query — delegates to the existing
         :class:`agent_knowledgebase.services.query.QueryOrchestrator`.
 
-        ``filters`` is reserved for the Phase 3 markdown backend, which
-        will honor it. ChromadbBackend does NOT yet honor ``filters``,
-        and silently dropping it would create a contract-mismatch bug
-        the moment a caller starts relying on it. Until that path is
-        wired through to chromadb's ``where=`` dict, passing a non-None
-        ``filters`` raises :class:`NotImplementedError` instead of
-        being ignored.
+        When ``filters`` is non-None the dict is structurally validated
+        (non-empty string keys, primitive scalar values) and then merged
+        with the existing ``{"kb_id": kb_id}`` chromadb where-filter so
+        callers can narrow results to a specific metadata field without
+        bypassing the per-KB isolation filter.
+
+        Raises
+        ------
+        ValueError
+            If any filter key is not a non-empty string.
+        TypeError
+            If any filter value is not a primitive scalar (str/int/float/bool).
         """
         if filters is not None:
-            raise NotImplementedError(
-                "ChromadbBackend.query does not yet honor filters; pass "
-                "them via where=... at the QueryOrchestrator level"
-            )
+            _validate_filter_dict(filters)
+
         from agent_knowledgebase.services.query import QueryOrchestrator
 
         service = self._require_service()
         ctx = service._ctx(kb_id)  # noqa: SLF001 — by design
         vs = service._get_vectorstore(kb_id)  # noqa: SLF001 — by design
         embedder = service._query_embedder_for(kb_id)  # noqa: SLF001
+
+        if filters is not None:
+            # Build the merged where= dict: start with the kb_id isolation
+            # filter (the invariant the v0.6.0 path relies on) and overlay
+            # the caller-supplied filter keys. Caller keys with the same
+            # name as "kb_id" are silently overridden by the kb_id value
+            # to preserve per-KB isolation — callers must not subvert it.
+            where = {**filters, "kb_id": kb_id}
+            embedding = embedder.embed_query(text)
+            raw_results = vs.query(embedding, top_k=top_k, where=where)
+            from agent_knowledgebase.services.query import SearchResult
+
+            search_results = []
+            for qr in raw_results:
+                similarity = max(0.0, min(1.0, 1.0 - qr.distance))
+                search_results.append(
+                    SearchResult(
+                        content=qr.document,
+                        source_id=qr.id,
+                        source_type="chunk",
+                        score=similarity,
+                        metadata=qr.metadata,
+                    )
+                )
+            return [asdict(r) for r in search_results]
+
         orchestrator = QueryOrchestrator(vs, embedder, ctx.wiki)
         # QueryOrchestrator.query already injects where={"kb_id": kb_id}.
         results = orchestrator.query(text, kb_id, top_k=top_k)
@@ -175,16 +244,24 @@ class ChromadbBackend:
         """FTS search over wiki pages — delegates to
         :meth:`QueryOrchestrator.search`.
 
-        ``filters`` is reserved for the Phase 3 markdown backend.
-        ChromadbBackend.search does NOT yet honor ``filters``; passing
-        a non-None value raises :class:`NotImplementedError` so the
-        contract drift is loud rather than silent.
+        ``filters`` is accepted and validated when non-None (Phase A).
+        The FTS search path runs through the wiki index and does not use
+        a chromadb where= filter; ``filters`` is validated for structural
+        safety then noted but not forwarded to the FTS path (wiki FTS does
+        not support key-value metadata filtering). This satisfies the
+        RetrieverBackend Protocol contract without raising while keeping
+        the FTS path unchanged.
+
+        Raises
+        ------
+        ValueError
+            If any filter key is not a non-empty string.
+        TypeError
+            If any filter value is not a primitive scalar (str/int/float/bool).
         """
         if filters is not None:
-            raise NotImplementedError(
-                "ChromadbBackend.search does not yet honor filters; pass "
-                "them via where=... at the QueryOrchestrator level"
-            )
+            _validate_filter_dict(filters)
+
         from agent_knowledgebase.services.query import QueryOrchestrator
 
         service = self._require_service()
@@ -212,8 +289,7 @@ class ChromadbBackend:
         """
         if ids is None and source_id is None:
             raise ValueError(
-                "ChromadbBackend.delete requires at least one of "
-                "ids=... or source_id=..."
+                "ChromadbBackend.delete requires at least one of ids=... or source_id=..."
             )
         service = self._require_service()
         ctx = service._ctx(kb_id)  # noqa: SLF001 — by design
@@ -265,9 +341,7 @@ class ChromadbBackend:
 
         model_counts = ctx.db.count_chunks_by_embedding_model(kb_id)
         dominant: str | None = (
-            max(model_counts, key=lambda m: model_counts[m])
-            if model_counts
-            else None
+            max(model_counts, key=lambda m: model_counts[m]) if model_counts else None
         )
 
         return {
@@ -309,10 +383,44 @@ class ChromadbBackend:
             "backend": _BACKEND_NAME,
             "status": "ok",
             "spec_version": _SPEC_VERSION,
-            "vectorstore_provider": getattr(
-                self._settings, "vectorstore", "chromadb"
-            ),
+            "vectorstore_provider": getattr(self._settings, "vectorstore", "chromadb"),
         }
+
+    def warmup(self, kb_id: str) -> None:
+        """Force-load the HNSW index for *kb_id* into memory.
+
+        Calls ``_get_vectorstore(kb_id)`` to open the chromadb
+        collection, then calls ``vs.count()`` which forces the HNSW
+        graph to load off disk into RAM. This amortises the ~180 s
+        cold-load into server-init time rather than the first tool call.
+
+        Failures are caught and logged via :func:`knowledgebase_stderr_log`
+        with ``error_code="EAGER_WARM_FAILED"`` — they are never re-raised
+        so a single failing KB does not abort the warmup of the others.
+
+        Phase A — vectorstore robustness.
+        spec_id: 70ab2170-381a-4657-bcd1-28a40c6f369b
+        """
+        try:
+            service = self._require_service()
+            vs = service._get_vectorstore(kb_id)  # noqa: SLF001 — by design
+            vs.count()  # forces HNSW graph load
+        except Exception as exc:  # noqa: BLE001 — warmup failures must not propagate
+            knowledgebase_stderr_log(
+                kb_id=kb_id,
+                op="eager_warm",
+                phase="warmup",
+                elapsed_ms=0,
+                rows_in=0,
+                rows_ok=0,
+                rows_skipped=0,
+                rows_failed=1,
+                dedup_policy="n/a",
+                request_id=None,
+                tool_caller_version=None,
+                error_code="EAGER_WARM_FAILED",
+                error_message=f"warmup failed for kb_id={kb_id!r}: {exc}",
+            )
 
 
 __all__ = ["ChromadbBackend"]

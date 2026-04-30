@@ -35,6 +35,7 @@ from agent_knowledgebase.services.kb_ingest_service import (
     validate_batch_size,
 )
 from agent_knowledgebase.services.knowledgebase import KnowledgebaseService
+from agent_knowledgebase.services.stderr_log import knowledgebase_stderr_log
 
 mcp = FastMCP(
     "agent-knowledgebase",
@@ -48,9 +49,7 @@ mcp = FastMCP(
 _service: KnowledgebaseService | object | None = None
 
 
-def _config_missing_payload(
-    *, missing: str, detail: str
-) -> dict[str, str]:
+def _config_missing_payload(*, missing: str, detail: str) -> dict[str, str]:
     """Return the structured ``config_missing`` JSON payload."""
     return {
         "error": "config_missing",
@@ -172,6 +171,64 @@ class _ConfigMissingService:
         return _raise_config_missing
 
 
+def _trigger_eager_warm(service: KnowledgebaseService) -> None:
+    """Start the chromadb eager-warm in a non-blocking daemon thread.
+
+    The MCP transport handshake must NOT wait for warmup to complete;
+    this function returns immediately after spawning the daemon thread.
+    The thread is daemon=True so it never prevents interpreter shutdown.
+
+    Failures (including the case where the service does not have the
+    warmup method) are silently absorbed so startup is never blocked.
+
+    Phase A — vectorstore robustness.
+    spec_id: 70ab2170-381a-4657-bcd1-28a40c6f369b
+    """
+
+    def _run_warmup() -> None:
+        try:
+            knowledgebase_stderr_log(
+                kb_id="__server__",
+                op="eager_warm",
+                phase="start",
+                elapsed_ms=0,
+                rows_in=0,
+                rows_ok=0,
+                rows_skipped=0,
+                rows_failed=0,
+                dedup_policy="n/a",
+                request_id=None,
+                tool_caller_version=None,
+                error_code="eager_warm_started",
+                error_message="chromadb eager-warm started",
+            )
+            summary = service.warmup_all_chromadb_kbs()
+            knowledgebase_stderr_log(
+                kb_id="__server__",
+                op="eager_warm",
+                phase="complete",
+                elapsed_ms=0,
+                rows_in=summary.get("warmed_count", 0),
+                rows_ok=summary.get("warmed_count", 0),
+                rows_skipped=summary.get("skipped_count", 0),
+                rows_failed=summary.get("failed_count", 0),
+                dedup_policy="n/a",
+                request_id=None,
+                tool_caller_version=None,
+                error_code="eager_warm_completed",
+                error_message=(f"chromadb eager-warm completed: {summary}"),
+            )
+        except Exception:  # noqa: BLE001 — warmup failures must not block startup
+            pass
+
+    t = threading.Thread(
+        target=_run_warmup,
+        name="kb_eager_warm",
+        daemon=True,
+    )
+    t.start()
+
+
 def _get_service() -> KnowledgebaseService | _ConfigMissingService:
     global _service
     if _service is None:
@@ -182,6 +239,13 @@ def _get_service() -> KnowledgebaseService | _ConfigMissingService:
             _service = _ConfigMissingService(payload)
         else:
             _service = KnowledgebaseService(config)
+            # Phase A: kick off non-blocking chromadb eager-warm.
+            # The thread is daemon=True so it never blocks interpreter
+            # shutdown. The MCP transport handshake is not gated on it.
+            try:
+                _trigger_eager_warm(_service)
+            except Exception:  # noqa: BLE001 — never block startup
+                pass
     return _service  # type: ignore[return-value]
 
 
@@ -292,6 +356,7 @@ def _with_tool_timeout(func: _F) -> _F:
     a fresh install with no API key returns a structured
     ``config_missing`` JSON response instead of a raw stack trace.
     """
+
     @wraps(func)
     def wrapper(*args: object, **kwargs: object) -> str:
         # Re-entrant call from inside the worker thread: skip the
@@ -320,11 +385,13 @@ def _with_tool_timeout(func: _F) -> _F:
             return future.result(timeout=_TOOL_TIMEOUT_SECONDS)
         except concurrent.futures.TimeoutError:
             _reset_tool_executor()
-            return json.dumps({
-                "error": "tool_timeout",
-                "tool": func.__name__,
-                "timeout_seconds": _TOOL_TIMEOUT_SECONDS,
-            })
+            return json.dumps(
+                {
+                    "error": "tool_timeout",
+                    "tool": func.__name__,
+                    "timeout_seconds": _TOOL_TIMEOUT_SECONDS,
+                }
+            )
         except _ConfigMissingError as exc:
             return json.dumps(exc.payload)
         except ValueError as exc:
@@ -789,16 +856,10 @@ def _provenance() -> dict[str, str]:
     """
     env_prefix = "AGENT_KB_"
     env_keys_present = {
-        name[len(env_prefix):].lower()
-        for name in os.environ
-        if name.startswith(env_prefix)
+        name[len(env_prefix) :].lower() for name in os.environ if name.startswith(env_prefix)
     }
-    user_dict = NestedJsonConfigSettingsSource(
-        Settings, path=resolve_user_config_path()
-    )()
-    project_dict = NestedJsonConfigSettingsSource(
-        Settings, path=resolve_project_config_path()
-    )()
+    user_dict = NestedJsonConfigSettingsSource(Settings, path=resolve_user_config_path())()
+    project_dict = NestedJsonConfigSettingsSource(Settings, path=resolve_project_config_path())()
 
     result: dict[str, str] = {}
     for dotted, flat_name in DOT_TO_FLAT.items():
@@ -857,10 +918,13 @@ def kb_config_show(scope: str = "merged") -> str:
     if scope == "merged":
         cfg = load_settings()
         values = {flat_name: getattr(cfg, flat_name) for flat_name in DOT_TO_FLAT.values()}
-        return json.dumps({
-            "values": _unflatten(values),
-            "provenance": _provenance(),
-        }, default=str)
+        return json.dumps(
+            {
+                "values": _unflatten(values),
+                "provenance": _provenance(),
+            },
+            default=str,
+        )
 
     if scope == "user":
         return json.dumps(
@@ -869,7 +933,9 @@ def kb_config_show(scope: str = "merged") -> str:
         )
     if scope == "project":
         return json.dumps(
-            _unflatten(NestedJsonConfigSettingsSource(Settings, path=resolve_project_config_path())()),
+            _unflatten(
+                NestedJsonConfigSettingsSource(Settings, path=resolve_project_config_path())()
+            ),
             default=str,
         )
     if scope == "env":
@@ -987,6 +1053,7 @@ def kb_config_validate() -> str:
     ``"missing"``, or ``"error"`` for each file.  When both are
     ``"ok"``/``"missing"``, also returns the merged values + provenance.
     """
+
     def _check(path: Path) -> dict[str, object]:
         if not path.exists():
             return {"status": "missing", "path": str(path)}
