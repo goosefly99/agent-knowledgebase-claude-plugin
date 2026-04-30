@@ -15,7 +15,7 @@ which selects ONE :class:`RetrieverBackend` once at construction time via
 code paths route through that instance.
 
 The factory dispatches on ``settings.kb_backend`` (``Literal[
-'chromadb','markdown','lightrag']``, default ``'chromadb'``, loaded from
+'chromadb','markdown','lightrag','textvec']``, default ``'chromadb'``, loaded from
 ``AGENT_KB_BACKEND`` env or the ``kb_backend`` JSON config key —
 disambiguated from the existing ``Settings.vectorstore`` field which
 remains the chromadb-internal vector-store-provider choice).
@@ -152,7 +152,7 @@ class RetrieverBackend(Protocol):
         ...
 
 
-_VALID_BACKENDS = frozenset({"chromadb", "markdown", "lightrag"})
+_VALID_BACKENDS = frozenset({"chromadb", "markdown", "lightrag", "textvec"})
 
 # The sentinel file written by ``kb_migrate`` after a successful
 # migration: ``<saves_dir>/<kb-name>/.migrated_to``. The file's content
@@ -224,9 +224,7 @@ def resolve_backend_name(
     default is used so existing behavior is preserved bit-for-bit.
     """
     if kb_id is not None:
-        sentinel_target = _read_migrated_sentinel(
-            settings, kb_id=kb_id, service=service
-        )
+        sentinel_target = _read_migrated_sentinel(settings, kb_id=kb_id, service=service)
         if sentinel_target is not None:
             return sentinel_target
         per_kb = getattr(settings, "kb_backend_per_kb", None) or {}
@@ -244,7 +242,7 @@ def get_backend(
     """Backend factory. Reads ``settings.kb_backend`` and dispatches.
 
     Valid values: ``'chromadb'`` (default), ``'markdown'``,
-    ``'lightrag'``.
+    ``'lightrag'``, ``'textvec'``.
 
     Disambiguated from the existing ``settings.vectorstore`` field
     (which stays as the chromadb-internal vector-store-provider choice
@@ -271,10 +269,12 @@ def get_backend(
 
     if backend_name == "chromadb":
         from .chromadb_backend import ChromadbBackend
+
         return ChromadbBackend(settings, service=service)
 
     if backend_name == "markdown":
         from .markdown_backend import MarkdownWikiBackend
+
         return MarkdownWikiBackend(settings, service=service)
 
     if backend_name == "lightrag":
@@ -286,11 +286,20 @@ def get_backend(
         # requires a running LightRAG sidecar at
         # AGENT_KB_LIGHTRAG_URL plus per-method implementation.
         from .lightrag_backend import LightRAGBackend
+
         return LightRAGBackend(settings, service=service)
+
+    if backend_name == "textvec":
+        # Phase B: SQLite FTS5+BM25 over the existing per-KB chunks table.
+        # Opt-in via AGENT_KB_BACKEND=textvec. Zero new external dependencies
+        # (stdlib sqlite3). Default kb_backend stays 'chromadb'.
+        from .textvec_backend import TextvecBackend
+
+        return TextvecBackend(settings, service=service)
 
     raise ValueError(
         f"Unknown AGENT_KB_BACKEND={backend_name!r}; "
-        f"valid values: chromadb (default), markdown, lightrag"
+        f"valid values: chromadb (default), markdown, lightrag, textvec"
     )
 
 

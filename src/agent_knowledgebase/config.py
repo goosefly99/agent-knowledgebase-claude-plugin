@@ -48,7 +48,7 @@ class Settings(BaseSettings):
     )
 
     # --- Retrieval backend (Phase 2 redesign) ---
-    kb_backend: Literal["chromadb", "markdown", "lightrag"] = Field(
+    kb_backend: Literal["chromadb", "markdown", "lightrag", "textvec"] = Field(
         default="chromadb",
         validation_alias=AliasChoices(
             "kb_backend",
@@ -60,14 +60,16 @@ class Settings(BaseSettings):
         "Picks the high-level retrieval strategy that wraps "
         "ingest/query/search/delete: 'chromadb' (default; vector + FTS via "
         "the existing chromadb pipeline), 'markdown' (Phase 3, opt-in "
-        "Karpathy-style wiki backend), or 'lightrag' (Phase 6, deferred). "
+        "Karpathy-style wiki backend), 'lightrag' (Phase 6, deferred), or "
+        "'textvec' (Phase B, opt-in; SQLite FTS5+BM25 over the existing "
+        "chunks table — zero new external dependencies). "
         "Disambiguation: this is NOT the same as the 'vectorstore' field. "
         "'kb_backend' selects the retrieval-strategy abstraction "
         "(RetrieverBackend); 'vectorstore' selects the chromadb-internal "
         "vector-store provider in {chromadb, pinecone}, used only by the "
         "ChromadbBackend. The two compose: kb_backend='chromadb' + "
         "vectorstore='pinecone' would route through ChromadbBackend with a "
-        "Pinecone-backed VectorStore.",
+        "Pinecone-backed VectorStore. spec_id: 70ab2170-381a-4657-bcd1-28a40c6f369b",
     )
 
     # --- Vectorstore robustness (Phase A) ---
@@ -79,6 +81,42 @@ class Settings(BaseSettings):
         "daemon thread, amortising the ~180s HNSW cold-load into startup "
         "time rather than the first tool call. Set to False to disable "
         "(opt-out). spec_id: 70ab2170-381a-4657-bcd1-28a40c6f369b",
+    )
+
+    # --- TextvecBackend tuning (Phase B, v2.2) ---
+    # These fields are consumed by TextvecBackend (AGENT_KB_BACKEND=textvec).
+    # They have no effect when kb_backend is 'chromadb', 'markdown', or
+    # 'lightrag'. bm25_k1 / bm25_b are stored for documentation and future
+    # use; SQLite FTS5's BM25 parameters are currently configured via the
+    # tokenize= option and rank order, not via explicit k1/b tuning.
+    # spec_id: 70ab2170-381a-4657-bcd1-28a40c6f369b
+    fts5_tokenizer: str = Field(
+        default="porter unicode61",
+        description="FTS5 tokenizer directive (AGENT_KB_FTS5_TOKENIZER). "
+        "Default 'porter unicode61' enables English stemming and Unicode "
+        "normalisation. See SQLite FTS5 docs for supported tokenizer names.",
+    )
+    bm25_k1: float = Field(
+        default=1.2,
+        gt=0.0,
+        description="BM25 term-frequency saturation parameter k1 "
+        "(AGENT_KB_BM25_K1). Stored for documentation; SQLite FTS5 uses "
+        "its own BM25 implementation with fixed k1.",
+    )
+    bm25_b: float = Field(
+        default=0.75,
+        ge=0.0,
+        le=1.0,
+        description="BM25 document-length normalisation parameter b "
+        "(AGENT_KB_BM25_B). Stored for documentation; SQLite FTS5 uses "
+        "its own BM25 implementation with fixed b.",
+    )
+    lexical_min_token_len: int = Field(
+        default=2,
+        ge=1,
+        description="Minimum token length for FTS5 queries "
+        "(AGENT_KB_LEXICAL_MIN_TOKEN_LEN). Tokens shorter than this are "
+        "stripped from search queries to reduce noise. Default 2.",
     )
 
     # --- Per-KB retrieval backend overrides (Phase 4 redesign) ---
@@ -158,7 +196,7 @@ class Settings(BaseSettings):
     @field_validator("kb_backend_per_kb", mode="after")
     @classmethod
     def _validate_kb_backend_per_kb_values(cls, value: dict[str, str]) -> dict[str, str]:
-        valid = {"chromadb", "markdown", "lightrag"}
+        valid = {"chromadb", "markdown", "lightrag", "textvec"}
         for kb_id, backend in value.items():
             if backend not in valid:
                 raise ValueError(
@@ -300,7 +338,10 @@ class Settings(BaseSettings):
         benign even when ``kb_backend != 'chromadb'`` (it's the field
         default and may simply be unset).
         """
-        if self.kb_backend in {"markdown", "lightrag"} and self.vectorstore != "chromadb":
+        if (
+            self.kb_backend in {"markdown", "lightrag", "textvec"}
+            and self.vectorstore != "chromadb"
+        ):
             msg = (
                 f"vectorstore={self.vectorstore!r} is meaningless when "
                 f"kb_backend={self.kb_backend!r}; only set vectorstore "

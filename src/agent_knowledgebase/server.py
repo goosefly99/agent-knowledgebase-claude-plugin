@@ -1109,13 +1109,43 @@ def kb_config_validate() -> str:
 def main() -> None:
     """Run the MCP server.
 
-    Performs a startup precheck of the configuration so that missing or
-    misconfigured paths fail immediately with a structured single-line
-    JSON message on stderr, rather than surfacing on the first
-    ``kb_*`` MCP call and confusing the caller. ``sys.exit(1)`` on
-    failure ensures the launcher / supervisor sees a non-zero exit
-    code.
+    Performs two startup prechecks before the MCP transport handshake:
+
+    1. FTS5 availability probe — verifies the running Python build's
+       sqlite3 supports FTS5. Runs unconditionally (even when
+       ``AGENT_KB_BACKEND != 'textvec'``) because:
+       (a) the probe is effectively free (<1 ms in-memory round-trip),
+       (b) it catches the misconfiguration before the user opts in OR
+           before Phase C migration tooling is invoked, and
+       (c) the ``chunks_fts`` virtual table declared in database.py
+           (Phase B schema bootstrap) will fail to create on a non-FTS5
+           sqlite, breaking ANY KB ingest regardless of backend choice.
+       Exits non-zero with a structured JSON message on stderr if FTS5
+       is unavailable. spec_id: 70ab2170-381a-4657-bcd1-28a40c6f369b
+
+    2. Settings / saves_dir validation — same logic as before Phase B.
     """
+    import sqlite3 as _sqlite3
+
+    try:
+        _probe_conn = _sqlite3.connect(":memory:")
+        _probe_conn.execute("CREATE VIRTUAL TABLE _probe USING fts5(x);")
+        _probe_conn.execute("DROP TABLE _probe;")
+        _probe_conn.close()
+    except _sqlite3.OperationalError as exc:
+        structured_msg = json.dumps(
+            {
+                "error": "sqlite_fts5_unavailable",
+                "detail": str(exc),
+                "remediation": (
+                    "Install Python with FTS5-enabled sqlite3 "
+                    "(Python 3.11+ on standard CPython distros include FTS5 by default)."
+                ),
+            }
+        )
+        print(structured_msg, file=sys.stderr)
+        sys.exit(1)
+
     try:
         Settings().resolve_paths()
     except (ValidationError, FileNotFoundError, NotADirectoryError) as exc:

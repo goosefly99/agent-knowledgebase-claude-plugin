@@ -95,6 +95,38 @@ CREATE VIRTUAL TABLE IF NOT EXISTS wiki_pages_fts USING fts5(
 );
 """
 
+# Phase B (v2.2): contentless FTS5 virtual table + sync triggers for the
+# textvec backend. The contentless mode (content='chunks', content_rowid='id')
+# stores only the inverted index, not the original text — disk overhead is
+# ~5–15% per-KB sqlite file vs. baseline.  The three triggers keep chunks_fts
+# in sync automatically on INSERT / UPDATE / DELETE against chunks, so the
+# TextvecBackend write path only needs to write to chunks; triggers handle FTS.
+#
+# IDEMPOTENCY: every statement uses IF NOT EXISTS so running this on an
+# existing DB is a no-op.  This is guaranteed because _init_schema() is
+# called on every Database.__init__ (i.e. every server restart).
+_CHUNKS_FTS_SQL = """\
+CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
+    text,
+    tokenize='porter unicode61',
+    content='chunks',
+    content_rowid='rowid'
+);
+
+CREATE TRIGGER IF NOT EXISTS chunks_ai AFTER INSERT ON chunks BEGIN
+    INSERT INTO chunks_fts(rowid, text) VALUES (new.rowid, new.content);
+END;
+
+CREATE TRIGGER IF NOT EXISTS chunks_au AFTER UPDATE ON chunks BEGIN
+    INSERT INTO chunks_fts(chunks_fts, rowid, text) VALUES('delete', old.rowid, old.content);
+    INSERT INTO chunks_fts(rowid, text) VALUES (new.rowid, new.content);
+END;
+
+CREATE TRIGGER IF NOT EXISTS chunks_ad AFTER DELETE ON chunks BEGIN
+    INSERT INTO chunks_fts(chunks_fts, rowid, text) VALUES('delete', old.rowid, old.content);
+END;
+"""
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -159,6 +191,12 @@ class Database:
         # FTS virtual table must be created outside executescript in some
         # SQLite builds, so we run it separately.
         cur.executescript(_FTS_SQL)
+        # Phase B (v2.2): contentless chunks_fts + sync triggers.
+        # Uses executescript so each statement runs in its own implicit
+        # transaction (required for CREATE VIRTUAL TABLE on some sqlite
+        # builds). IF NOT EXISTS on every statement makes this idempotent
+        # across repeated Database.__init__ calls (e.g. server restarts).
+        cur.executescript(_CHUNKS_FTS_SQL)
         self._conn.commit()
         # Additive migration: add dedup_key column to pre-existing databases
         # that were created before this column was added to the schema DDL.
@@ -171,8 +209,7 @@ class Database:
         # _init_schema twice is a no-op (guarded by PRAGMA column probe).
         # Rollback SQL is documented in CHANGELOG.md.
         run_cols = {
-            row[1]
-            for row in self._conn.execute("PRAGMA table_info(pipeline_runs)").fetchall()
+            row[1] for row in self._conn.execute("PRAGMA table_info(pipeline_runs)").fetchall()
         }
         _PIPELINE_RUN_MIGRATION_COLUMNS: list[tuple[str, str]] = [
             ("ended_at", "TEXT"),
@@ -188,9 +225,7 @@ class Database:
         added_any = False
         for col_name, col_type in _PIPELINE_RUN_MIGRATION_COLUMNS:
             if col_name not in run_cols:
-                self._conn.execute(
-                    f"ALTER TABLE pipeline_runs ADD COLUMN {col_name} {col_type}"
-                )
+                self._conn.execute(f"ALTER TABLE pipeline_runs ADD COLUMN {col_name} {col_type}")
                 added_any = True
         if added_any:
             self._conn.commit()
@@ -217,10 +252,7 @@ class Database:
         # ``AGENT_KB_AUTO_REEMBED=1`` env var is the documented
         # bypass. Strictly ALTER ADD — non-destructive — and idempotent
         # across re-opens. spec_id: 70ab2170-381a-4657-bcd1-28a40c6f369b
-        chunk_cols = {
-            row[1]
-            for row in self._conn.execute("PRAGMA table_info(chunks)").fetchall()
-        }
+        chunk_cols = {row[1] for row in self._conn.execute("PRAGMA table_info(chunks)").fetchall()}
         _CHUNK_PROVIDER_SNAPSHOT_COLUMNS: list[tuple[str, str]] = [
             ("embedding_provider", "TEXT"),
             ("embed_base_url", "TEXT"),
@@ -230,9 +262,7 @@ class Database:
         added_provider_snapshot = False
         for col_name, col_type in _CHUNK_PROVIDER_SNAPSHOT_COLUMNS:
             if col_name not in chunk_cols:
-                self._conn.execute(
-                    f"ALTER TABLE chunks ADD COLUMN {col_name} {col_type}"
-                )
+                self._conn.execute(f"ALTER TABLE chunks ADD COLUMN {col_name} {col_type}")
                 added_provider_snapshot = True
         if added_provider_snapshot:
             self._conn.commit()
@@ -279,17 +309,13 @@ class Database:
         self._conn.commit()
 
     def get_knowledgebase(self, id: str) -> Optional[Knowledgebase]:
-        row = self._conn.execute(
-            "SELECT * FROM knowledgebases WHERE id = ?", (id,)
-        ).fetchone()
+        row = self._conn.execute("SELECT * FROM knowledgebases WHERE id = ?", (id,)).fetchone()
         if row is None:
             return None
         return self._row_to_knowledgebase(row)
 
     def list_knowledgebases(self) -> list[Knowledgebase]:
-        rows = self._conn.execute(
-            "SELECT * FROM knowledgebases ORDER BY created_at"
-        ).fetchall()
+        rows = self._conn.execute("SELECT * FROM knowledgebases ORDER BY created_at").fetchall()
         return [self._row_to_knowledgebase(r) for r in rows]
 
     def delete_knowledgebase(self, id: str) -> None:
@@ -337,9 +363,7 @@ class Database:
         return self._row_to_source(row)
 
     def list_sources(self, kb_id: str) -> list[Source]:
-        rows = self._conn.execute(
-            "SELECT * FROM sources WHERE kb_id = ?", (kb_id,)
-        ).fetchall()
+        rows = self._conn.execute("SELECT * FROM sources WHERE kb_id = ?", (kb_id,)).fetchall()
         return [self._row_to_source(r) for r in rows]
 
     def delete_source(self, id: str) -> None:
@@ -411,25 +435,20 @@ class Database:
         self._conn.commit()
 
     def get_wiki_page(self, id: str) -> Optional[WikiPage]:
-        row = self._conn.execute(
-            "SELECT * FROM wiki_pages WHERE id = ?", (id,)
-        ).fetchone()
+        row = self._conn.execute("SELECT * FROM wiki_pages WHERE id = ?", (id,)).fetchone()
         if row is None:
             return None
         return self._row_to_wiki_page(row)
 
     def list_wiki_pages(self, kb_id: str) -> list[WikiPage]:
-        rows = self._conn.execute(
-            "SELECT * FROM wiki_pages WHERE kb_id = ?", (kb_id,)
-        ).fetchall()
+        rows = self._conn.execute("SELECT * FROM wiki_pages WHERE kb_id = ?", (kb_id,)).fetchall()
         return [self._row_to_wiki_page(r) for r in rows]
 
     def update_wiki_page(self, page: WikiPage) -> None:
         """Update an existing wiki page and sync FTS."""
         # Delete old FTS entry.
         self._conn.execute(
-            "DELETE FROM wiki_pages_fts WHERE rowid = "
-            "(SELECT rowid FROM wiki_pages WHERE id = ?)",
+            "DELETE FROM wiki_pages_fts WHERE rowid = (SELECT rowid FROM wiki_pages WHERE id = ?)",
             (page.id,),
         )
         # Update the page.
@@ -473,8 +492,7 @@ class Database:
     def delete_wiki_page(self, id: str) -> None:
         # Remove FTS entry.
         self._conn.execute(
-            "DELETE FROM wiki_pages_fts WHERE rowid = "
-            "(SELECT rowid FROM wiki_pages WHERE id = ?)",
+            "DELETE FROM wiki_pages_fts WHERE rowid = (SELECT rowid FROM wiki_pages WHERE id = ?)",
             (id,),
         )
         # Remove link/source associations.
@@ -537,7 +555,9 @@ class Database:
         )
         self._conn.commit()
 
-    def get_wiki_links(self, page_id: str, direction: Literal["inbound", "outbound"] = "outbound") -> list[str]:
+    def get_wiki_links(
+        self, page_id: str, direction: Literal["inbound", "outbound"] = "outbound"
+    ) -> list[str]:
         """Return linked page IDs.
 
         Parameters
@@ -684,9 +704,7 @@ class Database:
         self._conn.commit()
 
     def get_pipeline_run(self, id: str) -> Optional[PipelineRun]:
-        row = self._conn.execute(
-            "SELECT * FROM pipeline_runs WHERE id = ?", (id,)
-        ).fetchone()
+        row = self._conn.execute("SELECT * FROM pipeline_runs WHERE id = ?", (id,)).fetchone()
         if row is None:
             return None
         return self._row_to_pipeline_run(row)
@@ -830,9 +848,7 @@ class Database:
             ).fetchall()
         ]
         for sid in source_ids:
-            self._conn.execute(
-                "DELETE FROM page_sources WHERE source_id = ?", (sid,)
-            )
+            self._conn.execute("DELETE FROM page_sources WHERE source_id = ?", (sid,))
         self._conn.execute("DELETE FROM sources WHERE kb_id = ?", (kb_id,))
         self._conn.commit()
 
@@ -862,9 +878,7 @@ class Database:
 
     def delete_pipeline_runs_by_source(self, source_id: str) -> None:
         """Delete all pipeline runs associated with a source."""
-        self._conn.execute(
-            "DELETE FROM pipeline_runs WHERE source_id = ?", (source_id,)
-        )
+        self._conn.execute("DELETE FROM pipeline_runs WHERE source_id = ?", (source_id,))
         self._conn.commit()
 
     def count_sources(self, kb_id: str) -> int:
@@ -1023,6 +1037,40 @@ class Database:
     # ------------------------------------------------------------------
     # Phase 5 — embedder_version stamping
     # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # Phase B (v2.2) — FTS5 rebuild helper for textvec migration
+    # ------------------------------------------------------------------
+
+    def rebuild_fts5(self, kb_id: str) -> int:
+        """Backfill ``chunks_fts`` for a kb_id. Idempotent — returns row count inserted.
+
+        Used by Phase C ``kb_migrate(target_backend='textvec')`` to populate
+        FTS5 for legacy v0.11.0 KBs whose ``chunks`` rows predate the
+        ``chunks_fts`` AFTER-INSERT trigger. Safe to call on a KB that already
+        has a fully-populated ``chunks_fts`` index — duplicate inserts for
+        existing rowids are silently skipped.
+
+        Implementation note on contentless FTS5 + INSERT OR IGNORE
+        -----------------------------------------------------------
+        Contentless FTS5 tables do NOT enforce a UNIQUE constraint on
+        rowid by default, so ``INSERT OR IGNORE`` would NOT automatically
+        deduplicate. Instead, we use a ``NOT EXISTS`` sub-select to check
+        whether the rowid is already in ``chunks_fts`` before inserting.
+        This is a safe, idempotent approach that avoids double-indexing.
+        spec_id: 70ab2170-381a-4657-bcd1-28a40c6f369b
+        """
+        cur = self._conn.execute(
+            "INSERT INTO chunks_fts (rowid, text) "
+            "SELECT rowid, content FROM chunks "
+            "WHERE kb_id = ? "
+            "AND NOT EXISTS ("
+            "  SELECT 1 FROM chunks_fts WHERE rowid = chunks.rowid"
+            ")",
+            (kb_id,),
+        )
+        self._conn.commit()
+        return cur.rowcount or 0
 
     def get_embedder_versions(self, kb_id: str) -> set[str]:
         """Return the set of distinct ``embedder_version`` values for *kb_id*.
