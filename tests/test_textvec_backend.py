@@ -4,12 +4,15 @@ Pins all 7 RetrieverBackend Protocol methods on a fresh SQLite DB.
 Round-trip: index -> query -> search -> delete -> count.
 Probe-4 fields verified via info().
 health_check() verified on a live FTS5-capable sqlite build.
+index() partial-failure log emission verified (Fix #2 from Phase B review).
 """
 
 from __future__ import annotations
 
+import sqlite3
 import uuid
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -301,3 +304,124 @@ class TestTextvecBackendProtocol:
         ).fetchone()
         fresh_conn.close()
         assert row["cnt"] > 0, "chunks_fts has 0 rows for UNIQUETOKEN via fresh connection"
+
+
+# ---------------------------------------------------------------------------
+# Fix #2: index() partial-failure log emission
+# ---------------------------------------------------------------------------
+
+
+class TestIndexPartialFailureLog:
+    """index() must emit a failure-shaped stderr log and re-raise on mid-loop error.
+
+    We use a mock connection (via MagicMock) whose execute() raises
+    IntegrityError on the 3rd INSERT call, then assert:
+    - rows_ok=2 in the failure log (only 2 succeeded before the error)
+    - error_code="TEXTVEC_INDEX_FAILED" is set
+    - The exception still propagates to the caller
+
+    Note: sqlite3.Connection.execute is read-only in CPython 3.13, so we
+    cannot monkey-patch a real connection. Instead we inject a MagicMock
+    connection via _connect to achieve the same effect without mutating a
+    live sqlite3.Connection.
+    """
+
+    def test_partial_failure_emits_error_log_and_reraises(
+        self, textvec_backend: TextvecBackend, kb_id: str, db_with_kb: Database
+    ) -> None:
+        """IntegrityError on doc 3 of 5: failure log has rows_ok=2 + re-raises."""
+        from contextlib import contextmanager
+        from unittest.mock import MagicMock
+
+        docs = [
+            {
+                "id": f"doc-{i}",
+                "content": f"content {i}",
+                "metadata": {"kb_id": kb_id, "source_id": f"src-{kb_id}"},
+            }
+            for i in range(5)
+        ]
+
+        insert_call_count = 0
+
+        def side_effect_execute(sql, params=None):
+            nonlocal insert_call_count
+            if sql and "INSERT OR IGNORE INTO chunks" in sql:
+                insert_call_count += 1
+                if insert_call_count == 3:
+                    raise sqlite3.IntegrityError("simulated IntegrityError on doc 3")
+            return MagicMock()  # cursor-like return value
+
+        mock_conn = MagicMock()
+        mock_conn.execute.side_effect = side_effect_execute
+        mock_conn.commit.return_value = None
+
+        @contextmanager
+        def mock_connect(kb_id_arg):
+            yield mock_conn
+
+        logged_calls: list[dict] = []
+
+        def capture_log(**kwargs):
+            logged_calls.append(dict(kwargs))
+
+        with (
+            patch(
+                "agent_knowledgebase.backends.textvec_backend.knowledgebase_stderr_log",
+                side_effect=capture_log,
+            ),
+            patch.object(textvec_backend, "_connect", side_effect=mock_connect),
+        ):
+            with pytest.raises(sqlite3.IntegrityError, match="simulated"):
+                textvec_backend.index(kb_id=kb_id, documents=docs)
+
+        # There should be at least 2 log calls: the start log + the failure log.
+        assert len(logged_calls) >= 2, (
+            f"Expected at least 2 log calls (start + failure), got {len(logged_calls)}: "
+            f"{logged_calls}"
+        )
+
+        # The failure log must be the last one emitted (after start log).
+        failure_log = logged_calls[-1]
+        assert failure_log["error_code"] == "TEXTVEC_INDEX_FAILED", (
+            f"Expected error_code='TEXTVEC_INDEX_FAILED', got {failure_log['error_code']!r}"
+        )
+        assert failure_log["rows_ok"] == 2, (
+            f"Expected rows_ok=2 (2 docs succeeded before error), got {failure_log['rows_ok']}"
+        )
+        assert failure_log["rows_in"] == 5, f"Expected rows_in=5, got {failure_log['rows_in']}"
+        assert failure_log["error_message"] is not None
+        assert "simulated" in failure_log["error_message"]
+
+    def test_index_elapsed_ms_not_hardcoded_zero_on_success(
+        self, textvec_backend: TextvecBackend, kb_id: str, db_with_kb: Database
+    ) -> None:
+        """On success, elapsed_ms in the final log is >= 0 (captured from perf_counter)."""
+        docs = [
+            {
+                "id": f"perf-doc-{i}",
+                "content": f"performance test content {i}",
+                "metadata": {"kb_id": kb_id, "source_id": f"src-{kb_id}"},
+            }
+            for i in range(3)
+        ]
+
+        logged_calls: list[dict] = []
+
+        def capture_log(**kwargs):
+            logged_calls.append(dict(kwargs))
+
+        with patch(
+            "agent_knowledgebase.backends.textvec_backend.knowledgebase_stderr_log",
+            side_effect=capture_log,
+        ):
+            textvec_backend.index(kb_id=kb_id, documents=docs)
+
+        # Should have at least start + success log.
+        assert len(logged_calls) >= 2
+        # All log calls must have elapsed_ms as a number, not hardcoded 0
+        # for the success log (last call). The start log may legitimately be ~0.
+        success_log = logged_calls[-1]
+        assert success_log["elapsed_ms"] >= 0
+        assert success_log["error_code"] is None
+        assert success_log["rows_ok"] == 3

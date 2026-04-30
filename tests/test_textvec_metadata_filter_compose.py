@@ -3,6 +3,8 @@
 - MATCH composes correctly with WHERE source_type=? AND dedup_key=? filters.
 - Filter validator rejects nested dicts, lists, non-string keys.
 - SQL parameter binding (not interpolation) verified via filter-column allow-list.
+- FTS5 sanitizer (_FTS_FORBID_RE) strips special characters that trigger
+  OperationalError or column-filter misinterpretation.
 """
 
 from __future__ import annotations
@@ -14,6 +16,7 @@ import pytest
 
 from agent_knowledgebase.backends.textvec_backend import (
     TextvecBackend,
+    _sanitize_fts_query,
     _validate_filter_dict,
     _build_filter_sql,
 )
@@ -258,3 +261,133 @@ class TestFilterComposeWithMatch:
         )
         results = backend.search(kb_id=kb_id, text="retrieval augmented", top_k=10)
         assert len(results) >= 2, "Expected both docs to match 'retrieval augmented'"
+
+
+# ---------------------------------------------------------------------------
+# FTS5 sanitizer unit tests (_sanitize_fts_query / _FTS_FORBID_RE)
+# ---------------------------------------------------------------------------
+
+
+class TestSanitizeFtsQuery:
+    """Pin _FTS_FORBID_RE behaviour on inputs containing FTS5-special chars.
+
+    Each case must NOT raise OperationalError when passed to a live search()
+    call, and the sanitised text must be sensible (non-empty when a real
+    token survives stripping).
+    """
+
+    # ---- Unit-level: pure sanitiser output ----
+
+    def test_cxx_strips_plus_signs(self) -> None:
+        """'c++' → 'c  ' → 'c' — the 'c' token survives."""
+        result = _sanitize_fts_query("c++")
+        assert "+" not in result
+        assert result.strip() == "c"
+
+    def test_python_asyncio_strips_colon(self) -> None:
+        """'python:asyncio' → 'python asyncio' — colon stripped, both tokens survive."""
+        result = _sanitize_fts_query("python:asyncio")
+        assert ":" not in result
+        assert "python" in result
+        assert "asyncio" in result
+
+    def test_foo_ampersand_bar_strips_ampersand(self) -> None:
+        """'foo&bar' → 'foo bar' — ampersand stripped, both tokens survive."""
+        result = _sanitize_fts_query("foo&bar")
+        assert "&" not in result
+        assert "foo" in result
+        assert "bar" in result
+
+    def test_a_pipe_b_strips_pipe(self) -> None:
+        """'a|b' → 'a b' — pipe stripped, both tokens survive."""
+        result = _sanitize_fts_query("a|b")
+        assert "|" not in result
+        assert "a" in result
+        assert "b" in result
+
+    def test_all_special_chars_stripped(self) -> None:
+        """All forbidden characters are stripped without raising."""
+        for char in ['"', "'", "(", ")", "-", "*", "^", "+", ":", "&", "|"]:
+            result = _sanitize_fts_query(f"word{char}word")
+            assert char not in result, f"char {char!r} survived sanitiser"
+
+    def test_normal_query_unchanged(self) -> None:
+        """Plain alphanumeric query is returned unmodified (modulo whitespace)."""
+        result = _sanitize_fts_query("machine learning")
+        assert result == "machine learning"
+
+    def test_empty_string_returns_empty(self) -> None:
+        """Empty input returns ''."""
+        assert _sanitize_fts_query("") == ""
+
+    def test_only_special_chars_returns_empty_or_whitespace(self) -> None:
+        """Input of only special chars produces empty / whitespace-only output."""
+        result = _sanitize_fts_query("++::&&||")
+        assert result.strip() == ""
+
+    # ---- Integration: no OperationalError through live search() ----
+
+    def test_cxx_search_does_not_raise(self, tmp_path: Path) -> None:
+        """search() with 'c++' input does not raise OperationalError."""
+        backend, kb_id, db = _make_backend_and_db(tmp_path)
+        backend.index(
+            kb_id=kb_id,
+            documents=[
+                {
+                    "id": "cxx-doc",
+                    "content": "c language programming systems",
+                    "metadata": {"kb_id": kb_id, "source_id": f"src-{kb_id}"},
+                }
+            ],
+        )
+        # Must not raise; result may be empty or non-empty.
+        results = backend.search(kb_id=kb_id, text="c++", top_k=5)
+        assert isinstance(results, list)
+
+    def test_python_asyncio_search_does_not_raise(self, tmp_path: Path) -> None:
+        """search() with 'python:asyncio' does not raise OperationalError."""
+        backend, kb_id, db = _make_backend_and_db(tmp_path)
+        backend.index(
+            kb_id=kb_id,
+            documents=[
+                {
+                    "id": "py-doc",
+                    "content": "python asyncio concurrency event loop",
+                    "metadata": {"kb_id": kb_id, "source_id": f"src-{kb_id}"},
+                }
+            ],
+        )
+        results = backend.search(kb_id=kb_id, text="python:asyncio", top_k=5)
+        assert isinstance(results, list)
+
+    def test_foo_ampersand_bar_search_does_not_raise(self, tmp_path: Path) -> None:
+        """search() with 'foo&bar' does not raise OperationalError."""
+        backend, kb_id, db = _make_backend_and_db(tmp_path)
+        backend.index(
+            kb_id=kb_id,
+            documents=[
+                {
+                    "id": "foobar-doc",
+                    "content": "foo bar baz qux",
+                    "metadata": {"kb_id": kb_id, "source_id": f"src-{kb_id}"},
+                }
+            ],
+        )
+        results = backend.search(kb_id=kb_id, text="foo&bar", top_k=5)
+        assert isinstance(results, list)
+
+    def test_a_pipe_b_search_does_not_raise(self, tmp_path: Path) -> None:
+        """search() with 'a|b' does not raise OperationalError."""
+        backend, kb_id, db = _make_backend_and_db(tmp_path)
+        backend.index(
+            kb_id=kb_id,
+            documents=[
+                {
+                    "id": "ab-doc",
+                    "content": "alpha beta gamma delta",
+                    "metadata": {"kb_id": kb_id, "source_id": f"src-{kb_id}"},
+                }
+            ],
+        )
+        results = backend.search(kb_id=kb_id, text="a|b", top_k=5)
+        assert isinstance(results, list)

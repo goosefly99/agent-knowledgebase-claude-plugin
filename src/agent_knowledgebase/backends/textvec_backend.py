@@ -64,6 +64,7 @@ from __future__ import annotations
 import re
 import sqlite3
 import threading
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Generator
@@ -90,10 +91,15 @@ _SPEC_ID = "70ab2170-381a-4657-bcd1-28a40c6f369b"
 _FILTER_ALLOWED_VALUE_TYPES = (str, int, float, bool)
 
 # FTS5-special characters that may cause parse errors in MATCH expressions.
-# Strip quotes, FTS5 operators, and punctuation that could be misinterpreted.
+# Strip the following so user input like "c++" or "python:asyncio" never
+# triggers a silent OperationalError-then-empty-results:
+#   "  '  (  )  -  *  ^   — basic FTS5 phrase/operator punctuation
+#   +                      — triggers "fts5: syntax error near '+'"
+#   :                      — triggers FTS5 column-filter syntax (col:term)
+#   &  |                   — operator parsing in some FTS5 versions
 # We use AND-of-tokens semantics (FTS5 default when no operator given),
 # so we strip anything that would be parsed as an operator.
-_FTS_FORBID_RE = re.compile(r"[\"\'()\-\*\^]")
+_FTS_FORBID_RE = re.compile(r"[\"\'()\-\*\^\+\:\&\|]")
 
 # Metadata columns in the chunks table that are supported as SQL equality
 # filters (composable with MATCH). This is a frozen allow-list; free-form
@@ -145,12 +151,26 @@ def _validate_filter_dict(filters: dict[str, Any]) -> None:
 def _sanitize_fts_query(text: str) -> str:
     """Strip FTS5-special characters from a query string.
 
-    FTS5 special characters (double/single quotes) are stripped because
-    they change tokenization semantics. The result is passed as a raw
-    FTS5 MATCH expression — NOT wrapped in phrase quotes — so multi-word
-    queries match documents where the tokens appear in ANY order (FTS5
-    default AND logic). This gives better recall than phrase matching for
-    natural language queries.
+    Strips characters that would otherwise trigger FTS5 parse errors or
+    unintended column-filter / operator semantics:
+
+    * ``"`` ``'`` — phrase-quote delimiters
+    * ``(`` ``)`` — grouping
+    * ``-`` — NOT operator
+    * ``*`` — prefix wildcard
+    * ``^`` — initial-token marker
+    * ``+`` — triggers "fts5: syntax error near '+'"
+    * ``:`` — column-filter syntax (e.g. ``col:term``)
+    * ``&`` ``|`` — operator parsing (FTS5 version-dependent)
+
+    The result is passed as a raw FTS5 MATCH expression — NOT wrapped in
+    phrase quotes — so multi-word queries match documents where the tokens
+    appear in ANY order (FTS5 default AND logic). This gives better recall
+    than phrase matching for natural language queries.
+
+    The ``try/except sqlite3.OperationalError: return []`` guard in
+    :meth:`TextvecBackend.search` remains as a final safety net for any
+    FTS5 syntax corner-cases not covered here.
 
     Returns ``""`` on empty input (caller must check before executing SQL).
     """
@@ -317,11 +337,15 @@ class TextvecBackend:
         if not documents:
             return
 
+        import json as _json
+
+        t0 = time.perf_counter()
+
         knowledgebase_stderr_log(
             kb_id=kb_id,
             op="textvec_index",
             phase="index",
-            elapsed_ms=0,
+            elapsed_ms=round((time.perf_counter() - t0) * 1000, 1),
             rows_in=len(documents),
             rows_ok=0,
             rows_skipped=0,
@@ -333,35 +357,53 @@ class TextvecBackend:
             error_message=None,
         )
 
-        import json as _json
-
-        with self._connect(kb_id) as conn:
-            for doc in documents:
-                meta = doc.get("metadata") or {}
-                source_id = doc.get("source_id") or meta.get("source_id") or ""
-                doc_kb_id = doc.get("kb_id") or meta.get("kb_id") or kb_id
-                conn.execute(
-                    "INSERT OR IGNORE INTO chunks "
-                    "(id, source_id, kb_id, content, metadata, "
-                    "embedding_id, embedding_provider, embed_base_url, embedder_version) "
-                    "VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL, NULL)",
-                    (
-                        doc["id"],
-                        source_id,
-                        doc_kb_id,
-                        doc.get("content", ""),
-                        _json.dumps(meta) if meta else None,
-                    ),
-                )
-            conn.commit()
+        rows_ok = 0
+        try:
+            with self._connect(kb_id) as conn:
+                for doc in documents:
+                    meta = doc.get("metadata") or {}
+                    source_id = doc.get("source_id") or meta.get("source_id") or ""
+                    doc_kb_id = doc.get("kb_id") or meta.get("kb_id") or kb_id
+                    conn.execute(
+                        "INSERT OR IGNORE INTO chunks "
+                        "(id, source_id, kb_id, content, metadata, "
+                        "embedding_id, embedding_provider, embed_base_url, embedder_version) "
+                        "VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL, NULL)",
+                        (
+                            doc["id"],
+                            source_id,
+                            doc_kb_id,
+                            doc.get("content", ""),
+                            _json.dumps(meta) if meta else None,
+                        ),
+                    )
+                    rows_ok += 1
+                conn.commit()
+        except Exception as exc:
+            knowledgebase_stderr_log(
+                kb_id=kb_id,
+                op="textvec_index",
+                phase="index",
+                elapsed_ms=round((time.perf_counter() - t0) * 1000, 1),
+                rows_in=len(documents),
+                rows_ok=rows_ok,
+                rows_skipped=0,
+                rows_failed=len(documents) - rows_ok,
+                dedup_policy="n/a",
+                request_id=None,
+                tool_caller_version=None,
+                error_code="TEXTVEC_INDEX_FAILED",
+                error_message=str(exc),
+            )
+            raise
 
         knowledgebase_stderr_log(
             kb_id=kb_id,
             op="textvec_index",
             phase="index",
-            elapsed_ms=0,
+            elapsed_ms=round((time.perf_counter() - t0) * 1000, 1),
             rows_in=len(documents),
-            rows_ok=len(documents),
+            rows_ok=rows_ok,
             rows_skipped=0,
             rows_failed=0,
             dedup_policy="n/a",

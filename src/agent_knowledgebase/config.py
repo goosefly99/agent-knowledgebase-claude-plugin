@@ -136,7 +136,7 @@ class Settings(BaseSettings):
         "kb_migrate after a successful migration), "
         "(2) this kb_backend_per_kb mapping, "
         "(3) the global ``Settings.kb_backend``. "
-        "Values must be one of {'chromadb', 'markdown', 'lightrag'}; "
+        "Values must be one of {'chromadb', 'markdown', 'lightrag', 'textvec'}; "
         "invalid backend names are rejected at validation time. "
         "spec_id: 70ab2170-381a-4657-bcd1-28a40c6f369b",
     )
