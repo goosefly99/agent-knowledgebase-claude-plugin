@@ -1051,13 +1051,23 @@ class Database:
         has a fully-populated ``chunks_fts`` index — duplicate inserts for
         existing rowids are silently skipped.
 
-        Implementation note on contentless FTS5 + INSERT OR IGNORE
-        -----------------------------------------------------------
+        Implementation note on contentless FTS5 dedup
+        -----------------------------------------------
         Contentless FTS5 tables do NOT enforce a UNIQUE constraint on
         rowid by default, so ``INSERT OR IGNORE`` would NOT automatically
-        deduplicate. Instead, we use a ``NOT EXISTS`` sub-select to check
-        whether the rowid is already in ``chunks_fts`` before inserting.
-        This is a safe, idempotent approach that avoids double-indexing.
+        deduplicate. We must check for prior indexing explicitly.
+
+        Critically, querying ``chunks_fts`` directly (e.g.
+        ``SELECT 1 FROM chunks_fts WHERE rowid = ?``) raises
+        ``OperationalError: no such column: T.text`` on contentless
+        tables — SQLite's FTS5 machinery tries to read the content
+        column from the content table during the subquery and fails.
+
+        Instead we query ``chunks_fts_docsize``, the FTS5-internal
+        shadow table that SQLite maintains for every FTS5 index. It has
+        columns ``(id, sz)`` where ``id`` is the rowid of each indexed
+        document. Querying it avoids the content-table read entirely and
+        is also faster than scanning the FTS index.
         spec_id: 70ab2170-381a-4657-bcd1-28a40c6f369b
         """
         cur = self._conn.execute(
@@ -1065,7 +1075,7 @@ class Database:
             "SELECT rowid, content FROM chunks "
             "WHERE kb_id = ? "
             "AND NOT EXISTS ("
-            "  SELECT 1 FROM chunks_fts WHERE rowid = chunks.rowid"
+            "  SELECT 1 FROM chunks_fts_docsize WHERE id = chunks.rowid"
             ")",
             (kb_id,),
         )
