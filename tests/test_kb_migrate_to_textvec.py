@@ -300,3 +300,104 @@ class TestMigrateToTextvecStderrLog:
             "Expected a migration success log line with error_message containing 'migrated' "
             "and error_code=None; got:\n" + "\n".join(repr(ln) for ln in migration_lines)
         )
+
+
+# ---------------------------------------------------------------------------
+# Fix C-1: filelock missing → loud RuntimeError
+# ---------------------------------------------------------------------------
+
+
+class TestMigrateToTextvecFilelockMissing:
+    def test_filelock_missing_raises_runtime_error(
+        self,
+        service: KnowledgebaseService,
+    ) -> None:
+        """When filelock is not installed, migrate_to_textvec raises RuntimeError."""
+        kb = service.create_kb("migrate-filelock-missing-test")
+        _plant_chunks(service, kb.id, n=3)
+
+        import builtins
+
+        real_import = builtins.__import__
+
+        def _mock_import(name, *args, **kwargs):
+            if name == "filelock":
+                raise ImportError("No module named 'filelock'")
+            return real_import(name, *args, **kwargs)
+
+        with patch("builtins.__import__", side_effect=_mock_import):
+            with pytest.raises(RuntimeError) as exc_info:
+                migrate_to_textvec(kb.id, service)
+
+        msg = str(exc_info.value)
+        assert "filelock" in msg, f"Expected 'filelock' in error message; got: {msg!r}"
+        assert "pip install" in msg, f"Expected pip install hint in error message; got: {msg!r}"
+        assert "docs/cross-process-lock-recipe.md" in msg, (
+            f"Expected recipe doc ref in error message; got: {msg!r}"
+        )
+
+    def test_filelock_missing_emits_stderr_log(
+        self,
+        service: KnowledgebaseService,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        """When filelock is missing, a MIGRATION_FILELOCK_MISSING log line is emitted."""
+        import builtins
+        import json
+
+        kb = service.create_kb("migrate-filelock-missing-log-test")
+        _plant_chunks(service, kb.id, n=3)
+
+        real_import = builtins.__import__
+
+        def _mock_import(name, *args, **kwargs):
+            if name == "filelock":
+                raise ImportError("No module named 'filelock'")
+            return real_import(name, *args, **kwargs)
+
+        with patch("builtins.__import__", side_effect=_mock_import):
+            with pytest.raises(RuntimeError):
+                migrate_to_textvec(kb.id, service)
+
+        captured = capsys.readouterr()
+        log_lines = [json.loads(line) for line in captured.err.splitlines() if line.strip()]
+        missing_lines = [
+            ln for ln in log_lines if ln.get("error_code") == "MIGRATION_FILELOCK_MISSING"
+        ]
+        assert missing_lines, "Expected a MIGRATION_FILELOCK_MISSING log line; got:\n" + "\n".join(
+            repr(ln) for ln in log_lines
+        )
+
+
+# ---------------------------------------------------------------------------
+# Fix I-2: unknown kb_id → ValueError before any directory/lock operation
+# ---------------------------------------------------------------------------
+
+
+class TestMigrateToTextvecUnknownKbId:
+    def test_unknown_kb_id_raises_value_error(
+        self,
+        service: KnowledgebaseService,
+    ) -> None:
+        """Passing an unknown kb_id raises ValueError before any filesystem ops."""
+        bad_kb_id = "totally-unknown-kb-id-xyzzy-404"
+        with pytest.raises(ValueError, match="unknown kb_id"):
+            migrate_to_textvec(bad_kb_id, service)
+
+    def test_unknown_kb_id_does_not_create_directory(
+        self,
+        service: KnowledgebaseService,
+        saves_dir: Path,
+    ) -> None:
+        """No stray directory is created when kb_id is unknown."""
+        from agent_knowledgebase.config import sanitize_kb_dir_name
+
+        bad_kb_id = "stray-dir-leak-test-xyzzy"
+        expected_stray = saves_dir / sanitize_kb_dir_name(bad_kb_id)
+
+        with pytest.raises(ValueError):
+            migrate_to_textvec(bad_kb_id, service)
+
+        assert not expected_stray.exists(), (
+            f"Stray directory was created at {expected_stray} for unknown kb_id={bad_kb_id!r}"
+        )

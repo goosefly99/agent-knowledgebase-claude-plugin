@@ -698,10 +698,25 @@ def migrate_to_textvec(kb_id: str, service: "KnowledgebaseService") -> dict:
 
     Uses :class:`filelock.FileLock` keyed on
     ``<kb-root>/.ingest.lock`` (the same path recipe documented in
-    ``docs/cross-process-lock-recipe.md``).  The lock is acquired with a
-    zero-second timeout so that a concurrent ingest holding the lock
-    causes an immediate return with ``status='deferred'`` rather than a
-    raise — the MCP caller can retry at a safe moment.
+    ``docs/cross-process-lock-recipe.md``).  The FileLock coordinates
+    with other ``migrate_to_textvec`` callers (in any process) AND with
+    external wrappers that adopt the cross-process-lock-recipe.  It does
+    **not** block in-process ``ingest_source`` calls; those are protected
+    separately by the in-process ``threading.Lock`` acquired below, while
+    SQLite WAL serialises writers at the engine level for concurrent SQL.
+
+    ``filelock`` is an intentional non-runtime dependency of this plugin
+    (see ``docs/cross-process-lock-recipe.md``), but a destructive-ish
+    FTS5 migration **must not** proceed without cross-process locking.
+    If ``filelock`` is not installed this function raises
+    :class:`RuntimeError` with an install hint rather than silently
+    falling through.
+
+    The lock is acquired with a zero-second timeout so that another
+    ``migrate_to_textvec`` (or an external-wrapper holder) already
+    holding the lock causes an immediate return with
+    ``status='deferred'`` rather than a raise — the caller can retry
+    at a safe moment.
 
     Returns
     -------
@@ -713,6 +728,11 @@ def migrate_to_textvec(kb_id: str, service: "KnowledgebaseService") -> dict:
 
     spec_id: 70ab2170-381a-4657-bcd1-28a40c6f369b
     """
+    # Upfront validation: reject unknown kb_ids before creating any
+    # directory or acquiring any lock, to prevent stray-directory leaks.
+    if kb_id not in service._index:  # noqa: SLF001 — by design
+        raise ValueError(f"unknown kb_id={kb_id!r}")
+
     t0 = time.monotonic()
 
     def _elapsed_ms() -> int:
@@ -748,19 +768,43 @@ def migrate_to_textvec(kb_id: str, service: "KnowledgebaseService") -> dict:
             return {"status": "already_migrated", "rows": 0, "elapsed_ms": elapsed}
 
     # Cross-process filelock: timeout=0 → non-blocking try-once.
+    # filelock is intentionally NOT a runtime dep of this plugin
+    # (docs/cross-process-lock-recipe.md), but a destructive-ish FTS5
+    # migration must not proceed without cross-process locking — fail
+    # loudly with an actionable install hint rather than silently
+    # skipping the lock.
     lock_path = kb_root / _INGEST_LOCK_FILENAME
     try:
         from filelock import FileLock
-    except ImportError:
-        # filelock is in requirements.lock but guard defensively.
-        FileLock = None  # type: ignore[assignment]
+    except ImportError as exc:
+        knowledgebase_stderr_log(
+            kb_id=kb_id,
+            op="kb_migrate",
+            phase="migration",
+            elapsed_ms=_elapsed_ms(),
+            rows_in=0,
+            rows_ok=0,
+            rows_skipped=0,
+            rows_failed=0,
+            dedup_policy="n/a",
+            request_id=None,
+            tool_caller_version=None,
+            error_code="MIGRATION_FILELOCK_MISSING",
+            error_message=(
+                "filelock not installed; cross-process safe migration unavailable. "
+                "Install filelock in the wrapper environment per "
+                "docs/cross-process-lock-recipe.md (e.g. `pip install filelock>=3.0`)."
+            ),
+        )
+        raise RuntimeError(
+            "filelock not installed; cannot run migrate_to_textvec safely. "
+            "Install with `pip install filelock>=3.0` per "
+            "docs/cross-process-lock-recipe.md."
+        ) from exc
 
     try:
-        if FileLock is not None:
-            lock = FileLock(str(lock_path), timeout=_MIGRATION_FILELOCK_TIMEOUT)
-            lock.acquire()
-        else:
-            lock = None  # type: ignore[assignment]
+        lock = FileLock(str(lock_path), timeout=_MIGRATION_FILELOCK_TIMEOUT)
+        lock.acquire()
     except Exception as exc:  # noqa: BLE001
         # FilelockTimeout or any acquire failure → deferred.
         elapsed = _elapsed_ms()
@@ -812,84 +856,88 @@ def migrate_to_textvec(kb_id: str, service: "KnowledgebaseService") -> dict:
                 )
                 return {"status": "already_migrated", "rows": 0, "elapsed_ms": elapsed}
 
-        # Run FTS5 backfill via Database.rebuild_fts5().
-        ctx = service._ctx(kb_id)  # noqa: SLF001 — by design
-        try:
-            rows = ctx.db.rebuild_fts5(kb_id)
-        except Exception as exc:  # noqa: BLE001
+        # In-process serialisation: acquire the per-kb_id threading.Lock
+        # inside the cross-process FileLock, mirroring the layering used
+        # by migrate().  This closes the in-process concurrency gap when
+        # two threads in the same MCP server process race on the same KB.
+        with service._get_kb_lock(kb_id):  # noqa: SLF001 — by design
+            # Run FTS5 backfill via Database.rebuild_fts5().
+            ctx = service._ctx(kb_id)  # noqa: SLF001 — by design
+            try:
+                rows = ctx.db.rebuild_fts5(kb_id)
+            except Exception as exc:  # noqa: BLE001
+                elapsed = _elapsed_ms()
+                knowledgebase_stderr_log(
+                    kb_id=kb_id,
+                    op="kb_migrate",
+                    phase="migration",
+                    elapsed_ms=elapsed,
+                    rows_in=0,
+                    rows_ok=0,
+                    rows_skipped=0,
+                    rows_failed=1,
+                    dedup_policy="n/a",
+                    request_id=None,
+                    tool_caller_version=None,
+                    error_code="MIGRATION_FAILED",
+                    error_message=str(exc),
+                )
+                raise
+
+            # Write .migrated_to sentinel (atomic via mkstemp + os.replace).
+            _write_migrated_sentinel(kb_root, _TEXTVEC_SENTINEL_CONTENT)
+
+            # Invalidate the per-KB backend cache so the next query routes
+            # through TextvecBackend immediately (sentinel controls routing).
+            service._invalidate_backend_cache(kb_id)  # noqa: SLF001
+
             elapsed = _elapsed_ms()
+
+            # Warn when no chunks were backfilled on a KB that has chunk rows
+            # (e.g. chunks.content is NULL / empty on every row — edge case).
+            result: dict[str, object] = {
+                "status": "migrated",
+                "rows": rows,
+                "elapsed_ms": elapsed,
+            }
+            error_code: str | None = None
+            error_message: str | None = "kb migrated to textvec backend"
+            if rows == 0:
+                # Check whether the KB is genuinely empty or anomalous.
+                try:
+                    chunk_count_row = ctx.db._conn.execute(  # noqa: SLF001
+                        "SELECT COUNT(*) AS cnt FROM chunks WHERE kb_id = ?", (kb_id,)
+                    ).fetchone()
+                    total_chunks = int(chunk_count_row["cnt"]) if chunk_count_row else 0
+                except Exception:  # noqa: BLE001
+                    total_chunks = 0
+                if total_chunks > 0:
+                    error_code = "MIGRATION_NO_ROWS"
+                    error_message = "no_chunks_text"
+                    result["warning"] = "no_chunks_text"
+
             knowledgebase_stderr_log(
                 kb_id=kb_id,
                 op="kb_migrate",
                 phase="migration",
                 elapsed_ms=elapsed,
                 rows_in=0,
-                rows_ok=0,
+                rows_ok=rows,
                 rows_skipped=0,
-                rows_failed=1,
+                rows_failed=0,
                 dedup_policy="n/a",
                 request_id=None,
                 tool_caller_version=None,
-                error_code="MIGRATION_FAILED",
-                error_message=str(exc),
+                error_code=error_code,
+                error_message=error_message,
             )
-            raise
-
-        # Write .migrated_to sentinel (atomic via mkstemp + os.replace).
-        _write_migrated_sentinel(kb_root, _TEXTVEC_SENTINEL_CONTENT)
-
-        # Invalidate the per-KB backend cache so the next query routes through
-        # TextvecBackend immediately (the sentinel now controls routing).
-        service._invalidate_backend_cache(kb_id)  # noqa: SLF001
-
-        elapsed = _elapsed_ms()
-
-        # Warn when no chunks were backfilled on a KB that has chunk rows
-        # (e.g. chunks.content is NULL / empty on every row — edge case).
-        result: dict[str, object] = {
-            "status": "migrated",
-            "rows": rows,
-            "elapsed_ms": elapsed,
-        }
-        error_code: str | None = None
-        error_message: str | None = "kb migrated to textvec backend"
-        if rows == 0:
-            # Check whether the KB is genuinely empty or anomalous.
-            try:
-                chunk_count_row = ctx.db._conn.execute(  # noqa: SLF001
-                    "SELECT COUNT(*) AS cnt FROM chunks WHERE kb_id = ?", (kb_id,)
-                ).fetchone()
-                total_chunks = int(chunk_count_row["cnt"]) if chunk_count_row else 0
-            except Exception:  # noqa: BLE001
-                total_chunks = 0
-            if total_chunks > 0:
-                error_code = "MIGRATION_NO_ROWS"
-                error_message = "no_chunks_text"
-                result["warning"] = "no_chunks_text"
-
-        knowledgebase_stderr_log(
-            kb_id=kb_id,
-            op="kb_migrate",
-            phase="migration",
-            elapsed_ms=elapsed,
-            rows_in=0,
-            rows_ok=rows,
-            rows_skipped=0,
-            rows_failed=0,
-            dedup_policy="n/a",
-            request_id=None,
-            tool_caller_version=None,
-            error_code=error_code,
-            error_message=error_message,
-        )
-        return result
+            return result
 
     finally:
-        if lock is not None:
-            try:
-                lock.release()
-            except Exception:  # noqa: BLE001
-                pass
+        try:
+            lock.release()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 __all__ = [
