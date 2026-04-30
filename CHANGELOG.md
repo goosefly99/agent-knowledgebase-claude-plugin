@@ -1,5 +1,115 @@
 # Changelog
 
+## 0.12.0 — 2026-04-30
+
+> Vectorstore robustness + TextvecBackend opt-in. Three additive phases
+> (A/B/C) shipped as one release. Default `Settings.kb_backend` stays
+> `'chromadb'`; `'textvec'` is opt-in. No breaking changes.
+>
+> Source spec: `docs/superpowers/specs/2026-04-30-kb-retrieval-next-update-design.md`
+> Parent spec: `pipeline_mcp_data/specs/agent-kb-textvec-spec-v2.2.json`
+> (validated 2026-04-28; PASS, 13 VERIFIED / 2 PARTIAL)
+
+### Added
+
+- **Phase A — chromadb eager-warm.** `ChromadbBackend.warmup(kb_id)` +
+  `KnowledgebaseService.warmup_all_chromadb_kbs()` + `server.py`
+  daemon-thread trigger. Eliminates the 180s HNSW cold-load on first
+  `kb_query`/`kb_search`/`kb_ingest` after fresh MCP server launch.
+  Wallclock amortized into server-init (non-blocking; 30s wallclock
+  cap; opt-out via `AGENT_KB_CHROMADB_EAGER_WARM=false`).
+- **Phase A — chromadb filter passthrough.** `ChromadbBackend.query()`
+  now honors non-None `filters` instead of raising `NotImplementedError`;
+  filter dict is structurally validated then merged into the chromadb
+  `where=` clause with `kb_id` placed last to preserve per-KB isolation.
+  `ChromadbBackend.search()` rejects non-None filters with `ValueError`
+  (FTS path has no metadata-filter support).
+- **Phase B — `TextvecBackend`.** New 4th `RetrieverBackend` Protocol
+  implementation over SQLite FTS5+BM25 + Porter tokenizer, on a
+  contentless `chunks_fts` virtual table joined to `chunks` via
+  integer rowid. Zero new external dependencies (stdlib `sqlite3`).
+  Opt in via `AGENT_KB_BACKEND=textvec`. `info()` returns
+  `dominant_embedding_model='lexical-fts5'` (chromadb / markdown /
+  lightrag arms unchanged). Settings.kb_backend Literal widened to
+  include `'textvec'`; default stays `'chromadb'`. New tunable fields:
+  `fts5_tokenizer="porter unicode61"`, `bm25_k1=1.2`, `bm25_b=0.75`,
+  `lexical_min_token_len=2`.
+- **Phase B — FTS5 schema.** `chunks_fts` virtual table created
+  idempotently at schema bootstrap; `chunks_ai`/`chunks_au`/`chunks_ad`
+  triggers keep the index in sync. `Database.rebuild_fts5(kb_id) -> int`
+  backfills the index for legacy v0.11.0 KBs whose chunks rows
+  predate the triggers. Server runs an FTS5 availability probe at
+  `main()` startup (`CREATE VIRTUAL TABLE _probe USING fts5(x)`);
+  fails fast with structured stderr JSON on missing FTS5.
+- **Phase B — `bin/benchmark_recall.py`.** Standalone harness for
+  paired recall@k comparison between any two backends. CLI args
+  `--kb-id`, `--queries-file`, `--baseline-backend`, `--target-backend`,
+  `--top-k`. Human-readable + JSON output.
+- **Phase C — `kb_migrate(kb_id, target_backend='textvec')`.**
+  Backfills `chunks_fts` for legacy chromadb-stamped KBs without
+  re-ingest. Acquires per-kb FileLock (timeout=0, non-blocking) +
+  in-process `service._get_kb_lock(kb_id)`; idempotent via
+  `<kb_root>/.migrated_to=textvec` sentinel + TOCTOU recheck inside
+  lock. Three terminal states: `migrated`, `already_migrated`,
+  `deferred` (lock contention; no raise). `MIGRATION_NO_ROWS`
+  defensive warning when rebuild_fts5 returns 0 on a non-empty KB.
+  `RuntimeError` with install hint if `filelock` unavailable
+  (filelock remains intentionally non-default per
+  `docs/cross-process-lock-recipe.md`).
+- **Phase C — read-fallback hint.** `TextvecBackend.search` (and
+  therefore `query` via delegation) emits a once-per-session
+  `REBUILD_RECOMMENDED` stderr-log line when fetched chunks rows
+  have non-NULL `embedding_provider` (legacy chromadb-stamped). Hint
+  command: `kb_rebuild_index --backend=textvec`. Module-level set
+  guards against re-emission per session per `kb_id`.
+
+### Changed
+
+- **`kb_migrate` MCP tool** — `target_backend` Literal widened from
+  `{markdown, chromadb}` to `{markdown, chromadb, textvec}`. The
+  `@mcp.tool()` outer + `@_with_tool_timeout` inner decorator order
+  is preserved (frozen contract, pinned by
+  `tests/contract/test_decorator_order.py`). `kb_migrate` is NOT
+  among the 26 frozen `kb_*` tool surface — additive widening
+  allowed.
+
+### Frozen contracts (unchanged)
+
+- 26 frozen `kb_*` MCP tool names + signatures + response shapes
+- Probe-4 contract (5 keys: `source_type`, `uri`, `dedup_key`,
+  `page_id`, `dominant_embedding_model`; inapplicable values are
+  `None`, never omitted)
+- 11-field `knowledgebase_stderr_log` schema
+- `@mcp.tool()` outer + `@_with_tool_timeout` inner decorator order
+- 180s `_with_tool_timeout` budget
+- Cross-process FileLock per-`kb_id` (recipe in
+  `docs/cross-process-lock-recipe.md`; `filelock` intentionally not
+  a default runtime dep)
+- SQL-injection AST validator + read-only sqlite (`?mode=ro`) +
+  50-row hard-reject on `kb_ingest_batch(source_type=sql_database)`
+
+### Tests
+
+- 39 new tests across Phases A/B/C: `test_chromadb_eager_warm.py`,
+  `test_chromadb_filter_passthrough.py`, `test_textvec_backend.py`,
+  `test_textvec_fts5_recall.py`, `test_textvec_porter_tokenizer.py`,
+  `test_textvec_metadata_filter_compose.py`,
+  `test_fts5_startup_probe.py`, `test_database_rebuild_fts5.py`,
+  `test_kb_migrate_to_textvec.py`,
+  `test_textvec_legacy_kb_read_fallback.py`,
+  `test_textvec_migration_idempotent.py`. Total suite:
+  818 passed, 8 skipped.
+
+### Deferred (gated on adoption signal)
+
+- v2.2 Phase 3 — default flip + chromadb removal (now slated for
+  0.13.0)
+- v2.2 Phase 4 — cleanup (`services/embeddings.py`,
+  `services/vectorstore.py`, `PipelinePhase.embed`,
+  `_backfill_chunks_embedding_snapshot`)
+- v2.2 Phase 5 — MultiQueryRetriever / LLM query rewrite (now
+  slated for 0.14.0)
+
 ## 0.11.0+phase6 — 2026-04-24
 
 > Phase 6 of the v2.1 redesign — `LightRAGBackend` stub. **Stub only**;
