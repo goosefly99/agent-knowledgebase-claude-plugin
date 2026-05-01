@@ -27,6 +27,7 @@ htmlcov/
 
 # Project
 *.db
+pipeline_mcp_data/
 docs/superpowers/
 .tmp_saves/
 
