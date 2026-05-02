@@ -58,6 +58,21 @@
   appending under a different embedder would produce
   geometrically meaningless results.
 
+### Fixed
+
+- **Windows: shim no longer drops MCP tools list.** The Docker
+  shim previously called `os.execvp("docker", ...)`. On Windows
+  this is `_spawnv(_P_OVERLAY, ...)` — the original Python PID
+  exits and `docker.exe` is spawned under a new PID. Claude
+  Code's MCP transport tracks the original PID; once it died the
+  harness closed the stdio pipes, the in-container server saw
+  EOF on stdin, and the connection dropped ~70 ms after
+  `initialize` — before `tools/list` could fire. The shim now
+  proxies via `subprocess.run`, so the launcher Python process
+  stays alive as `docker.exe`'s parent for the full session.
+  POSIX behavior is unchanged in practice (Python is still the
+  long-lived parent; one extra wait-able process vs. true exec).
+
 ### Migration
 
 If you were on v0.12.0 with a chromadb backend, your existing KBs

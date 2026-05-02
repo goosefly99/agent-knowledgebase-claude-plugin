@@ -39,3 +39,19 @@ HANDOFF.md
 
 # Integration smoke run outputs
 tests/integration/fixtures/ingest_summary.json
+
+# Agent / validation runtime
+.acv/
+.claude/scheduled_tasks.lock
+.claude/settings.local.json
+
+# Build / dependency lockfiles (this is a plugin/library, not an app)
+uv.lock
+
+# Linter / type-checker caches
+.mypy_cache/
+.ruff_cache/
+.pytype/
+
+# Node (for any future JS tooling)
+node_modules/

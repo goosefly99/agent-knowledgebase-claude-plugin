@@ -8,9 +8,17 @@ host-specific ``docker-compose.override.yml`` is auto-loaded). This shim:
 
   1. Verifies ``docker`` is on PATH.
   2. Verifies the ``agent-knowledgebase`` container is in state ``running``.
-  3. ``os.execvp("docker", ["docker", "exec", "-i", "agent-knowledgebase",
-     "python", "-m", "agent_knowledgebase.server"])`` pipes the MCP stdio
-     into a fresh server process inside the container.
+  3. Runs ``docker exec -i agent-knowledgebase python -m
+     agent_knowledgebase.server`` as a child via ``subprocess.run`` and
+     proxies its exit code. The Python launcher stays alive as the
+     long-lived parent so Claude Code's MCP transport (which tracks the
+     spawned PID) sees a stable process throughout the session.
+
+Why subprocess.run instead of os.execvp: on Windows ``os.execvp`` is
+implemented via ``_spawnv(_P_OVERLAY, ...)`` which kills the original
+Python PID and spawns ``docker.exe`` under a new PID. The MCP harness
+detects the original PID exit, closes its end of the stdio pipes, and
+the connection is torn down before ``tools/list`` ever fires.
 
 If any step fails, the shim emits a single-line JSON document on stderr
 and exits 1 — Claude Code's MCP transport surfaces the structured payload
@@ -24,7 +32,6 @@ to the user. Canonical error tokens:
 from __future__ import annotations
 
 import json
-import os
 import shutil
 import subprocess
 import sys
@@ -88,7 +95,7 @@ def main() -> None:
         sys.exit(1)
 
     args = [
-        "docker",
+        docker_path,
         "exec",
         "-i",
         CONTAINER_NAME,
@@ -96,7 +103,16 @@ def main() -> None:
         "-m",
         "agent_knowledgebase.server",
     ]
-    os.execvp(docker_path, args)
+    try:
+        result = subprocess.run(args, check=False)
+    except FileNotFoundError as exc:
+        _emit_stderr_error(
+            "inspect_failed",
+            f"docker exec failed to launch: {exc}",
+            container=CONTAINER_NAME,
+        )
+        sys.exit(1)
+    sys.exit(result.returncode)
 
 
 if __name__ == "__main__":
