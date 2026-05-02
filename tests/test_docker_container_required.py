@@ -6,21 +6,19 @@ agent-knowledgebase container is running, without invoking real Docker.
 
 from __future__ import annotations
 
-import json
 import subprocess
-from unittest.mock import MagicMock, patch
+import sys
+from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
 # Module under test imports docker_shim from bin/run_server via runpy in
 # integration tests. For the unit-test layer, we exercise the helpers
 # directly via a side-import of the script.
-import sys
-from pathlib import Path
-
 _BIN_DIR = Path(__file__).resolve().parent.parent / "bin"
 sys.path.insert(0, str(_BIN_DIR))
-import run_server  # type: ignore[import-not-found]
+import run_server  # type: ignore[import-not-found]  # noqa: E402
 
 
 def test_is_container_running_true_when_inspect_returns_running(monkeypatch: pytest.MonkeyPatch) -> None:
