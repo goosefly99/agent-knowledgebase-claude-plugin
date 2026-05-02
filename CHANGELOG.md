@@ -1,5 +1,67 @@
 # Changelog
 
+## 0.13.0 — Docker-first runtime, ChromaDB-only, three embedders
+
+### Breaking changes
+
+- **Runtime model: Docker container required.** The plugin shim
+  (`bin/run_server.py`) now `docker exec`s into a long-running
+  `agent-knowledgebase` container. Start it with
+  `docker compose -f ${CLAUDE_PLUGIN_ROOT}/docker/docker-compose.yml up -d`.
+  The shim emits `docker_not_installed` or `container_not_running`
+  structured stderr tokens when prerequisites are unmet. The host
+  no longer needs Python 3.11+ on PATH; `docker` is the only
+  requirement.
+- **Backends collapsed to chromadb-only.** `markdown`, `lightrag`,
+  `textvec` backends and the `kb_backend_per_kb` routing surface
+  are removed. `kb_migrate` MCP tool is also removed (no migration
+  targets remain). Existing chromadb KBs continue to work
+  unchanged.
+- **Vectorstore collapsed to chromadb-only.** Pinecone support
+  removed. The `vectorstore` config field, `AGENT_KB_PINECONE_*`
+  env vars, and the pinecone optional-extra are gone.
+- **Embedding providers collapsed to three.** `Settings.embedding_provider`
+  is now `Literal["ollama", "sentence-transformers", "openai"]`.
+  `remote` and `fastembed` providers are removed. The default
+  flips from `remote` + `text-embedding-3-small` to `ollama` +
+  `qwen3-embedding:8b` (matched to the bundled Ollama sidecar).
+- **`AGENT_KB_EMBED_API_KEY` → `OPENAI_API_KEY`.** The openai
+  provider reads the industry-standard `OPENAI_API_KEY` env var
+  directly. The `AGENT_KB_EMBED_API_KEY` env var, the
+  `embedding.api_key` JSON field, and the `embed_api_key` Settings
+  field are removed.
+- **textvec-only schema removed from `database.py`.** The
+  `chunks_fts` virtual table and its sync triggers are dropped.
+  `wiki_pages_fts` (used by chromadb's wiki search) is retained.
+
+### Added
+
+- `docker/Dockerfile` and `docker/docker-compose.yml` ship the
+  python server + Ollama sidecar with persistent named volumes.
+- `OpenAIEmbedder` (replacing `RemoteEmbedder`) — explicitly
+  scoped to OpenAI's `/v1/embeddings` contract; rejects empty
+  `OPENAI_API_KEY` with a structured `config_missing` payload.
+- `tests/test_chromadb_mutability.py` pins ChromaDBStore's
+  insert/update/delete contract so future chromadb upgrades can't
+  silently regress mutability.
+
+### Migration
+
+If you were on v0.12.0 with a chromadb backend, your existing KBs
+under `${AGENT_KB_SAVES_DIR}` continue to work — the on-disk
+chromadb layout is unchanged. After upgrading:
+
+1. Mount your existing saves dir into the container (edit
+   `docker/docker-compose.override.yml` to bind-mount instead of
+   the named volume).
+2. Set `AGENT_KB_EMBEDDING_PROVIDER=ollama` (or `openai` with
+   `OPENAI_API_KEY`) — the `remote` provider name is no longer
+   accepted.
+
+If you were on the `markdown`, `lightrag`, `textvec`, or
+`pinecone` backends, you must migrate to chromadb manually before
+upgrading; v0.13.0 cannot read those layouts.
+
 ## 0.12.0 — 2026-04-30
 
 > Vectorstore robustness + TextvecBackend opt-in. Three additive phases

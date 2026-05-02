@@ -6,64 +6,48 @@ Exposes an MCP server (`agent-knowledgebase`) packaged as a Claude Code plugin (
 
 ## Installation
 
-### Pattern A — Claude Code marketplace (default, since v0.8.0)
+The plugin runs the MCP server inside a Docker container. The plugin shim refuses to start if the `agent-knowledgebase` container is not in `running` state.
 
-Install the plugin from the marketplace entry `agent-knowledgebase-auto-dev`. The only host requirement is **Python >=3.11 on PATH**. `uv` is no longer required as a runtime dependency.
+### Prerequisites
 
-On first launch the bundled `bin/run_server.py` self-bootstraps a venv at `${CLAUDE_PLUGIN_ROOT}/.venv` (using the stdlib `venv` module), runs `pip install -r requirements.lock` inside it, and persists a SHA256 sentinel so subsequent launches skip pip install entirely (fast path). The full `.mcp.json` is just:
+- **Docker** (Docker Desktop on macOS/Windows; docker engine on Linux). `docker` must be on PATH.
+- One of:
+  - The bundled Ollama sidecar (default — installs nothing extra), then a one-time model pull (~5 GB):
+    ```bash
+    docker compose -f docker/docker-compose.yml up -d
+    docker exec agent-kb-ollama ollama pull qwen3-embedding:8b
+    ```
+  - **OR** an `OPENAI_API_KEY` (set in the environment or in `docker/docker-compose.override.yml`) to use OpenAI embeddings instead.
 
-```json
-{
-  "mcpServers": {
-    "agent-knowledgebase": {
-      "command": "python",
-      "args": ["${CLAUDE_PLUGIN_ROOT}/bin/run_server.py"]
-    }
-  }
-}
-```
-
-The launcher emits structured single-line JSON stderr if it cannot bootstrap. The three error tokens are:
-
-- `python_version` — the host Python is older than 3.11. Install Python 3.11+.
-- `network_unreachable` — pip install timed out at 30 s. Either fix network access or set `AGENT_KB_VENDORED_DEPS=/path/to/wheels` (see below).
-- `read_only_filesystem` — `${CLAUDE_PLUGIN_ROOT}` is not writable. Mount it writable or relocate the plugin root to a writable directory.
-
-#### Air-gapped / offline (`AGENT_KB_VENDORED_DEPS`)
-
-For corporate hosts behind captive portals or air-gapped environments, vendor wheels once on a connected host:
+### Starting the container
 
 ```bash
-pip download -d wheels/ -r requirements.lock
+cd ${CLAUDE_PLUGIN_ROOT}
+docker compose -f docker/docker-compose.yml up -d
 ```
 
-Then ship `wheels/` to the target host and set:
+This starts two services:
+- `agent-knowledgebase` — the MCP server host (idle until `docker exec` connects).
+- `agent-kb-ollama` — the Ollama sidecar that serves embedding requests.
+
+Persistent state lives in two named volumes (`agent-kb-data` for sqlite + chromadb, `ollama-models` for downloaded Ollama models). Both survive `docker compose down`; remove them with `docker volume rm` if you want a clean slate.
+
+### Stopping
 
 ```bash
-export AGENT_KB_VENDORED_DEPS=/path/to/wheels
+docker compose -f docker/docker-compose.yml down
 ```
 
-The launcher will use `pip install --no-index --find-links=$AGENT_KB_VENDORED_DEPS` and skip PyPI entirely.
+### Per-host customization
 
-### Pattern C — `pipx install agent-knowledgebase` (alternate)
+Copy `docker/docker-compose.override.yml.example` to `docker/docker-compose.override.yml` and edit. Common overrides: bind-mount your host saves directory, switch to OpenAI embeddings, disable the Ollama sidecar.
 
-If you prefer not to let the plugin manage its own venv, you can install the package directly:
+### Plugin error tokens
 
-```bash
-pipx install agent-knowledgebase
-```
+The plugin shim emits structured single-line JSON to stderr on failure:
 
-This exposes the `agent-knowledgebase-server` CLI entry point (registered via `[project.scripts]`). Wire it into your own MCP host config as `command: agent-knowledgebase-server`.
-
-> **Marketplace caveat:** the Claude Code plugin marketplace does **not** auto-run `pipx install` for you. If you want this pattern, run the `pipx install` command manually before configuring the plugin. Pattern A above is what the marketplace ships out of the box and is the default for that reason.
-
-### Pattern D — Docker (alternate, zero Python on host)
-
-A future GHCR Docker image (`ghcr.io/...`) will let you run the server without any Python on the host. The Dockerfile is a Phase 6 deliverable of the v2.1 redesign and is not yet shipped — track `docs/redesign/ROADMAP.md`.
-
-### PEP-723 single-file scripts (future)
-
-PEP-723 inline-metadata single-file launchers are tracked as a future-only design and not in scope for v0.8.0.
+- `docker_not_installed` — install Docker and ensure `docker` is on PATH.
+- `container_not_running` — run `docker compose -f ${CLAUDE_PLUGIN_ROOT}/docker/docker-compose.yml up -d`.
 
 ## Ecosystem version floor
 
@@ -106,23 +90,16 @@ The plugin resolves settings in four layers, highest priority last:
 
 These must always come from the environment. Setting them in a JSON config file is rejected loudly.
 
-- `AGENT_KB_EMBED_API_KEY` — Bearer token for the remote embeddings endpoint (only needed for `embedding.provider = "remote"`; use any placeholder for servers that ignore auth such as local Ollama).
-- `AGENT_KB_PINECONE_API_KEY` — Pinecone key (only needed for `vectorstore = "pinecone"`).
+- `OPENAI_API_KEY` — required when `embedding.provider = "openai"`. Use the standard OpenAI environment variable name; do NOT prefix with `AGENT_KB_`.
 
 ### Example `config.json`
 
 ```json
 {
-  "vectorstore": "chromadb",
   "embedding": {
-    "provider": "sentence-transformers",
-    "model": "all-MiniLM-L6-v2"
+    "provider": "ollama",
+    "model": "qwen3-embedding:8b"
   },
-  "pinecone": {
-    "index": null,
-    "environment": null
-  },
-  "export_path": null,
   "chunk": {
     "size": 512,
     "overlap": 64,
@@ -151,15 +128,11 @@ These must always come from the environment. Setting them in a JSON config file 
 
 | JSON path | Env var | Default |
 |---|---|---|
-| `vectorstore` | `AGENT_KB_VECTORSTORE` | `"chromadb"` |
-| `embedding.provider` | `AGENT_KB_EMBEDDING_PROVIDER` | `"sentence-transformers"` |
-| `embedding.model` | `AGENT_KB_EMBEDDING_MODEL` | `"all-MiniLM-L6-v2"` |
-| `embedding.base_url` | `AGENT_KB_EMBED_BASE_URL` | `null` (required when `embedding.provider = "remote"`) |
+| `embedding.provider` | `AGENT_KB_EMBEDDING_PROVIDER` | `"ollama"` |
+| `embedding.model` | `AGENT_KB_EMBEDDING_MODEL` | `"qwen3-embedding:8b"` |
+| `embedding.base_url` | `AGENT_KB_EMBED_BASE_URL` | `null` (defaults: `http://ollama:11434` for ollama, `https://api.openai.com/v1` for openai) |
 | `embedding.timeout_seconds` | `AGENT_KB_EMBED_TIMEOUT_SECONDS` | `30.0` |
 | `embedding.max_retries` | `AGENT_KB_EMBED_MAX_RETRIES` | `0` |
-| `pinecone.index` | `AGENT_KB_PINECONE_INDEX` | `null` |
-| `pinecone.environment` | `AGENT_KB_PINECONE_ENVIRONMENT` | `null` |
-| `export_path` | `AGENT_KB_EXPORT_PATH` | `null` |
 | `chunk.size` | `AGENT_KB_CHUNK_SIZE` | `512` |
 | `chunk.overlap` | `AGENT_KB_CHUNK_OVERLAP` | `64` |
 | `chunk.token_encoding` | `AGENT_KB_CHUNK_TOKEN_ENCODING` | `"cl100k_base"` |
