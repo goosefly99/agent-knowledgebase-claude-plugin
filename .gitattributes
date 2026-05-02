@@ -1,0 +1,7 @@
+# Files that MUST stay LF regardless of host OS / git autocrlf settings.
+# The docker/ tree ships into a Linux container; CRLF in entrypoint.sh
+# would break `exec` (kernel reads the shebang as `/bin/sh\r`).
+*.sh text eol=lf
+docker/Dockerfile text eol=lf
+docker/*.yml text eol=lf
+docker/*.yml.example text eol=lf
