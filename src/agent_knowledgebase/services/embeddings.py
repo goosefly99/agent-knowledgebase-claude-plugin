@@ -14,11 +14,6 @@ Supported providers:
   ``sentence-transformers`` library (offline-capable). Moved to opt-in
   ``[embed-local-st]`` extra in Phase 5; install via
   ``pip install agent-knowledgebase[embed-local-st]``.
-* ``fastembed`` (Phase 5, opt-in) — Local ONNX-runtime embedder backed
-  by ``qdrant-fastembed``. Install via
-  ``pip install agent-knowledgebase[embed-local-onnx]``. Lazy-imports
-  ``fastembed`` only inside :class:`FastembedEmbedder` so the rest of
-  the embeddings module loads even when fastembed isn't installed.
 
 Embedder version (Phase 5)
 --------------------------
@@ -26,9 +21,8 @@ Embedder version (Phase 5)
 Every embedder exposes :attr:`Embedder.embedder_version` — an opaque
 string that uniquely identifies the embedder's vector geometry beyond
 just its model name. Two embedders with the same nominal model_name
-(e.g. ``"all-MiniLM-L6-v2"``) but different libraries / quantizations
-(e.g. fastembed-int8 vs HF-fp32) MUST report different
-``embedder_version`` values. Stamped on every ingested chunk by
+(e.g. ``"all-MiniLM-L6-v2"``) but different libraries MUST report
+different ``embedder_version`` values. Stamped on every ingested chunk by
 :class:`Database.insert_chunk` so
 ``KnowledgebaseService._ingest_source_locked`` can detect mixed-
 version ingests via :meth:`Database.get_embedder_versions`. The
@@ -225,12 +219,9 @@ class Embedder(Protocol):
         """Return an opaque version string identifying the embedder's geometry.
 
         Two embedders with the same nominal :attr:`model_name` but
-        different libraries / quantizations MUST report different
-        version strings — fastembed-MiniLM-int8 is NOT
-        interchangeable with sentence-transformers' MiniLM-fp32 even
-        though both report ``model_name='all-MiniLM-L6-v2'``. The
-        per-chunk stamp lives in :attr:`Database.insert_chunk` so the
-        Phase 5 mixed-version rejection in
+        different libraries MUST report different version strings.
+        The per-chunk stamp lives in :attr:`Database.insert_chunk`
+        so the Phase 5 mixed-version rejection in
         ``KnowledgebaseService._ingest_source_locked`` can detect
         mismatches early.
 
@@ -663,109 +654,6 @@ class OllamaEmbedder:
 
 
 # ---------------------------------------------------------------------------
-# Fastembed local-ONNX provider (Phase 5, opt-in)
-# ---------------------------------------------------------------------------
-
-
-class FastembedEmbedder:
-    """Local ONNX-runtime embedder backed by ``qdrant-fastembed``.
-
-    Phase 5 (opt-in). Install via
-    ``pip install agent-knowledgebase[embed-local-onnx]``. The
-    ``fastembed`` import is deliberately deferred to ``__init__`` so
-    the rest of this module loads even when the extra is not
-    installed.
-
-    fastembed produces vectors of the same dimensionality as the
-    matching sentence-transformers model (e.g. ``MiniLM-L6-v2`` → 384)
-    but the int8-quantized ONNX path produces VECTORS THAT ARE NOT
-    INTERCHANGEABLE with the fp32 sentence-transformers vectors. Same
-    nominal model_name; different geometry. The Phase 5
-    :attr:`embedder_version` discrimination is what keeps the
-    :meth:`Database.get_embedder_versions`-driven mixed-version
-    rejection from silently accepting cross-quantization mixes.
-
-    spec_id: 70ab2170-381a-4657-bcd1-28a40c6f369b
-    """
-
-    def __init__(
-        self,
-        model_name: str = "BAAI/bge-small-en-v1.5",
-    ) -> None:
-        try:
-            from fastembed import TextEmbedding
-        except ImportError as exc:
-            raise RuntimeError(
-                "fastembed provider requires "
-                "'pip install agent-knowledgebase[embed-local-onnx]'"
-            ) from exc
-
-        self._model_name = model_name
-        self._model = TextEmbedding(model_name=model_name)
-        self._dimension_cache: int | None = None
-
-    def embed(self, texts: list[str]) -> list[list[float]]:
-        """Batch-embed *texts* via fastembed's ONNX runtime."""
-        if not texts:
-            return []
-        # ``embed`` returns a generator of numpy arrays.
-        vectors = [vec.tolist() for vec in self._model.embed(texts)]
-        if vectors and self._dimension_cache is None:
-            self._dimension_cache = len(vectors[0])
-        return vectors
-
-    def embed_query(self, text: str) -> list[float]:
-        """Embed a single query string."""
-        # Some fastembed model families ship a separate ``query_embed``
-        # method with a query-prefix prompt; fall back to ``embed`` when
-        # not available so generic models keep working.
-        query_embed = getattr(self._model, "query_embed", None)
-        if callable(query_embed):
-            vectors = [vec.tolist() for vec in query_embed([text])]
-        else:
-            vectors = self.embed([text])
-        if vectors and self._dimension_cache is None:
-            self._dimension_cache = len(vectors[0])
-        return vectors[0]
-
-    def probe_dimension(self) -> int:
-        """Return the embedding dimension, probing a one-text embed."""
-        if self._dimension_cache is not None:
-            return self._dimension_cache
-        vectors = self.embed([_PROBE_TEXT])
-        if not vectors or not vectors[0]:
-            raise RuntimeError(
-                f"fastembed model {self._model_name!r} returned an "
-                f"empty embedding on probe"
-            )
-        self._dimension_cache = len(vectors[0])
-        return self._dimension_cache
-
-    @property
-    def dimension(self) -> int:
-        """Return the embedding dimension, probing on first access."""
-        if self._dimension_cache is None:
-            self.probe_dimension()
-        assert self._dimension_cache is not None
-        return self._dimension_cache
-
-    @property
-    def model_name(self) -> str:
-        """Return the fastembed model identifier."""
-        return self._model_name
-
-    @property
-    def embedder_version(self) -> str:
-        """Version string flagging the int8 ONNX quantization.
-
-        fastembed's MiniLM-int8 vectors are NOT interchangeable with
-        sentence-transformers' MiniLM-fp32 vectors — the mixed-
-        version rejection uses this to keep them apart.
-        """
-        return f"fastembed/{self._model_name}-int8"
-
-
-# ---------------------------------------------------------------------------
 # Factory
 # ---------------------------------------------------------------------------
 
@@ -861,12 +749,6 @@ def _build_embedder(
     """Internal builder shared by :func:`create_embedder` variants."""
     if provider == "sentence-transformers":
         return SentenceTransformerEmbedder(model_name=model)
-    if provider == "fastembed":
-        # Phase 5 opt-in. The class itself raises a friendly RuntimeError
-        # pointing at ``pip install agent-knowledgebase[embed-local-onnx]``
-        # if fastembed isn't installed; we don't need to repeat the
-        # check here.
-        return FastembedEmbedder(model_name=model)
     if provider == "ollama":
         return OllamaEmbedder(
             model_name=model,

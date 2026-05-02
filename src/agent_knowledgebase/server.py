@@ -10,7 +10,7 @@ import threading
 from dataclasses import asdict
 from functools import wraps
 from pathlib import Path
-from typing import Callable, Literal, TypeVar
+from typing import Callable, TypeVar
 
 from mcp.server.fastmcp import FastMCP
 
@@ -617,59 +617,6 @@ def kb_export(kb_id: str, output_dir: str) -> str:
     return json.dumps([str(p) for p in paths])
 
 
-@mcp.tool()
-@_with_tool_timeout
-def kb_migrate(
-    kb_id: str,
-    target_backend: Literal["markdown", "chromadb", "textvec"],
-) -> str:
-    """Migrate a knowledgebase between retrieval backends (Phase 4 / Phase C).
-
-    Cuts over the storage layout for *kb_id* to *target_backend*.
-
-    For ``"markdown"`` and ``"chromadb"``:
-    1. Materialises the data on disk in the new backend's layout
-       (``<saves_dir>/<kb-name>/wiki/`` for markdown,
-       ``<saves_dir>/<kb-name>/chroma/`` for chromadb).
-    2. Writes the routing sentinel file
-       ``<saves_dir>/<kb-name>/.migrated_to`` with the target backend
-       name so future ``kb_query`` / ``kb_search`` calls route there.
-    3. Leaves the OLD backend's data untouched — rollback is
-       deleting the sentinel file. Operators reclaim disk space
-       manually.
-
-    For ``"textvec"`` (Phase C additive):
-    Backfills the SQLite FTS5 index (``chunks_fts``) from the existing
-    ``chunks`` table rows for legacy chromadb-stamped KBs, then writes
-    the routing sentinel. Idempotent — a second call returns
-    ``{"status": "already_migrated"}``. Cross-process-safe via filelock.
-
-    Parameters:
-        kb_id: ID of the knowledgebase to migrate.
-        target_backend: Target backend name — ``"chromadb"``, ``"markdown"``,
-            or ``"textvec"``. ``"lightrag"`` is rejected (Phase 6 deferred).
-
-    Returns a JSON object summarising the migration.
-    For ``markdown``/``chromadb``:
-    ``{"kb_id":..., "target_backend":..., "pages_migrated":N,
-    "sentinel_path":..., "notes":[...], "spec_id":...}``.
-    For ``textvec``:
-    ``{"status": "migrated"|"already_migrated"|"deferred",
-    "rows": N, "elapsed_ms": M}``.
-
-    spec_id: 70ab2170-381a-4657-bcd1-28a40c6f369b
-    """
-    from agent_knowledgebase.services import migration
-
-    svc = _get_service()
-
-    if target_backend == "textvec":
-        return json.dumps(migration.migrate_to_textvec(kb_id, svc))
-
-    result = svc.migrate(kb_id=kb_id, target_backend=target_backend)
-    return json.dumps(result)
-
-
 # ===================================================================
 # Read-Path Tools (Always Available)
 # ===================================================================
@@ -1128,43 +1075,12 @@ def kb_config_validate() -> str:
 def main() -> None:
     """Run the MCP server.
 
-    Performs two startup prechecks before the MCP transport handshake:
-
-    1. FTS5 availability probe — verifies the running Python build's
-       sqlite3 supports FTS5. Runs unconditionally (even when
-       ``AGENT_KB_BACKEND != 'textvec'``) because:
-       (a) the probe is effectively free (<1 ms in-memory round-trip),
-       (b) it catches the misconfiguration before the user opts in OR
-           before Phase C migration tooling is invoked, and
-       (c) the ``chunks_fts`` virtual table declared in database.py
-           (Phase B schema bootstrap) will fail to create on a non-FTS5
-           sqlite, breaking ANY KB ingest regardless of backend choice.
-       Exits non-zero with a structured JSON message on stderr if FTS5
-       is unavailable. spec_id: 70ab2170-381a-4657-bcd1-28a40c6f369b
-
-    2. Settings / saves_dir validation — same logic as before Phase B.
+    Performs the Settings / saves_dir validation precheck before the
+    MCP transport handshake. The wiki_pages_fts virtual table still
+    relies on sqlite3 FTS5 support, but every supported runtime
+    (CPython 3.11+) ships with FTS5 enabled, so the explicit startup
+    probe was removed in v0.13.0.
     """
-    import sqlite3 as _sqlite3
-
-    try:
-        _probe_conn = _sqlite3.connect(":memory:")
-        _probe_conn.execute("CREATE VIRTUAL TABLE _probe USING fts5(x);")
-        _probe_conn.execute("DROP TABLE _probe;")
-        _probe_conn.close()
-    except _sqlite3.OperationalError as exc:
-        structured_msg = json.dumps(
-            {
-                "error": "sqlite_fts5_unavailable",
-                "detail": str(exc),
-                "remediation": (
-                    "Install Python with FTS5-enabled sqlite3 "
-                    "(Python 3.11+ on standard CPython distros include FTS5 by default)."
-                ),
-            }
-        )
-        print(structured_msg, file=sys.stderr)
-        sys.exit(1)
-
     try:
         Settings().resolve_paths()
     except (ValidationError, FileNotFoundError, NotADirectoryError) as exc:

@@ -20,12 +20,11 @@ dependencies = [
     "tiktoken>=0.7",
 ]
 
-# Phase 5 — opt-in extras. See docs/install_size.md for per-extra
-# install-size tables. The 'all' convenience extra pulls every
-# optional dep group at once. spec_id:
-# 70ab2170-381a-4657-bcd1-28a40c6f369b
+# Opt-in extras. The fastembed (qdrant-fastembed) and pinecone extras
+# were dropped in v0.13.0 along with the fastembed embedder and pinecone
+# vectorstore; the embeddings refactor in Phase 3 may shrink this list
+# further. See docs/install_size.md for per-extra install-size tables.
 [project.optional-dependencies]
-embed-local-onnx = ["qdrant-fastembed>=0.4"]
 embed-local-st = ["sentence-transformers>=3.0"]
 # I-03: codebase ingestion uses regex-based symbol detection — there is
 # no tree-sitter import anywhere in src/. The extra is retained as an
@@ -39,14 +38,11 @@ ingest-sql = [
     "sqlalchemy>=2.0",
     "sqlparse>=0.5",
 ]
-pinecone = ["pinecone-client>=3.0"]
 all = [
-    "qdrant-fastembed>=0.4",
     "sentence-transformers>=3.0",
     "pdfplumber>=0.11",
     "sqlalchemy>=2.0",
     "sqlparse>=0.5",
-    "pinecone-client>=3.0",
 ]
 
 [project.scripts]

@@ -95,38 +95,6 @@ CREATE VIRTUAL TABLE IF NOT EXISTS wiki_pages_fts USING fts5(
 );
 """
 
-# Phase B (v2.2): contentless FTS5 virtual table + sync triggers for the
-# textvec backend. The contentless mode (content='chunks', content_rowid='id')
-# stores only the inverted index, not the original text — disk overhead is
-# ~5–15% per-KB sqlite file vs. baseline.  The three triggers keep chunks_fts
-# in sync automatically on INSERT / UPDATE / DELETE against chunks, so the
-# TextvecBackend write path only needs to write to chunks; triggers handle FTS.
-#
-# IDEMPOTENCY: every statement uses IF NOT EXISTS so running this on an
-# existing DB is a no-op.  This is guaranteed because _init_schema() is
-# called on every Database.__init__ (i.e. every server restart).
-_CHUNKS_FTS_SQL = """\
-CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
-    text,
-    tokenize='porter unicode61',
-    content='chunks',
-    content_rowid='rowid'
-);
-
-CREATE TRIGGER IF NOT EXISTS chunks_ai AFTER INSERT ON chunks BEGIN
-    INSERT INTO chunks_fts(rowid, text) VALUES (new.rowid, new.content);
-END;
-
-CREATE TRIGGER IF NOT EXISTS chunks_au AFTER UPDATE ON chunks BEGIN
-    INSERT INTO chunks_fts(chunks_fts, rowid, text) VALUES('delete', old.rowid, old.content);
-    INSERT INTO chunks_fts(rowid, text) VALUES (new.rowid, new.content);
-END;
-
-CREATE TRIGGER IF NOT EXISTS chunks_ad AFTER DELETE ON chunks BEGIN
-    INSERT INTO chunks_fts(chunks_fts, rowid, text) VALUES('delete', old.rowid, old.content);
-END;
-"""
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -191,12 +159,6 @@ class Database:
         # FTS virtual table must be created outside executescript in some
         # SQLite builds, so we run it separately.
         cur.executescript(_FTS_SQL)
-        # Phase B (v2.2): contentless chunks_fts + sync triggers.
-        # Uses executescript so each statement runs in its own implicit
-        # transaction (required for CREATE VIRTUAL TABLE on some sqlite
-        # builds). IF NOT EXISTS on every statement makes this idempotent
-        # across repeated Database.__init__ calls (e.g. server restarts).
-        cur.executescript(_CHUNKS_FTS_SQL)
         self._conn.commit()
         # Additive migration: add dedup_key column to pre-existing databases
         # that were created before this column was added to the schema DDL.
@@ -1037,50 +999,6 @@ class Database:
     # ------------------------------------------------------------------
     # Phase 5 — embedder_version stamping
     # ------------------------------------------------------------------
-
-    # ------------------------------------------------------------------
-    # Phase B (v2.2) — FTS5 rebuild helper for textvec migration
-    # ------------------------------------------------------------------
-
-    def rebuild_fts5(self, kb_id: str) -> int:
-        """Backfill ``chunks_fts`` for a kb_id. Idempotent — returns row count inserted.
-
-        Used by Phase C ``kb_migrate(target_backend='textvec')`` to populate
-        FTS5 for legacy v0.11.0 KBs whose ``chunks`` rows predate the
-        ``chunks_fts`` AFTER-INSERT trigger. Safe to call on a KB that already
-        has a fully-populated ``chunks_fts`` index — duplicate inserts for
-        existing rowids are silently skipped.
-
-        Implementation note on contentless FTS5 dedup
-        -----------------------------------------------
-        Contentless FTS5 tables do NOT enforce a UNIQUE constraint on
-        rowid by default, so ``INSERT OR IGNORE`` would NOT automatically
-        deduplicate. We must check for prior indexing explicitly.
-
-        Critically, querying ``chunks_fts`` directly (e.g.
-        ``SELECT 1 FROM chunks_fts WHERE rowid = ?``) raises
-        ``OperationalError: no such column: T.text`` on contentless
-        tables — SQLite's FTS5 machinery tries to read the content
-        column from the content table during the subquery and fails.
-
-        Instead we query ``chunks_fts_docsize``, the FTS5-internal
-        shadow table that SQLite maintains for every FTS5 index. It has
-        columns ``(id, sz)`` where ``id`` is the rowid of each indexed
-        document. Querying it avoids the content-table read entirely and
-        is also faster than scanning the FTS index.
-        spec_id: 70ab2170-381a-4657-bcd1-28a40c6f369b
-        """
-        cur = self._conn.execute(
-            "INSERT INTO chunks_fts (rowid, text) "
-            "SELECT rowid, content FROM chunks "
-            "WHERE kb_id = ? "
-            "AND NOT EXISTS ("
-            "  SELECT 1 FROM chunks_fts_docsize WHERE id = chunks.rowid"
-            ")",
-            (kb_id,),
-        )
-        self._conn.commit()
-        return cur.rowcount or 0
 
     def get_embedder_versions(self, kb_id: str) -> set[str]:
         """Return the set of distinct ``embedder_version`` values for *kb_id*.
