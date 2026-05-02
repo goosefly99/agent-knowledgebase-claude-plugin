@@ -14,7 +14,7 @@ The plugin runs the MCP server inside a Docker container. The plugin shim refuse
 - One of:
   - The bundled Ollama sidecar (default — installs nothing extra), then a one-time model pull (~5 GB):
     ```bash
-    docker compose -f docker/docker-compose.yml up -d
+    cd ${CLAUDE_PLUGIN_ROOT}/docker && docker compose up -d
     docker exec agent-kb-ollama ollama pull qwen3-embedding:8b
     ```
   - **OR** an `OPENAI_API_KEY` (set in the environment or in `docker/docker-compose.override.yml`) to use OpenAI embeddings instead.
@@ -22,9 +22,11 @@ The plugin runs the MCP server inside a Docker container. The plugin shim refuse
 ### Starting the container
 
 ```bash
-cd ${CLAUDE_PLUGIN_ROOT}
-docker compose -f docker/docker-compose.yml up -d
+cd ${CLAUDE_PLUGIN_ROOT}/docker
+docker compose up -d
 ```
+
+Run `docker compose` from `docker/` (not from the plugin root with `-f`) so any `docker-compose.override.yml` you place alongside the base file is auto-loaded.
 
 This starts two services:
 - `agent-knowledgebase` — the MCP server host (idle until `docker exec` connects).
@@ -35,7 +37,7 @@ Persistent state lives in two named volumes (`agent-kb-data` for sqlite + chroma
 ### Stopping
 
 ```bash
-docker compose -f docker/docker-compose.yml down
+cd ${CLAUDE_PLUGIN_ROOT}/docker && docker compose down
 ```
 
 ### Per-host customization
@@ -47,7 +49,7 @@ Copy `docker/docker-compose.override.yml.example` to `docker/docker-compose.over
 The plugin shim emits structured single-line JSON to stderr on failure:
 
 - `docker_not_installed` — install Docker and ensure `docker` is on PATH.
-- `container_not_running` — run `docker compose -f ${CLAUDE_PLUGIN_ROOT}/docker/docker-compose.yml up -d`.
+- `container_not_running` — run `cd ${CLAUDE_PLUGIN_ROOT}/docker && docker compose up -d`.
 
 ## Ecosystem version floor
 

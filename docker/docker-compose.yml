@@ -1,7 +1,10 @@
 # docker/docker-compose.yml — agent-knowledgebase runtime
 #
-# Start with: docker compose -f docker/docker-compose.yml up -d
-# Stop with:  docker compose -f docker/docker-compose.yml down
+# Start with: cd ${CLAUDE_PLUGIN_ROOT}/docker && docker compose up -d
+# Stop with:  cd ${CLAUDE_PLUGIN_ROOT}/docker && docker compose down
+#
+# Run from this directory (not from the plugin root with `-f`) so any
+# host-specific `docker-compose.override.yml` is auto-loaded.
 #
 # The agent-kb container stays up via `tail -f /dev/null` so the plugin's
 # `bin/run_server.py` shim can `docker exec -i` a fresh MCP server per

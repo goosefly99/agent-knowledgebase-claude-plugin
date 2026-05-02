@@ -31,5 +31,11 @@ pipeline_mcp_data/
 docs/superpowers/
 .tmp_saves/
 
+# Per-host docker overrides (bind mounts, secrets, etc.)
+docker/docker-compose.override.yml
+
+# Per-session handoff notes (dev artifact, not a tracked doc)
+HANDOFF.md
+
 # Integration smoke run outputs
 tests/integration/fixtures/ingest_summary.json

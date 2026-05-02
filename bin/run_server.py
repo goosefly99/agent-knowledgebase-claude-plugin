@@ -3,8 +3,8 @@
 
 Replaces the v0.8.0 stdlib-venv bootstrap. The plugin now requires a
 running Docker container named ``agent-knowledgebase`` (started via
-``docker compose -f ${CLAUDE_PLUGIN_ROOT}/docker/docker-compose.yml up -d``).
-This shim:
+``cd ${CLAUDE_PLUGIN_ROOT}/docker && docker compose up -d`` so any
+host-specific ``docker-compose.override.yml`` is auto-loaded). This shim:
 
   1. Verifies ``docker`` is on PATH.
   2. Verifies the ``agent-knowledgebase`` container is in state ``running``.
@@ -31,7 +31,7 @@ import sys
 
 CONTAINER_NAME = "agent-knowledgebase"
 COMPOSE_HINT = (
-    "docker compose -f ${CLAUDE_PLUGIN_ROOT}/docker/docker-compose.yml up -d"
+    "cd ${CLAUDE_PLUGIN_ROOT}/docker && docker compose up -d"
 )
 
 
