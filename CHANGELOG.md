@@ -44,6 +44,19 @@
 - `tests/test_chromadb_mutability.py` pins ChromaDBStore's
   insert/update/delete contract so future chromadb upgrades can't
   silently regress mutability.
+- **Auto-fallback for the global default embedder.** When
+  `AGENT_KB_EMBEDDING_PROVIDER=ollama` and the configured
+  `embed_base_url` is unreachable at first global-embedder build,
+  the global default silently swaps to a
+  `SentenceTransformerEmbedder("all-MiniLM-L6-v2")` and emits the
+  `OLLAMA_UNREACHABLE_FALLBACK_TO_SENTENCE_TRANSFORMERS` stderr
+  token. Scope: GLOBAL DEFAULT ONLY — per-snapshot rebuilds at
+  query/ingest time on existing KBs do NOT fall back. A KB
+  ingested under ollama embeddings whose snapshot rebuild later
+  encounters an unreachable ollama still raises
+  `EmbedderUnavailableError` loudly, because querying or
+  appending under a different embedder would produce
+  geometrically meaningless results.
 
 ### Migration
 

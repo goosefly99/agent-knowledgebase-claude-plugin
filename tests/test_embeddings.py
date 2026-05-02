@@ -717,6 +717,22 @@ class TestOllamaEmbedder:
 class TestCreateEmbedderOllama:
     """Factory tests for the 'ollama' provider."""
 
+    @pytest.fixture(autouse=True)
+    def _stub_probe(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Make OllamaEmbedder.probe_dimension a no-op that returns 4096.
+
+        Every test in this class verifies the configured-build behavior
+        (type, base_url, no-api-key). The probe issues a real httpx call
+        that fails in CI/test environments without a live Ollama instance,
+        which would trigger the auto-fallback and swap the returned embedder
+        to SentenceTransformerEmbedder.  Stubbing the probe neutralises the
+        fallback so the configured OllamaEmbedder is returned unchanged.
+        """
+        monkeypatch.setattr(
+            "agent_knowledgebase.services.embeddings.OllamaEmbedder.probe_dimension",
+            lambda self: 4096,
+        )
+
     def test_creates_ollama_embedder(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -765,6 +781,10 @@ class TestCreateEmbedderForModel:
     def test_returns_default_when_model_matches(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        monkeypatch.setattr(
+            "agent_knowledgebase.services.embeddings.OllamaEmbedder.probe_dimension",
+            lambda self: 4096,
+        )
         config = Settings(
             saves_dir=tmp_path,
             embedding_provider="ollama",
@@ -778,6 +798,10 @@ class TestCreateEmbedderForModel:
     def test_returns_default_when_model_none(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        monkeypatch.setattr(
+            "agent_knowledgebase.services.embeddings.OllamaEmbedder.probe_dimension",
+            lambda self: 4096,
+        )
         config = Settings(
             saves_dir=tmp_path,
             embedding_provider="ollama",

@@ -175,8 +175,13 @@ def test_get_embedding_snapshot_empty_returns_none(tmp_path: Path) -> None:
 
 def test_create_embedder_for_model_legacy_one_arg_signature_still_works(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Backwards-compat: ``(config, model_name)`` keeps Phase 0 behavior."""
+    monkeypatch.setattr(
+        "agent_knowledgebase.services.embeddings.OllamaEmbedder.probe_dimension",
+        lambda self: 4096,
+    )
     saves = tmp_path / "saves"
     saves.mkdir()
     # Use ollama provider so no API key is required.

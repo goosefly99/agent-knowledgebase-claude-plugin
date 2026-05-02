@@ -27,13 +27,34 @@ different ``embedder_version`` values.
 
 from __future__ import annotations
 
+import json
 import os
+import sys
 import time
 from typing import Any, Protocol, runtime_checkable
 
 import httpx
 
 from agent_knowledgebase.config import Settings
+
+
+# ---------------------------------------------------------------------------
+# Process-level auto-fallback: ollama → sentence-transformers
+# ---------------------------------------------------------------------------
+
+#: Default sentence-transformers model used by :func:`create_embedder` when
+#: the configured ollama provider is unreachable. Hardcoded to keep the
+#: fallback contract deterministic; override the global default by setting
+#: ``AGENT_KB_EMBEDDING_PROVIDER=sentence-transformers`` explicitly.
+OLLAMA_FALLBACK_ST_MODEL = "all-MiniLM-L6-v2"
+
+#: Stable stderr-error-token emitted when the ollama probe fails and we
+#: swap the GLOBAL default to sentence-transformers. Per-snapshot rebuilds
+#: (``create_embedder_for_model``) never emit this token — they raise the
+#: original :class:`EmbedderUnavailableError` so a query against an existing
+#: ollama-backed KB fails loudly instead of silently producing query
+#: vectors in the wrong embedding space.
+OLLAMA_FALLBACK_STDERR_TOKEN = "OLLAMA_UNREACHABLE_FALLBACK_TO_SENTENCE_TRANSFORMERS"
 
 
 # ---------------------------------------------------------------------------
@@ -650,19 +671,90 @@ class OllamaEmbedder:
 
 
 def create_embedder(config: Settings) -> Embedder:
-    """Instantiate the appropriate :class:`Embedder` based on *config*.
+    """Instantiate the *global-default* :class:`Embedder` for this process.
+
+    When the configured provider is ``ollama``, the returned embedder is
+    probed once via :meth:`Embedder.probe_dimension`. If the probe raises
+    :class:`EmbedderUnavailableError`, the global default silently swaps
+    to a :class:`SentenceTransformerEmbedder`
+    (model: :data:`OLLAMA_FALLBACK_ST_MODEL`) so first-ingest into a
+    fresh KB still succeeds when ollama is down. The swap is announced
+    via a single-line JSON stderr emission carrying the
+    :data:`OLLAMA_FALLBACK_STDERR_TOKEN` token.
+
+    Auto-fallback is intentionally scoped to the GLOBAL default only;
+    :func:`create_embedder_for_model` (the per-snapshot rebuild used at
+    query time) does NOT fall back. A KB previously ingested under
+    ollama embeddings cannot be queried under a different embedder
+    without producing geometrically meaningless similarity scores, so
+    those rebuilds re-raise :class:`EmbedderUnavailableError` loudly.
 
     Raises:
         ValueError: If the openai provider is selected but ``OPENAI_API_KEY``
             is not present in the environment.
     """
-    return _build_embedder(
+    embedder = _build_embedder(
         provider=config.embedding_provider,
         model=config.embedding_model,
         base_url=config.embed_base_url,
         timeout_seconds=config.embed_timeout_seconds,
         max_retries=config.embed_max_retries,
     )
+    if config.embedding_provider == "ollama":
+        embedder = _maybe_fallback_to_sentence_transformers(
+            embedder,
+            ollama_model=config.embedding_model,
+            ollama_base_url=config.embed_base_url,
+        )
+    return embedder
+
+
+def _maybe_fallback_to_sentence_transformers(
+    primary: Embedder,
+    *,
+    ollama_model: str,
+    ollama_base_url: str | None,
+    fallback_model: str = OLLAMA_FALLBACK_ST_MODEL,
+) -> Embedder:
+    """Probe *primary* for reachability; on failure, return a SentenceTransformerEmbedder.
+
+    Used by :func:`create_embedder` to enable the auto-fallback contract:
+    "Local ollama embeddings model default choice; sentence-transformers
+    embeddings available if specified or if ollama model is not
+    available." Only the global-default builder applies this fallback;
+    per-snapshot rebuilds bypass it so a query against an ollama-backed
+    KB fails loudly instead of silently swapping spaces.
+
+    The probe is :meth:`Embedder.probe_dimension`, which issues one
+    bounded ``/api/embed`` call. Successful return reuses the dimension
+    cache so the next real embed avoids a duplicate call.
+
+    If sentence-transformers itself fails to load (missing extras /
+    missing HF cache / no network), the original
+    :class:`EmbedderUnavailableError` is re-raised — the caller is no
+    worse off than the no-fallback path.
+    """
+    try:
+        primary.probe_dimension()
+        return primary
+    except EmbedderUnavailableError as ollama_exc:
+        try:
+            fallback = SentenceTransformerEmbedder(model_name=fallback_model)
+        except BaseException:  # noqa: BLE001 — re-raise the ollama error if ST also fails
+            raise ollama_exc
+        payload = {
+            "error_code": OLLAMA_FALLBACK_STDERR_TOKEN,
+            "ollama_model": ollama_model,
+            "ollama_base_url": ollama_base_url,
+            "fallback_provider": "sentence-transformers",
+            "fallback_model": fallback_model,
+            "probe_error": ollama_exc.error,
+            "probe_phase": ollama_exc.phase,
+            "probe_latency_ms": ollama_exc.latency_ms,
+            "probe_detail": ollama_exc.detail,
+        }
+        print(json.dumps(payload), file=sys.stderr, flush=True)
+        return fallback
 
 
 def create_embedder_for_model(
