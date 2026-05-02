@@ -752,13 +752,9 @@ class TestKbConfigShow:
         from agent_knowledgebase import server as srv
         self._env(monkeypatch, tmp_path)
         result = json.loads(srv.kb_config_show("defaults"))
-        # Literal defaults
-        assert result["vectorstore"] == "chromadb"
-        # Phase 5 default-flip (v0.11.0): provider 'ollama' -> 'remote',
-        # model 'qwen3-embedding:8b' -> 'text-embedding-3-small'.
-        # spec_id: 70ab2170-381a-4657-bcd1-28a40c6f369b
-        assert result["embedding"]["provider"] == "remote"
-        assert result["embedding"]["model"] == "text-embedding-3-small"
+        # v0.13.0 defaults: ollama provider, qwen3-embedding:8b model.
+        assert result["embedding"]["provider"] == "ollama"
+        assert result["embedding"]["model"] == "qwen3-embedding:8b"
         assert result["chunk"]["size"] == 512
         assert result["chunk"]["overlap"] == 64
         assert result["query"]["default_top_k"] == 10
@@ -845,7 +841,7 @@ class TestKbConfigGet:
         # Several representative valid keys must appear in the error
         assert "embedding.model" in msg
         assert "chunk.size" in msg
-        assert "vectorstore" in msg
+        assert "embedding.provider" in msg
 
 
 class TestKbConfigSet:
@@ -1042,7 +1038,7 @@ class TestKbConfigValidate:
         # every DOT_TO_FLAT key must appear in provenance with a classification
         prov = merged["provenance"]
         assert prov["embedding.model"] == "user_json"
-        assert prov["vectorstore"] == "default"  # no override
+        assert prov["embedding.provider"] == "default"  # no override
         # Provenance must cover every known dotted key
         from agent_knowledgebase.config_files import DOT_TO_FLAT
         for dotted_key in DOT_TO_FLAT:

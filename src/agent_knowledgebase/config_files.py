@@ -70,15 +70,11 @@ def resolve_project_config_path() -> Path:
 
 # Dotted JSON paths → flat Settings field names.  See design spec §5.2.
 DOT_TO_FLAT: dict[str, str] = {
-    "kb_backend": "kb_backend",
-    "vectorstore": "vectorstore",
     "embedding.provider": "embedding_provider",
     "embedding.model": "embedding_model",
     "embedding.base_url": "embed_base_url",
     "embedding.timeout_seconds": "embed_timeout_seconds",
     "embedding.max_retries": "embed_max_retries",
-    "pinecone.index": "pinecone_index",
-    "pinecone.environment": "pinecone_environment",
     "export_path": "export_path",
     "chunk.size": "chunk_size",
     "chunk.overlap": "chunk_overlap",
@@ -92,7 +88,10 @@ DOT_TO_FLAT: dict[str, str] = {
 
 # Keys (at any depth or any flat form) that must never appear in a JSON config.
 # The JSON source rejects them loudly because they belong in env (secrets or
-# required+validated file paths).
+# required+validated file paths). ``embed_api_key`` / ``pinecone_api_key`` /
+# ``api_key`` are kept in the forbidden list even though the corresponding
+# Settings fields were dropped in v0.13.0 — operators with stale on-disk
+# configs see a clear rejection rather than a silent unknown-key error.
 FORBIDDEN_KEYS: frozenset[str] = frozenset({
     "embed_api_key", "pinecone_api_key", "saves_dir", "api_key",
 })

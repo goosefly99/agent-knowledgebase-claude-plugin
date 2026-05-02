@@ -17,12 +17,12 @@ explicitly authorise this deferral.
 What this file pins instead is the **root** of Bug-1a as fixed in
 Phase 0:
 
-* Pre-fix: ``RemoteEmbedder('qwen3-embedding:8b').dimension`` silently
+* Pre-fix: ``OpenAIEmbedder('qwen3-embedding:8b').dimension`` silently
   returned the hardcoded ``1536`` fallback. Any caller that sized a
   ChromaDB collection from that value, then issued the first real embed
   (which produced 4096-dim vectors), would dimension-mismatch on
   insert. The bug was at the EMBEDDER layer, not the chromadb layer.
-* Post-fix: ``RemoteEmbedder.dimension`` probes the live endpoint for
+* Post-fix: ``OpenAIEmbedder.dimension`` probes the live endpoint for
   unknown models and caches the actual response length. The mismatch
   source is removed.
 
@@ -42,7 +42,7 @@ import pytest
 
 from agent_knowledgebase.services.embeddings import (
     EmbedderDimensionMismatchError,
-    RemoteEmbedder,
+    OpenAIEmbedder,
 )
 
 
@@ -60,7 +60,7 @@ def test_qwen3_embedding_no_longer_silently_returns_1536() -> None:
     """Bug-1a regression: the hardcoded fallback is gone.
 
     The exact pathology the spec calls out:
-    ``RemoteEmbedder('qwen3-embedding:8b').dimension`` previously
+    ``OpenAIEmbedder('qwen3-embedding:8b').dimension`` previously
     returned ``1536`` without any HTTP call (because the model name is
     not in ``_REMOTE_EMBEDDING_DIMENSIONS``). Post-fix it probes the
     live endpoint and returns the response vector's length — proving
@@ -69,7 +69,7 @@ def test_qwen3_embedding_no_longer_silently_returns_1536() -> None:
     mock_client = MagicMock(spec=httpx.Client)
     mock_client.post.return_value = _ok_remote_embed([0.0] * 4096)
 
-    embedder = RemoteEmbedder(
+    embedder = OpenAIEmbedder(
         model_name="qwen3-embedding:8b",
         api_key="ollama",
         base_url="http://localhost:11434/v1",
@@ -78,7 +78,7 @@ def test_qwen3_embedding_no_longer_silently_returns_1536() -> None:
 
     dim = embedder.dimension
     assert dim != 1536, (
-        "RemoteEmbedder.dimension must NOT silently return the hardcoded "
+        "OpenAIEmbedder.dimension must NOT silently return the hardcoded "
         "1536 fallback for unknown models; this was the root cause of "
         "Bug-1a's dimension-mismatch on first ingest."
     )

@@ -59,22 +59,14 @@ class TestSavesDir:
 class TestDefaults:
     """Default values for fields other than saves_dir."""
 
-    def test_default_vectorstore(self, test_config: Settings) -> None:
-        assert test_config.vectorstore == "chromadb"
-
     def test_default_embedding_provider(self, test_config: Settings) -> None:
-        # Phase 5 default-flip (v0.11.0): default flipped from 'ollama' to
-        # 'remote'. Existing v0.6.0 KBs ingested under 'ollama' stay
-        # queryable post-flip via the Phase 4 per-chunk provider snapshot.
-        # spec_id: 70ab2170-381a-4657-bcd1-28a40c6f369b
-        assert test_config.embedding_provider == "remote"
+        # v0.13.0: default is 'ollama' (paired with bundled Ollama
+        # sidecar in docker-compose.yml).
+        assert test_config.embedding_provider == "ollama"
 
     def test_default_embedding_model(self, test_config: Settings) -> None:
-        # Phase 5 default-flip (v0.11.0): paired with the
-        # embedding_provider flip — default model flipped from
-        # 'qwen3-embedding:8b' (Ollama) to 'text-embedding-3-small'
-        # (OpenAI-compat).
-        assert test_config.embedding_model == "text-embedding-3-small"
+        # v0.13.0: default model is qwen3-embedding:8b (Ollama).
+        assert test_config.embedding_model == "qwen3-embedding:8b"
 
     def test_default_chunk_size(self, test_config: Settings) -> None:
         assert test_config.chunk_size == 512
@@ -82,11 +74,9 @@ class TestDefaults:
     def test_default_chunk_overlap(self, test_config: Settings) -> None:
         assert test_config.chunk_overlap == 64
 
-    def test_optional_fields_are_none(self, test_config: Settings) -> None:
-        assert test_config.pinecone_api_key is None
-        assert test_config.pinecone_index is None
-        assert test_config.pinecone_environment is None
-        assert test_config.embed_api_key is None
+    def test_default_export_path_is_none(self, tmp_path: Path) -> None:
+        cfg = Settings(saves_dir=tmp_path)
+        assert cfg.export_path is None
 
     def test_default_chunk_token_encoding(self, test_config: Settings) -> None:
         assert test_config.chunk_token_encoding == "cl100k_base"
@@ -132,11 +122,6 @@ class TestDefaults:
 class TestEnvOverrides:
     """Environment variable overrides are picked up."""
 
-    def test_override_vectorstore(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-        monkeypatch.setenv("AGENT_KB_VECTORSTORE", "pinecone")
-        cfg = Settings(saves_dir=tmp_path)
-        assert cfg.vectorstore == "pinecone"
-
     def test_override_chunk_size(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         monkeypatch.setenv("AGENT_KB_CHUNK_SIZE", "1024")
         cfg = Settings(saves_dir=tmp_path)
@@ -150,9 +135,9 @@ class TestEnvOverrides:
     def test_override_embedding_provider(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        monkeypatch.setenv("AGENT_KB_EMBEDDING_PROVIDER", "remote")
+        monkeypatch.setenv("AGENT_KB_EMBEDDING_PROVIDER", "openai")
         cfg = Settings(saves_dir=tmp_path)
-        assert cfg.embedding_provider == "remote"
+        assert cfg.embedding_provider == "openai"
 
     def test_override_embedding_model(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -307,62 +292,6 @@ class TestHybridWeightValidation:
             query_hybrid_vector_weight=0.7,
             query_hybrid_fts_weight=0.3,
         )
-
-
-class TestKBBackendVectorstoreConsistency:
-    """``vectorstore`` is only meaningful when ``kb_backend='chromadb'``.
-
-    Setting ``kb_backend in {markdown, lightrag}`` together with a
-    non-default ``vectorstore`` is a meaningless combination — those
-    backends don't read the ``vectorstore`` field. The validator must
-    reject it loudly (Phase 2 hardening; protects Phase 3+).
-    """
-
-    def test_markdown_with_pinecone_rejected(self, tmp_path: Path) -> None:
-        from pydantic import ValidationError
-
-        with pytest.raises(
-            ValidationError, match="vectorstore=.*meaningless when kb_backend"
-        ):
-            Settings(
-                saves_dir=tmp_path,
-                kb_backend="markdown",
-                vectorstore="pinecone",
-                embed_api_key="x",
-                embed_base_url="y",
-            )
-
-    def test_markdown_with_chromadb_default_succeeds(self, tmp_path: Path) -> None:
-        """``vectorstore='chromadb'`` is benign even when ignored by the
-        markdown backend (it's the field default).
-        """
-        cfg = Settings(
-            saves_dir=tmp_path,
-            kb_backend="markdown",
-            vectorstore="chromadb",
-        )
-        assert cfg.kb_backend == "markdown"
-        assert cfg.vectorstore == "chromadb"
-
-    def test_chromadb_default_state_validates(self, tmp_path: Path) -> None:
-        """The default state ``kb_backend='chromadb' + vectorstore='chromadb'``
-        must continue to validate.
-        """
-        cfg = Settings(saves_dir=tmp_path)
-        assert cfg.kb_backend == "chromadb"
-        assert cfg.vectorstore == "chromadb"
-
-    def test_chromadb_with_pinecone_validates(self, tmp_path: Path) -> None:
-        """``kb_backend='chromadb' + vectorstore='pinecone'`` is the
-        legitimate cross-product the validator must NOT reject.
-        """
-        cfg = Settings(
-            saves_dir=tmp_path,
-            kb_backend="chromadb",
-            vectorstore="pinecone",
-        )
-        assert cfg.kb_backend == "chromadb"
-        assert cfg.vectorstore == "pinecone"
 
 
 class TestFixtures:

@@ -67,18 +67,12 @@ def _classify_config_error(exc: BaseException) -> dict[str, str]:
     ``AGENT_KB_SAVES_DIR``-flavoured payload for path-existence errors
     raised by ``resolve_paths``.
 
-    Phase 5 (I-06) — also catches the runtime
-    ``ValueError("AGENT_KB_<VAR> required for ...")`` family raised
-    inside the embedder build path (``embeddings._build_embedder``).
-    Without this wrap, a fresh-install operator who hasn't set
-    ``AGENT_KB_EMBED_API_KEY`` after the Phase 5 default flip to
-    ``provider='remote'`` would receive a raw stack trace on first
-    ``kb_query`` instead of the structured ``config_missing`` payload
-    every other config failure surfaces. The pattern is
-    ``AGENT_KB_*`` at the start of the message + the literal ``required``
-    later — anything matching is wrapped as a config error and the env
-    var name is extracted from the first whitespace-separated token.
-    spec_id: 70ab2170-381a-4657-bcd1-28a40c6f369b
+    Also catches the runtime ``ValueError("AGENT_KB_<VAR> required for ...")``
+    family raised inside the embedder build path
+    (``embeddings._build_embedder``). The pattern is ``AGENT_KB_*`` at
+    the start of the message + the literal ``required`` later —
+    anything matching is wrapped as a config error and the env var
+    name is extracted from the first whitespace-separated token.
     """
     if isinstance(exc, ValidationError):
         missing_field = "AGENT_KB_SAVES_DIR"
@@ -330,24 +324,24 @@ def _reset_tool_executor() -> None:
 
 
 def _maybe_classify_runtime_value_error(exc: BaseException) -> dict[str, str] | None:
-    """Return a config_missing payload when *exc* matches the AGENT_KB_ pattern.
+    """Return a config_missing payload when *exc* matches a missing-config pattern.
 
-    Phase 5 (I-06): the embedder build path raises
-    ``ValueError("AGENT_KB_<VAR> required for ...")`` when a required
-    runtime config var is missing (e.g. ``AGENT_KB_EMBED_API_KEY`` after
-    the Phase 5 default flip to ``provider='remote'``). Without a wrap,
-    this propagates as a raw stack trace on first ``kb_query``. The
-    same payload shape that Phase 0 used for ``_get_service``-time
-    config errors is reused here so callers see one error contract.
-    Returns ``None`` for unrelated ValueErrors so they keep propagating
-    raw. spec_id: 70ab2170-381a-4657-bcd1-28a40c6f369b
+    The embedder build path raises ``ValueError("AGENT_KB_<VAR> required ...")``
+    or ``ValueError("OPENAI_API_KEY is required ...")`` when a required
+    runtime config var is missing. Without a wrap, this propagates as a
+    raw stack trace on first ``kb_query``. The same payload shape that
+    Phase 0 used for ``_get_service``-time config errors is reused here
+    so callers see one error contract. Returns ``None`` for unrelated
+    ValueErrors so they keep propagating raw.
     """
     if not isinstance(exc, ValueError):
         return None
     msg = str(exc)
-    if not msg.startswith("AGENT_KB_") or "required" not in msg:
-        return None
-    return _classify_config_error(exc)
+    if msg.startswith("AGENT_KB_") and "required" in msg:
+        return _classify_config_error(exc)
+    if msg.startswith("OPENAI_API_KEY") and "required" in msg:
+        return _config_missing_payload(missing="OPENAI_API_KEY", detail=msg)
+    return None
 
 
 def _with_tool_timeout(func: _F) -> _F:

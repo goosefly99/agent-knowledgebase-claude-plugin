@@ -1,14 +1,8 @@
 [project]
 name = "agent-knowledgebase"
-version = "0.12.0"
+version = "0.13.0"
 description = "Personal knowledgebase plugin — ingest sources, build wiki artifacts, query with vector search"
 requires-python = ">=3.11"
-# Phase 5 default install — minimal viable retrieval. chromadb stays
-# (default vectorstore); httpx + pydantic + mcp + tiktoken + trafilatura
-# are runtime essentials. sentence-transformers, tree-sitter*,
-# pdfplumber, sqlalchemy, sqlparse have moved into [optional-dependencies]
-# extras to drop the default install size. spec_id:
-# 70ab2170-381a-4657-bcd1-28a40c6f369b
 dependencies = [
     "mcp>=1.0.0",
     "pydantic>=2.0",
@@ -20,19 +14,12 @@ dependencies = [
     "tiktoken>=0.7",
 ]
 
-# Opt-in extras. The fastembed (qdrant-fastembed) and pinecone extras
-# were dropped in v0.13.0 along with the fastembed embedder and pinecone
-# vectorstore; the embeddings refactor in Phase 3 may shrink this list
-# further. See docs/install_size.md for per-extra install-size tables.
 [project.optional-dependencies]
+# v0.13.0 — three embedder providers, all installable in the Docker
+# image. The Dockerfile installs requirements.lock which already
+# includes the embed-local-st extra so sentence-transformers ships
+# in the image. No pinecone, no fastembed.
 embed-local-st = ["sentence-transformers>=3.0"]
-# I-03: codebase ingestion uses regex-based symbol detection — there is
-# no tree-sitter import anywhere in src/. The extra is retained as an
-# empty placeholder so callers depending on the name don't break, and so
-# a future tree-sitter-backed chunker can land here without renaming the
-# extra group.
-# spec_id: 70ab2170-381a-4657-bcd1-28a40c6f369b
-ingest-codebase = []  # placeholder; future tree-sitter chunking will land here
 ingest-file = ["pdfplumber>=0.11"]
 ingest-sql = [
     "sqlalchemy>=2.0",

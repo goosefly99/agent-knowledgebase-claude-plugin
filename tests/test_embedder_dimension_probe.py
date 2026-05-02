@@ -2,7 +2,7 @@
 
 Three regressions pinned here, one per concrete embedder behaviour:
 
-1. ``RemoteEmbedder('qwen3-embedding:8b').dimension`` (the model that
+1. ``OpenAIEmbedder('qwen3-embedding:8b').dimension`` (the model that
    surfaced the bug — Ollama's ``/v1`` exposes it via the OpenAI-compatible
    surface, but it is not in the ``_REMOTE_EMBEDDING_DIMENSIONS`` lookup
    table, so the previous code returned the hardcoded 1536 fallback).
@@ -26,7 +26,7 @@ import pytest
 from agent_knowledgebase.services.embeddings import (
     EmbedderUnavailableError,
     OllamaEmbedder,
-    RemoteEmbedder,
+    OpenAIEmbedder,
 )
 
 
@@ -61,7 +61,7 @@ def test_remote_embedder_unknown_model_probes_real_dimension() -> None:
     mock_client = MagicMock(spec=httpx.Client)
     mock_client.post.return_value = _ok_remote_embed([0.0] * 4096)
 
-    embedder = RemoteEmbedder(
+    embedder = OpenAIEmbedder(
         model_name="qwen3-embedding:8b",
         api_key="test",
         base_url="http://test/v1",
@@ -89,7 +89,7 @@ def test_remote_embedder_known_model_skips_probe() -> None:
     call.
     """
     mock_client = MagicMock(spec=httpx.Client)
-    embedder = RemoteEmbedder(
+    embedder = OpenAIEmbedder(
         model_name="text-embedding-3-small",
         api_key="sk-test",
         base_url="https://example.invalid/v1",
@@ -103,7 +103,7 @@ def test_remote_embedder_known_model_skips_probe() -> None:
 def test_remote_embedder_known_model_probe_dimension_is_idempotent() -> None:
     """``probe_dimension`` for a known model returns the static value with no HTTP call."""
     mock_client = MagicMock(spec=httpx.Client)
-    embedder = RemoteEmbedder(
+    embedder = OpenAIEmbedder(
         model_name="text-embedding-3-large",
         api_key="sk-test",
         base_url="https://example.invalid/v1",
@@ -165,7 +165,7 @@ def test_remote_probe_failure_reports_real_latency() -> None:
     mock_client = MagicMock(spec=httpx.Client)
     mock_client.post.side_effect = slow_empty_response
 
-    embedder = RemoteEmbedder(
+    embedder = OpenAIEmbedder(
         model_name="qwen3-embedding:8b",
         api_key="test",
         base_url="http://test/v1",

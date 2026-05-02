@@ -124,22 +124,21 @@ class TestNestedJsonConfigSettingsSourceLoad:
     def test_flattening(self, tmp_path: Path) -> None:
         f = tmp_path / "cfg.json"
         f.write_text(json.dumps({
-            "embedding": {"provider": "remote", "model": "text-embedding-3-small"},
+            "embedding": {"provider": "openai", "model": "text-embedding-3-small"},
             "chunk": {"size": 256},
             "query": {"hybrid": {"vector_weight": 0.6}},
         }))
         result = _load(f)
-        assert result["embedding_provider"] == "remote"
+        assert result["embedding_provider"] == "openai"
         assert result["embedding_model"] == "text-embedding-3-small"
         assert result["chunk_size"] == 256
         assert result["query_hybrid_vector_weight"] == 0.6
 
     def test_flat_keys_also_accepted(self, tmp_path: Path) -> None:
-        """Top-level keys like `vectorstore` and `export_path` pass through unchanged."""
+        """Top-level keys like `export_path` pass through unchanged."""
         f = tmp_path / "cfg.json"
-        f.write_text(json.dumps({"vectorstore": "pinecone", "export_path": "/tmp/out"}))
+        f.write_text(json.dumps({"export_path": "/tmp/out"}))
         result = _load(f)
-        assert result["vectorstore"] == "pinecone"
         assert result["export_path"] == "/tmp/out"
 
     def test_malformed_json_raises(self, tmp_path: Path) -> None:
@@ -188,10 +187,8 @@ class TestLayeringPrecedence:
         monkeypatch.setenv("AGENT_KB_USER_CONFIG", str(tmp_path / "no_user.json"))
         monkeypatch.setenv("AGENT_KB_PROJECT_CONFIG", str(tmp_path / "no_proj.json"))
         cfg = Settings()
-        # Phase 5 default-flip (v0.11.0): default model flipped from
-        # 'qwen3-embedding:8b' to 'text-embedding-3-small'.
-        # spec_id: 70ab2170-381a-4657-bcd1-28a40c6f369b
-        assert cfg.embedding_model == "text-embedding-3-small"
+        # v0.13.0 default: ollama provider with qwen3-embedding:8b.
+        assert cfg.embedding_model == "qwen3-embedding:8b"
         assert cfg.chunk_size == 512
 
     def test_user_file_overrides_default(
@@ -290,6 +287,5 @@ class TestLoadSettingsHelper:
         monkeypatch.setenv("AGENT_KB_USER_CONFIG", str(tmp_path / "none.json"))
         monkeypatch.setenv("AGENT_KB_PROJECT_CONFIG", str(tmp_path / "none2.json"))
         cfg = load_settings()
-        # Phase 5 default-flip (v0.11.0). spec_id:
-        # 70ab2170-381a-4657-bcd1-28a40c6f369b
-        assert cfg.embedding_model == "text-embedding-3-small"
+        # v0.13.0 default model.
+        assert cfg.embedding_model == "qwen3-embedding:8b"

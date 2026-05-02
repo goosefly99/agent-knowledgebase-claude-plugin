@@ -28,16 +28,17 @@ What's being tested
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from unittest.mock import patch
+
+import pytest
 
 from agent_knowledgebase.config import Settings
 from agent_knowledgebase.database import Database
 from agent_knowledgebase.models import Chunk
 from agent_knowledgebase.services.embeddings import (
     OllamaEmbedder,
-    RemoteEmbedder,
+    OpenAIEmbedder,
     create_embedder_for_model,
 )
 
@@ -140,14 +141,14 @@ def test_get_embedding_snapshot_returns_dominant_tuple(tmp_path: Path) -> None:
         ("src-1", "kb-1", "file", "x://a", "ingested"),
     )
     db._conn.commit()
-    # Two chunks with ollama/qwen, one with remote/text-embedding-3-small.
+    # Two chunks with ollama/qwen, one with openai/text-embedding-3-small.
     for _ in range(2):
         db.insert_chunk(_make_chunk(kb_id="kb-1"))
     db.insert_chunk(
         _make_chunk(
             kb_id="kb-1",
             model="text-embedding-3-small",
-            provider="remote",
+            provider="openai",
             base_url="https://api.openai.com/v1",
         )
     )
@@ -190,42 +191,40 @@ def test_create_embedder_for_model_legacy_one_arg_signature_still_works(
     assert embedder.model_name == "qwen3-embedding:8b"
 
 
-def test_create_embedder_for_model_with_provider_override_builds_remote(
-    tmp_path: Path,
+def test_create_embedder_for_model_with_provider_override_builds_openai(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """When provider='remote' is supplied, a RemoteEmbedder is built
+    """When provider='openai' is supplied, an OpenAIEmbedder is built
     even though the global config says ``provider='ollama'`` — proving
     the snapshot can rebuild a non-default embedder."""
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
     saves = tmp_path / "saves"
     saves.mkdir()
     settings = Settings(
         saves_dir=saves,
         embedding_provider="ollama",
         embedding_model="qwen3-embedding:8b",
-        # Provide an api key so the remote-build path doesn't reject.
-        embed_api_key="sk-test",
     ).resolve_paths()
     embedder = create_embedder_for_model(
         settings,
         "text-embedding-3-small",
-        provider="remote",
+        provider="openai",
         base_url="https://api.openai.com/v1",
     )
-    assert isinstance(embedder, RemoteEmbedder)
+    assert isinstance(embedder, OpenAIEmbedder)
     assert embedder.model_name == "text-embedding-3-small"
 
 
 def test_query_embedder_for_uses_snapshot_after_default_flip(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """End-to-end: ingest under provider=ollama, flip the live config
-    to provider=remote, query the same KB — the snapshot resolution
+    to provider=openai, query the same KB — the snapshot resolution
     must rebuild the original Ollama embedder for that KB.
-
-    This is the spec's Phase 5 safety property in test form.
     """
     from agent_knowledgebase.services.knowledgebase import KnowledgebaseService
 
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
     saves = tmp_path / "saves"
     saves.mkdir()
     # Initial settings -> ingest path stamps provider=ollama on chunks.
@@ -263,15 +262,13 @@ def test_query_embedder_for_uses_snapshot_after_default_flip(
         )
     )
 
-    # Rebuild the service with a flipped config: provider=remote,
-    # model=text-embedding-3-small. This simulates the Phase 5
-    # default-flip operating against an existing Phase 4-stamped KB.
+    # Rebuild the service with a flipped config: provider=openai,
+    # model=text-embedding-3-small.
     flipped = Settings(
         saves_dir=saves,
-        embedding_provider="remote",
+        embedding_provider="openai",
         embedding_model="text-embedding-3-small",
         embed_base_url="https://api.openai.com/v1",
-        embed_api_key="sk-test",
     ).resolve_paths()
     svc2 = KnowledgebaseService(flipped)
 
@@ -354,119 +351,6 @@ def test_backfill_stamps_columns_for_legacy_chunks(tmp_path: Path) -> None:
     )
     assert rerun == 0
     db.close()
-
-
-# ---------------------------------------------------------------------------
-# I-02 — backfill restricts by metadata.embedding_model
-# ---------------------------------------------------------------------------
-
-
-def test_backfill_skips_chunks_with_mismatched_embedding_model(
-    tmp_path: Path,
-) -> None:
-    """I-02: ``backfill_provider_snapshot`` must only stamp chunks
-    whose ``metadata.embedding_model`` matches the current
-    ``Settings.embedding_model``. A mixed-history KB whose chunks were
-    ingested under MULTIPLE different embedders must NOT have the
-    process-wide provider misstamped onto the chunks that came from a
-    different embedder.
-
-    Bug history: the old implementation read
-    ``service._config.embedding_provider`` and stamped every NULL
-    chunk regardless of model, so a switch from Ollama to Remote
-    would silently misstamp the older Ollama chunks with
-    ``provider='remote'``.
-    """
-    from agent_knowledgebase.config import Settings
-    from agent_knowledgebase.services.knowledgebase import KnowledgebaseService
-    from agent_knowledgebase.services.migration import backfill_provider_snapshot
-
-    saves = tmp_path / "saves"
-    saves.mkdir()
-    # Live config says model=text-embedding-3-small, provider=remote.
-    settings = Settings(
-        saves_dir=saves,
-        embedding_provider="remote",
-        embedding_model="text-embedding-3-small",
-        embed_base_url="https://api.openai.com/v1",
-        embed_api_key="sk-test",
-    ).resolve_paths()
-    svc = KnowledgebaseService(settings)
-    kb = svc.create_kb(name="bf-mixed")
-    ctx = svc._ctx(kb.id)
-
-    # Insert a source row so the FK constraints are satisfied.
-    ctx.db._conn.execute(
-        "INSERT INTO sources (id, kb_id, source_type, uri, status) "
-        "VALUES (?, ?, ?, ?, ?)",
-        (f"src-{kb.id}", kb.id, "file", "x://mixed", "ingested"),
-    )
-    ctx.db._conn.commit()
-
-    # 5 chunks with embedding_model='text-embedding-3-small' (matches
-    # current settings); should be stamped.
-    for i in range(5):
-        ctx.db._conn.execute(
-            "INSERT INTO chunks (id, source_id, kb_id, content, metadata, embedding_id) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (
-                f"c-match-{i}",
-                f"src-{kb.id}",
-                kb.id,
-                f"matching {i}",
-                json.dumps({"embedding_model": "text-embedding-3-small"}),
-                None,
-            ),
-        )
-    # 5 chunks with embedding_model='qwen3-embedding:8b' (DIFFERENT
-    # model — must NOT be misstamped with provider='remote').
-    for i in range(5):
-        ctx.db._conn.execute(
-            "INSERT INTO chunks (id, source_id, kb_id, content, metadata, embedding_id) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (
-                f"c-skip-{i}",
-                f"src-{kb.id}",
-                kb.id,
-                f"skip {i}",
-                json.dumps({"embedding_model": "qwen3-embedding:8b"}),
-                None,
-            ),
-        )
-    ctx.db._conn.commit()
-
-    summary = backfill_provider_snapshot(svc, kb_id=kb.id)
-    assert summary[kb.id] == 5, (
-        f"expected 5 matching chunks updated, got {summary[kb.id]} — "
-        f"the mismatched-model chunks must be left untouched"
-    )
-
-    # Matching-model chunks: stamped with remote.
-    matching = ctx.db._conn.execute(
-        "SELECT embedding_provider, embed_base_url FROM chunks "
-        "WHERE id LIKE 'c-match-%'"
-    ).fetchall()
-    for row in matching:
-        assert row["embedding_provider"] == "remote", (
-            f"matching-model chunk should be stamped 'remote', got "
-            f"{row['embedding_provider']!r}"
-        )
-        assert row["embed_base_url"] == "https://api.openai.com/v1"
-
-    # Mismatched-model chunks: STILL NULL (the bug catcher).
-    skipped = ctx.db._conn.execute(
-        "SELECT embedding_provider, embed_base_url FROM chunks "
-        "WHERE id LIKE 'c-skip-%'"
-    ).fetchall()
-    for row in skipped:
-        assert row["embedding_provider"] is None, (
-            f"mismatched-model chunk MUST stay NULL (no misstamp); "
-            f"got provider={row['embedding_provider']!r}. "
-            f"This is the I-02 bug: the old backfill stamped every NULL "
-            f"row with the process-wide provider, silently corrupting "
-            f"mixed-embedder KBs."
-        )
-        assert row["embed_base_url"] is None
 
 
 def test_backfill_embedding_snapshot_db_method_honors_model_filter(

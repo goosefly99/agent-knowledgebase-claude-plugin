@@ -1,12 +1,10 @@
-"""Phase 5 (I-06) — runtime ValueError("AGENT_KB_*") wrapped as config_missing.
+"""v0.13.0 — runtime ValueError on missing OPENAI_API_KEY wrapped as config_missing.
 
-After the Phase 5 default flip to ``provider='remote'``, an operator
-on a fresh install with no ``AGENT_KB_EMBED_API_KEY`` would hit
-``ValueError("AGENT_KB_EMBED_API_KEY required for remote
-embeddings")`` raised inside the embedder build path on first
-``kb_query``. The Phase 0 ``_classify_config_error`` only handled
-``Settings.resolve_paths()`` errors; the runtime variant needs the
-same wrap. spec_id: 70ab2170-381a-4657-bcd1-28a40c6f369b
+When ``embedding_provider='openai'`` is selected but ``OPENAI_API_KEY``
+is unset, the embedder build path raises
+``ValueError("OPENAI_API_KEY is required ...")`` on first ``kb_query``.
+The server's classify hook catches the pattern and returns a
+structured ``config_missing`` payload instead of a raw stack trace.
 """
 
 from __future__ import annotations
@@ -32,7 +30,7 @@ def _reset_service_between_tests(monkeypatch: pytest.MonkeyPatch) -> None:
 def _scrub_config_env(monkeypatch: pytest.MonkeyPatch) -> None:
     """Remove every env var that could supply embedder config."""
     for var in (
-        "AGENT_KB_EMBED_API_KEY",
+        "OPENAI_API_KEY",
         "AGENT_KB_EMBED_BASE_URL",
         "AGENT_KB_EMBEDDING_PROVIDER",
         "AGENT_KB_EMBEDDING_MODEL",
@@ -44,10 +42,10 @@ def _scrub_config_env(monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv(var, raising=False)
 
 
-def test_kb_query_returns_config_missing_when_remote_api_key_unset(
+def test_kb_query_returns_config_missing_when_openai_api_key_unset(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Fresh install + post-Phase-5 default + no API key →
+    """Fresh install + provider=openai + no API key →
     structured ``config_missing`` payload, NOT a stack trace.
 
     Mirrors the ``test_get_service_config_missing.py`` pattern: invoke
@@ -57,16 +55,15 @@ def test_kb_query_returns_config_missing_when_remote_api_key_unset(
     saves = tmp_path / "saves"
     saves.mkdir()
     monkeypatch.setenv("AGENT_KB_SAVES_DIR", str(saves))
+    monkeypatch.setenv("AGENT_KB_EMBEDDING_PROVIDER", "openai")
 
-    # Create a KB so we have something to query against. (Use the
-    # service directly to keep this independent of kb_create's
-    # success/failure paths.)
+    # Create a KB so we have something to query against.
     svc = server._get_service()
     kb = svc.create_kb(name="cfg-missing")
 
-    # Insert a chunk so the snapshot returns a model that the post-flip
-    # remote default would try to query under, triggering the
-    # ValueError on first kb_query.
+    # Insert a chunk so the snapshot resolves to an openai-stamped
+    # entry, triggering the ValueError on first kb_query when the
+    # OPENAI_API_KEY env var is unset.
     import json as _json
     ctx = svc._ctx(kb.id)
     ctx.db._conn.execute(
@@ -85,13 +82,13 @@ def test_kb_query_returns_config_missing_when_remote_api_key_unset(
             "test content",
             _json.dumps({
                 "embedding_model": "text-embedding-3-small",
-                "embedding_provider": "remote",
+                "embedding_provider": "openai",
                 "embed_base_url": "https://api.openai.com/v1",
             }),
             None,
-            "remote",
+            "openai",
             "https://api.openai.com/v1",
-            "remote/text-embedding-3-small@https://api.openai.com/v1",
+            "openai/text-embedding-3-small@https://api.openai.com/v1",
         ),
     )
     ctx.db._conn.commit()
@@ -109,8 +106,8 @@ def test_kb_query_returns_config_missing_when_remote_api_key_unset(
     assert payload.get("error") == "config_missing", (
         f"Expected error='config_missing'; got {payload!r}"
     )
-    assert payload.get("missing") == "AGENT_KB_EMBED_API_KEY", (
-        f"Expected missing='AGENT_KB_EMBED_API_KEY'; got {payload!r}"
+    assert payload.get("missing") == "OPENAI_API_KEY", (
+        f"Expected missing='OPENAI_API_KEY'; got {payload!r}"
     )
     assert payload.get("detail"), "config_missing payload must include detail"
 
@@ -119,14 +116,14 @@ def test_unrelated_value_error_still_propagates(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The wrap must NOT swallow ValueErrors with messages that don't
-    match the AGENT_KB_<VAR> required pattern — those are real bugs
-    and should still surface.
+    match the missing-config patterns — those are real bugs and should
+    still surface.
     """
     _scrub_config_env(monkeypatch)
     saves = tmp_path / "saves"
     saves.mkdir()
     monkeypatch.setenv("AGENT_KB_SAVES_DIR", str(saves))
-    monkeypatch.setenv("AGENT_KB_EMBED_API_KEY", "sk-test")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
 
     # kb_query against a non-existent kb_id raises
     # ValueError("KB <kb_id> not found") inside the service.

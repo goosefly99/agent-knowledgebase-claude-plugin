@@ -1,36 +1,33 @@
 """Embedding providers behind a common interface.
 
-Supported providers:
+Supported providers (v0.13.0):
 
-* ``remote`` (default — Phase 5 flip) — POSTs to an HTTP
-  ``/v1/embeddings`` endpoint speaking the OpenAI-compatible
-  embeddings JSON contract (``{"input": [...], "model": ...}`` →
-  ``{"data": [{"index": N, "embedding": [...]}]}``). Works with
-  vLLM, LocalAI, OpenAI, Azure OpenAI, Ollama's ``/v1`` surface, etc.
-* ``ollama`` — POSTs to Ollama's native ``/api/embed`` endpoint.
-  Requires only ``base_url`` (default ``http://127.0.0.1:11434``); no API
-  key. Parses the Ollama response shape ``{"embeddings": [[...]]}``.
+* ``ollama`` (default) — POSTs to Ollama's native ``/api/embed`` endpoint.
+  Requires only ``base_url`` (default ``http://ollama:11434`` to match the
+  bundled Docker sidecar); no API key. Parses the Ollama response shape
+  ``{"embeddings": [[...]]}``.
+* ``openai`` — POSTs to OpenAI's (or any /v1/embeddings-compatible)
+  endpoint speaking the OpenAI JSON contract
+  (``{"input": [...], "model": ...}`` →
+  ``{"data": [{"index": N, "embedding": [...]}]}``). The API key is
+  read directly from the ``OPENAI_API_KEY`` env var (no
+  ``AGENT_KB_``-prefixed alias).
 * ``sentence-transformers`` — Local embedder backed by the
-  ``sentence-transformers`` library (offline-capable). Moved to opt-in
-  ``[embed-local-st]`` extra in Phase 5; install via
-  ``pip install agent-knowledgebase[embed-local-st]``.
+  ``sentence-transformers`` library (bundled in the Docker image).
 
-Embedder version (Phase 5)
---------------------------
+Embedder version
+----------------
 
 Every embedder exposes :attr:`Embedder.embedder_version` — an opaque
 string that uniquely identifies the embedder's vector geometry beyond
 just its model name. Two embedders with the same nominal model_name
 (e.g. ``"all-MiniLM-L6-v2"``) but different libraries MUST report
-different ``embedder_version`` values. Stamped on every ingested chunk by
-:class:`Database.insert_chunk` so
-``KnowledgebaseService._ingest_source_locked`` can detect mixed-
-version ingests via :meth:`Database.get_embedder_versions`. The
-``AGENT_KB_AUTO_REEMBED=1`` env var bypasses the rejection.
+different ``embedder_version`` values.
 """
 
 from __future__ import annotations
 
+import os
 import time
 from typing import Any, Protocol, runtime_checkable
 
@@ -237,13 +234,10 @@ class Embedder(Protocol):
 
         Implementations issue a single-text dry-run embed of a fixed
         probe string when no static lookup is available, then cache the
-        result. This replaces the previous behavior where
-        ``RemoteEmbedder.dimension`` silently returned a hardcoded
-        ``1536`` fallback for unknown models and
-        ``OllamaEmbedder.dimension`` returned ``0`` until the first
-        embed call had succeeded — both bugs that produced
-        dimension-mismatch failures on first ingest into a vector
-        collection sized at the actual probed dimension.
+        result. This avoids returning stale or hardcoded dimension
+        values that would cause dimension-mismatch failures on first
+        ingest into a vector collection sized at the actual probed
+        dimension.
         """
         ...
 
@@ -256,11 +250,10 @@ class Embedder(Protocol):
 class SentenceTransformerEmbedder:
     """Local embedder backed by the ``sentence-transformers`` library.
 
-    Phase 5: this provider is no longer in the default install. Install
-    via ``pip install agent-knowledgebase[embed-local-st]`` to use.
-    Lazy-imports ``sentence_transformers`` inside ``__init__`` so the
-    rest of the embeddings module loads cleanly when the extra is
-    not installed.
+    Bundled in the Docker image (the ``embed-local-st`` extra is
+    installed by ``requirements.lock``). Lazy-imports
+    ``sentence_transformers`` inside ``__init__`` so the rest of the
+    embeddings module loads cleanly when the extra is not installed.
     """
 
     def __init__(self, model_name: str = "all-MiniLM-L6-v2") -> None:
@@ -305,40 +298,42 @@ class SentenceTransformerEmbedder:
 
 
 # ---------------------------------------------------------------------------
-# Remote HTTP provider (/v1/embeddings surface)
+# OpenAI HTTP provider (/v1/embeddings surface)
 # ---------------------------------------------------------------------------
 
-# Known dimensions for common remote embedding models.
-_REMOTE_EMBEDDING_DIMENSIONS: dict[str, int] = {
+# Known dimensions for common OpenAI embedding models.
+_OPENAI_EMBEDDING_DIMENSIONS: dict[str, int] = {
     "text-embedding-3-small": 1536,
     "text-embedding-3-large": 3072,
     "text-embedding-ada-002": 1536,
 }
 
 
-class RemoteEmbedder:
-    """Remote embedder that POSTs to an HTTP ``/v1/embeddings`` endpoint.
+class OpenAIEmbedder:
+    """OpenAI (or any /v1/embeddings-compatible) HTTP embedder.
 
-    Speaks the common embeddings JSON contract (``{"input": [...],
-    "model": ...}`` → ``{"data": [{"index": N, "embedding": [...]}]}``)
-    used by Ollama's ``/v1`` surface, vLLM, LocalAI, and widely-available
-    hosted APIs. Every call is wall-clock bounded by ``timeout_seconds``
-    with up to ``max_retries`` retries, so a stalled backend cannot block
-    the MCP RPC indefinitely — on timeout or connection failure, callers
-    receive an :class:`EmbedderUnavailableError` with a FIELD-14
-    structured payload.
+    Posts to ``<base_url>/embeddings`` with the OpenAI JSON shape and an
+    ``Authorization: Bearer <api_key>`` header. The ``api_key`` MUST be the
+    user's ``OPENAI_API_KEY`` (passed in by the factory). Calls are
+    wall-clock bounded by ``timeout_seconds`` with up to ``max_retries``
+    retries; transport failures surface as :class:`EmbedderUnavailableError`
+    with a structured payload.
     """
 
     def __init__(
         self,
         model_name: str,
         api_key: str,
-        base_url: str,
         *,
+        base_url: str = "https://api.openai.com/v1",
         timeout_seconds: float = 30.0,
         max_retries: int = 0,
         _client: Any | None = None,
     ) -> None:
+        if not api_key:
+            raise ValueError(
+                "OPENAI_API_KEY is required for the openai embedding provider"
+            )
         self._model_name = model_name
         self._timeout_seconds = timeout_seconds
         self._base_url = base_url.rstrip("/")
@@ -347,9 +342,7 @@ class RemoteEmbedder:
         if _client is not None:
             self._client = _client
         else:
-            headers: dict[str, str] = {}
-            if api_key:
-                headers["Authorization"] = f"Bearer {api_key}"
+            headers: dict[str, str] = {"Authorization": f"Bearer {api_key}"}
             self._client = httpx.Client(
                 timeout=timeout_seconds,
                 headers=headers,
@@ -426,14 +419,14 @@ class RemoteEmbedder:
         Resolution order:
 
         1. Cached value from a previous probe or successful embed.
-        2. Static lookup in :data:`_REMOTE_EMBEDDING_DIMENSIONS` for
-           well-known OpenAI-compatible models (avoids an HTTP call).
+        2. Static lookup in :data:`_OPENAI_EMBEDDING_DIMENSIONS` for
+           well-known OpenAI models (avoids an HTTP call).
         3. Live dry-run embed of the literal probe string ``"probe"``;
            the resulting vector's length is cached and returned.
         """
         if self._dimension_cache is not None:
             return self._dimension_cache
-        known = _REMOTE_EMBEDDING_DIMENSIONS.get(self._model_name)
+        known = _OPENAI_EMBEDDING_DIMENSIONS.get(self._model_name)
         if known is not None:
             self._dimension_cache = known
             return known
@@ -456,15 +449,13 @@ class RemoteEmbedder:
     def dimension(self) -> int:
         """Return the expected embedding dimension for the configured model.
 
-        Returns the static value from :data:`_REMOTE_EMBEDDING_DIMENSIONS`
+        Returns the static value from :data:`_OPENAI_EMBEDDING_DIMENSIONS`
         when the model is known, otherwise probes the live endpoint via
-        :meth:`probe_dimension`. The previous hardcoded 1536 fallback —
-        which silently produced dimension mismatches for any non-OpenAI
-        model — has been removed.
+        :meth:`probe_dimension`.
         """
         if self._dimension_cache is not None:
             return self._dimension_cache
-        known = _REMOTE_EMBEDDING_DIMENSIONS.get(self._model_name)
+        known = _OPENAI_EMBEDDING_DIMENSIONS.get(self._model_name)
         if known is not None:
             self._dimension_cache = known
             return known
@@ -472,32 +463,32 @@ class RemoteEmbedder:
 
     @property
     def model_name(self) -> str:
-        """Return the name of the remote embedding model."""
+        """Return the name of the OpenAI embedding model."""
         return self._model_name
 
     @property
     def embedder_version(self) -> str:
-        """Version string identifying the remote OpenAI-compat endpoint.
+        """Version string identifying the OpenAI-compat endpoint+model pair.
 
-        Includes the base_url so two RemoteEmbedders pointed at
+        Includes the base_url so two OpenAIEmbedders pointed at
         different OpenAI-compat servers (e.g. OpenAI proper vs vLLM)
         for the same nominal model are still treated as distinct
-        embedders for the Phase 5 mixed-version rejection.
+        embedders.
         """
-        return f"remote/{self._model_name}@{self._base_url}"
+        return f"openai/{self._model_name}@{self._base_url}"
 
 
 # ---------------------------------------------------------------------------
 # Ollama native provider (/api/embed)
 # ---------------------------------------------------------------------------
 
-DEFAULT_OLLAMA_BASE_URL = "http://127.0.0.1:11434"
+DEFAULT_OLLAMA_BASE_URL = "http://ollama:11434"
 
 
 class OllamaEmbedder:
     """Embedder targeting Ollama's native ``/api/embed`` endpoint.
 
-    Unlike :class:`RemoteEmbedder` (which speaks the OpenAI-compatible
+    Unlike :class:`OpenAIEmbedder` (which speaks the OpenAI
     ``/v1/embeddings`` contract and requires a ``/v1`` suffix plus a
     Bearer API key), this provider:
 
@@ -509,7 +500,7 @@ class OllamaEmbedder:
     Every call is wall-clock bounded by ``timeout_seconds`` with up to
     ``max_retries`` retries; transport failures surface as
     :class:`EmbedderUnavailableError` with the same FIELD-14 payload
-    shape used by :class:`RemoteEmbedder`.
+    shape used by :class:`OpenAIEmbedder`.
     """
 
     def __init__(
@@ -662,14 +653,13 @@ def create_embedder(config: Settings) -> Embedder:
     """Instantiate the appropriate :class:`Embedder` based on *config*.
 
     Raises:
-        ValueError: If the remote provider is selected but no API key or
-            base URL is set.
+        ValueError: If the openai provider is selected but ``OPENAI_API_KEY``
+            is not present in the environment.
     """
     return _build_embedder(
         provider=config.embedding_provider,
         model=config.embedding_model,
         base_url=config.embed_base_url,
-        api_key=config.embed_api_key,
         timeout_seconds=config.embed_timeout_seconds,
         max_retries=config.embed_max_retries,
     )
@@ -688,38 +678,26 @@ def create_embedder_for_model(
     Used at query time to guarantee the query vector is produced by the
     same embedder that originally ingested the vectorstore.
 
-    Backwards-compatible signature (Phase 4 redesign):
-
     * Old call sites pass only ``(config, model_name)`` — provider and
-      base_url default from ``config`` (unchanged Phase 0/2/3 behavior).
-    * Phase 4+ call sites that read a per-page snapshot pass
+      base_url default from ``config``.
+    * Call sites that read a per-page snapshot pass
       ``(config, model_name, provider=..., base_url=...)`` so the
-      original embedder is faithfully rebuilt even after ``Settings``
-      defaults flip in Phase 5 (e.g. an Ollama-ingested KB stays
-      queryable after the global default switches to remote/text-
-      embedding-3-small). When provider/base_url are passed explicitly,
-      they override config; the API key still comes from
-      ``config.embed_api_key`` (secrets are not stamped per-page).
-    * Phase 5 adds the optional ``version`` kwarg — purely informational
-      today. Future use: when a snapshot's stamped ``embedder_version``
-      doesn't match the embedder this factory would produce, the
-      caller (or a future version of this factory) can warn / refuse /
-      auto-switch. The current implementation accepts and ignores
-      ``version`` so test harnesses can pass it through without
-      breaking the Phase 4 contract.
+      original embedder is faithfully rebuilt. When provider/base_url
+      are passed explicitly, they override config; the OpenAI API key
+      still comes from ``OPENAI_API_KEY`` in the environment (secrets
+      are not stamped per-page).
+    * The optional ``version`` kwarg is accepted for forward-compat and
+      is purely informational today.
 
     When ``model_name`` is ``None`` or equals the configured default
     AND no overrides are supplied, the regular configured embedder is
     returned. Any explicit override forces a fresh embedder build so
     callers can target a non-default snapshot even if ``model_name``
     matches the global default.
-
-    spec_id: 70ab2170-381a-4657-bcd1-28a40c6f369b
     """
-    # ``version`` is accepted for forward-compat (Phase 5) but the
-    # current builder is deterministic from (provider, model, base_url)
-    # so we don't route on it. Keep the param so downstream callers
-    # can pass it through without TypeError.
+    # ``version`` is accepted for forward-compat but the current builder
+    # is deterministic from (provider, model, base_url) so we don't
+    # route on it.
     _ = version
     has_override = provider is not None or base_url is not None
     if not has_override and (not model_name or model_name == config.embedding_model):
@@ -731,7 +709,6 @@ def create_embedder_for_model(
         provider=effective_provider,
         model=effective_model,
         base_url=effective_base_url,
-        api_key=config.embed_api_key,
         timeout_seconds=config.embed_timeout_seconds,
         max_retries=config.embed_max_retries,
     )
@@ -742,7 +719,6 @@ def _build_embedder(
     provider: str,
     model: str,
     base_url: str | None,
-    api_key: str | None,
     timeout_seconds: float,
     max_retries: int,
 ) -> Embedder:
@@ -756,20 +732,18 @@ def _build_embedder(
             timeout_seconds=timeout_seconds,
             max_retries=max_retries,
         )
-    if provider == "remote":
+    if provider == "openai":
+        api_key = os.environ.get("OPENAI_API_KEY", "")
         if not api_key:
-            raise ValueError("AGENT_KB_EMBED_API_KEY required for remote embeddings")
-        if not base_url:
             raise ValueError(
-                "AGENT_KB_EMBED_BASE_URL required for remote embeddings "
-                "(e.g. http://localhost:11434/v1 for Ollama's OpenAI-compat endpoint)"
+                "OPENAI_API_KEY is required when AGENT_KB_EMBEDDING_PROVIDER=openai. "
+                "Set OPENAI_API_KEY in the environment (e.g. via docker-compose.override.yml)."
             )
-        return RemoteEmbedder(
+        return OpenAIEmbedder(
             model_name=model,
             api_key=api_key,
-            base_url=base_url,
+            base_url=base_url or "https://api.openai.com/v1",
             timeout_seconds=timeout_seconds,
             max_retries=max_retries,
         )
-    # Should be unreachable due to the Literal type constraint, but guard anyway.
-    raise ValueError(f"Unknown embedding provider: {provider}")
+    raise ValueError(f"Unknown embedding provider: {provider!r}")

@@ -14,7 +14,7 @@ from agent_knowledgebase.services.embeddings import (
     Embedder,
     EmbedderUnavailableError,
     OllamaEmbedder,
-    RemoteEmbedder,
+    OpenAIEmbedder,
     SentenceTransformerEmbedder,
     create_embedder,
     create_embedder_for_model,
@@ -65,7 +65,7 @@ class TestSentenceTransformerEmbedder:
 
 
 # ---------------------------------------------------------------------------
-# RemoteEmbedder — fully mocked via _client injection
+# OpenAIEmbedder — fully mocked via _client injection
 # ---------------------------------------------------------------------------
 
 
@@ -83,7 +83,7 @@ def _make_embed_response(embeddings: list[list[float]], status_code: int = 200) 
     return response
 
 
-class TestRemoteEmbedder:
+class TestOpenAIEmbedder:
     """Unit tests with a mocked httpx client injected via ``_client``."""
 
     @pytest.fixture()
@@ -92,19 +92,19 @@ class TestRemoteEmbedder:
         return MagicMock(spec=httpx.Client)
 
     @pytest.fixture()
-    def embedder(self, mock_client: MagicMock) -> RemoteEmbedder:
-        return RemoteEmbedder(
+    def embedder(self, mock_client: MagicMock) -> OpenAIEmbedder:
+        return OpenAIEmbedder(
             model_name="text-embedding-3-small",
             api_key="sk-test-key",
             base_url="https://example.invalid/v1",
             _client=mock_client,
         )
 
-    def test_dimension_text_embedding_3_small(self, embedder: RemoteEmbedder) -> None:
+    def test_dimension_text_embedding_3_small(self, embedder: OpenAIEmbedder) -> None:
         assert embedder.dimension == 1536
 
     def test_dimension_text_embedding_3_large(self) -> None:
-        emb = RemoteEmbedder(
+        emb = OpenAIEmbedder(
             model_name="text-embedding-3-large",
             api_key="sk-test",
             base_url="https://example.invalid/v1",
@@ -113,7 +113,7 @@ class TestRemoteEmbedder:
         assert emb.dimension == 3072
 
     def test_dimension_text_embedding_ada_002(self) -> None:
-        emb = RemoteEmbedder(
+        emb = OpenAIEmbedder(
             model_name="text-embedding-ada-002",
             api_key="sk-test",
             base_url="https://example.invalid/v1",
@@ -133,7 +133,7 @@ class TestRemoteEmbedder:
         """
         mock_client = MagicMock(spec=httpx.Client)
         mock_client.post.return_value = _make_embed_response([[0.0] * 4096])
-        emb = RemoteEmbedder(
+        emb = OpenAIEmbedder(
             model_name="some-future-model",
             api_key="sk-test",
             base_url="https://example.invalid/v1",
@@ -147,7 +147,7 @@ class TestRemoteEmbedder:
             json={"input": ["probe"], "model": "some-future-model"},
         )
 
-    def test_embed_calls_api(self, embedder: RemoteEmbedder) -> None:
+    def test_embed_calls_api(self, embedder: OpenAIEmbedder) -> None:
         fake_vectors = [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]]
         embedder._client.post.return_value = _make_embed_response(fake_vectors)
 
@@ -159,7 +159,7 @@ class TestRemoteEmbedder:
         )
         assert result == fake_vectors
 
-    def test_embed_query_calls_api(self, embedder: RemoteEmbedder) -> None:
+    def test_embed_query_calls_api(self, embedder: OpenAIEmbedder) -> None:
         fake_vectors = [[0.1, 0.2, 0.3]]
         embedder._client.post.return_value = _make_embed_response(fake_vectors)
 
@@ -172,7 +172,7 @@ class TestRemoteEmbedder:
         assert result == [0.1, 0.2, 0.3]
 
     def test_embed_preserves_order_when_api_returns_unsorted(
-        self, embedder: RemoteEmbedder
+        self, embedder: OpenAIEmbedder
     ) -> None:
         """Verify that results are sorted by index even if the API returns them out of order."""
         response = MagicMock(spec=httpx.Response)
@@ -193,7 +193,7 @@ class TestRemoteEmbedder:
         """A trailing slash on base_url must not produce '//embeddings'."""
         mock_client = MagicMock(spec=httpx.Client)
         mock_client.post.return_value = _make_embed_response([[0.1]])
-        emb = RemoteEmbedder(
+        emb = OpenAIEmbedder(
             model_name="m",
             api_key="k",
             base_url="https://example.invalid/v1/",
@@ -203,7 +203,7 @@ class TestRemoteEmbedder:
         called_url = mock_client.post.call_args[0][0]
         assert called_url == "https://example.invalid/v1/embeddings"
 
-    def test_satisfies_protocol(self, embedder: RemoteEmbedder) -> None:
+    def test_satisfies_protocol(self, embedder: OpenAIEmbedder) -> None:
         assert isinstance(embedder, Embedder)
 
 
@@ -212,8 +212,8 @@ class TestRemoteEmbedder:
 # ---------------------------------------------------------------------------
 
 
-class TestRemoteEmbedderTransportBounds:
-    """RemoteEmbedder must bound its HTTP calls and surface structured errors."""
+class TestOpenAIEmbedderTransportBounds:
+    """OpenAIEmbedder must bound its HTTP calls and surface structured errors."""
 
     def test_constructor_threads_timeout_and_auth_to_real_client(
         self, monkeypatch: pytest.MonkeyPatch
@@ -226,7 +226,7 @@ class TestRemoteEmbedderTransportBounds:
                 captured.update(kwargs)
 
         monkeypatch.setattr(httpx, "Client", FakeClient)
-        RemoteEmbedder(
+        OpenAIEmbedder(
             model_name="qwen3-embedding:8b",
             api_key="ollama",
             base_url="http://localhost:11434/v1",
@@ -239,31 +239,24 @@ class TestRemoteEmbedderTransportBounds:
         assert isinstance(headers, dict)
         assert headers["Authorization"] == "Bearer ollama"
 
-    def test_empty_api_key_omits_auth_header(
+    def test_empty_api_key_raises_value_error(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """An empty api_key must not send an Authorization header at all."""
-        captured: dict[str, object] = {}
-
-        class FakeClient:
-            def __init__(self, **kwargs: object) -> None:
-                captured.update(kwargs)
-
-        monkeypatch.setattr(httpx, "Client", FakeClient)
-        RemoteEmbedder(
-            model_name="m",
-            api_key="",
-            base_url="http://localhost:11434/v1",
-        )
-
-        assert captured["headers"] == {}
+        """An empty api_key must raise ValueError — OpenAI auth is required."""
+        monkeypatch.setattr(httpx, "Client", MagicMock())
+        with pytest.raises(ValueError, match="OPENAI_API_KEY"):
+            OpenAIEmbedder(
+                model_name="m",
+                api_key="",
+                base_url="http://localhost:11434/v1",
+            )
 
     def test_embed_query_converts_timeout_to_unavailable_error(self) -> None:
         """httpx.TimeoutException must become EmbedderUnavailableError."""
         mock_client = MagicMock(spec=httpx.Client)
         mock_client.post.side_effect = httpx.ReadTimeout("read timed out")
 
-        embedder = RemoteEmbedder(
+        embedder = OpenAIEmbedder(
             model_name="qwen3-embedding:8b",
             api_key="ollama",
             base_url="http://localhost:11434/v1",
@@ -285,7 +278,7 @@ class TestRemoteEmbedderTransportBounds:
         mock_client = MagicMock(spec=httpx.Client)
         mock_client.post.side_effect = httpx.ConnectError("connection refused")
 
-        embedder = RemoteEmbedder(
+        embedder = OpenAIEmbedder(
             model_name="text-embedding-3-small",
             api_key="sk-test",
             base_url="https://example.invalid/v1",
@@ -302,7 +295,7 @@ class TestRemoteEmbedderTransportBounds:
         mock_client = MagicMock(spec=httpx.Client)
         mock_client.post.side_effect = httpx.ReadTimeout("stalled")
 
-        embedder = RemoteEmbedder(
+        embedder = OpenAIEmbedder(
             model_name="qwen3-embedding:8b",
             api_key="ollama",
             base_url="http://localhost:11434/v1",
@@ -334,7 +327,7 @@ class TestRemoteEmbedderTransportBounds:
         )
         mock_client.post.return_value = response
 
-        embedder = RemoteEmbedder(
+        embedder = OpenAIEmbedder(
             model_name="text-embedding-3-small",
             api_key="sk-test",
             base_url="https://example.invalid/v1",
@@ -355,7 +348,7 @@ class TestRemoteEmbedderTransportBounds:
         )
         mock_client.post.return_value = response
 
-        embedder = RemoteEmbedder(
+        embedder = OpenAIEmbedder(
             model_name="text-embedding-3-small",
             api_key="sk-test",
             base_url="https://example.invalid/v1",
@@ -380,7 +373,7 @@ class TestRemoteEmbedderTransportBounds:
         )
         mock_client.post.return_value = response
 
-        embedder = RemoteEmbedder(
+        embedder = OpenAIEmbedder(
             model_name="text-embedding-3-small",
             api_key="sk-test",
             base_url="https://example.invalid/v1",
@@ -407,7 +400,7 @@ class TestRemoteEmbedderTransportBounds:
         )
         mock_client.post.return_value = response
 
-        embedder = RemoteEmbedder(
+        embedder = OpenAIEmbedder(
             model_name="qwen3-embedding:8b",
             api_key="ollama",
             base_url="http://localhost:11434/v1",
@@ -437,7 +430,7 @@ class TestRemoteEmbedderTransportBounds:
         )
         mock_client.post.return_value = outer_response
 
-        embedder = RemoteEmbedder(
+        embedder = OpenAIEmbedder(
             model_name="text-embedding-3-small",
             api_key="sk-test",
             base_url="https://example.invalid/v1",
@@ -455,7 +448,7 @@ class TestRemoteEmbedderTransportBounds:
         mock_client = MagicMock(spec=httpx.Client)
         mock_client.post.side_effect = ValueError("bad input")
 
-        embedder = RemoteEmbedder(
+        embedder = OpenAIEmbedder(
             model_name="text-embedding-3-small",
             api_key="sk-test",
             base_url="https://example.invalid/v1",
@@ -474,7 +467,7 @@ class TestRemoteEmbedderTransportBounds:
             good,
         ]
 
-        embedder = RemoteEmbedder(
+        embedder = OpenAIEmbedder(
             model_name="m",
             api_key="k",
             base_url="http://localhost/v1",
@@ -494,7 +487,7 @@ class TestRemoteEmbedderTransportBounds:
             httpx.ConnectError("second"),
         ]
 
-        embedder = RemoteEmbedder(
+        embedder = OpenAIEmbedder(
             model_name="m",
             api_key="k",
             base_url="http://localhost/v1",
@@ -525,52 +518,59 @@ class TestCreateEmbedder:
         embedder = create_embedder(config)
         assert isinstance(embedder, SentenceTransformerEmbedder)
 
-    def test_creates_remote_embedder(
+    def test_creates_openai_embedder(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Factory returns RemoteEmbedder when provider='remote'."""
+        """Factory returns OpenAIEmbedder when provider='openai'."""
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-test-key")
         config = Settings(
             saves_dir=tmp_path,
-            embedding_provider="remote",
+            embedding_provider="openai",
             embedding_model="text-embedding-3-small",
-            embed_api_key="sk-test-key",
             embed_base_url="https://example.invalid/v1",
         )
         monkeypatch.setattr(httpx, "Client", MagicMock())
         embedder = create_embedder(config)
-        assert isinstance(embedder, RemoteEmbedder)
+        assert isinstance(embedder, OpenAIEmbedder)
 
-    def test_remote_without_key_raises(self, tmp_path: Path) -> None:
+    def test_openai_without_key_raises(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
         config = Settings(
             saves_dir=tmp_path,
-            embedding_provider="remote",
+            embedding_provider="openai",
             embedding_model="text-embedding-3-small",
-            embed_api_key=None,
             embed_base_url="https://example.invalid/v1",
         )
-        with pytest.raises(ValueError, match="AGENT_KB_EMBED_API_KEY required"):
+        with pytest.raises(ValueError, match="OPENAI_API_KEY"):
             create_embedder(config)
 
-    def test_remote_without_base_url_raises(self, tmp_path: Path) -> None:
+    def test_openai_without_base_url_uses_default(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """When embed_base_url is unset, the OpenAI default URL is used."""
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
         config = Settings(
             saves_dir=tmp_path,
-            embedding_provider="remote",
+            embedding_provider="openai",
             embedding_model="text-embedding-3-small",
-            embed_api_key="sk-test",
             embed_base_url=None,
         )
-        with pytest.raises(ValueError, match="AGENT_KB_EMBED_BASE_URL required"):
-            create_embedder(config)
+        monkeypatch.setattr(httpx, "Client", MagicMock())
+        embedder = create_embedder(config)
+        assert isinstance(embedder, OpenAIEmbedder)
+        assert embedder._base_url == "https://api.openai.com/v1"
 
-    def test_factory_threads_base_url_and_bounds_to_remote_embedder(
+    def test_factory_threads_base_url_and_bounds_to_openai_embedder(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """create_embedder must pass base_url/timeout/max_retries from Settings."""
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
         config = Settings(
             saves_dir=tmp_path,
-            embedding_provider="remote",
-            embedding_model="qwen3-embedding:8b",
-            embed_api_key="ollama",
+            embedding_provider="openai",
+            embedding_model="text-embedding-3-small",
             embed_base_url="http://localhost:11434/v1",
             embed_timeout_seconds=5.0,
             embed_max_retries=0,
@@ -585,7 +585,7 @@ class TestCreateEmbedder:
         monkeypatch.setattr(httpx, "Client", FakeClient)
         embedder = create_embedder(config)
 
-        assert isinstance(embedder, RemoteEmbedder)
+        assert isinstance(embedder, OpenAIEmbedder)
         assert captured["timeout"] == 5.0
         # base_url is stored on the embedder, not the httpx.Client (we pass full URLs).
         assert embedder._base_url == "http://localhost:11434/v1"
@@ -747,12 +747,12 @@ class TestCreateEmbedderOllama:
     def test_ollama_does_not_require_api_key(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """The ollama provider must not fail when embed_api_key is None."""
+        """The ollama provider must not require any API key."""
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
         config = Settings(
             saves_dir=tmp_path,
             embedding_provider="ollama",
             embedding_model="qwen3-embedding:8b",
-            embed_api_key=None,
         )
         monkeypatch.setattr(httpx, "Client", MagicMock())
         embedder = create_embedder(config)

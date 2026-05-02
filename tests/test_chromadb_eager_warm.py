@@ -73,24 +73,18 @@ class TestWarmupAllChromadbKbs:
         svc = _make_service(test_config)
         kb = svc.create_kb("eager-warm-kb")
 
-        # Patch ChromadbBackend.warmup to record calls.
+        # Patch ChromadbBackend.warmup to record calls. v0.13.0 collapses
+        # the per-KB backend cache; the service exposes a single
+        # ``_backend`` attribute.
         warmup_calls: list[str] = []
+        original_warmup = getattr(svc._backend, "warmup", None)
 
-        original_backend_for = svc._backend_for
+        def _recording_warmup(wkb_id: str) -> None:
+            warmup_calls.append(wkb_id)
+            if original_warmup is not None:
+                original_warmup(wkb_id)
 
-        def _patched_backend_for(kb_id: str):  # type: ignore[return]
-            backend = original_backend_for(kb_id)
-            original_warmup = getattr(backend, "warmup", None)
-
-            def _recording_warmup(wkb_id: str) -> None:
-                warmup_calls.append(wkb_id)
-                if original_warmup is not None:
-                    original_warmup(wkb_id)
-
-            backend.warmup = _recording_warmup
-            return backend
-
-        svc._backend_for = _patched_backend_for  # type: ignore[method-assign]
+        svc._backend.warmup = _recording_warmup  # type: ignore[method-assign]
 
         result = svc.warmup_all_chromadb_kbs()
         assert kb.id in warmup_calls
@@ -111,14 +105,10 @@ class TestWarmupAllChromadbKbs:
         svc = _make_service(test_config)
         svc.create_kb("fail-warm-kb")
 
-        original_backend_for = svc._backend_for
-
-        def _patched_backend_for(kb_id: str):  # type: ignore[return]
-            backend = original_backend_for(kb_id)
-            backend.warmup = lambda wkb_id: (_ for _ in ()).throw(RuntimeError("cold load boom"))
-            return backend
-
-        svc._backend_for = _patched_backend_for  # type: ignore[method-assign]
+        # v0.13.0: single-backend service.
+        svc._backend.warmup = lambda wkb_id: (_ for _ in ()).throw(  # type: ignore[method-assign]
+            RuntimeError("cold load boom")
+        )
 
         # Should not raise.
         result = svc.warmup_all_chromadb_kbs()
@@ -299,18 +289,11 @@ class TestWarmupTimeoutCap:
         # A threading.Event that is never set — the worker will block for 60 s.
         slow_event = threading.Event()
 
-        original_backend_for = svc._backend_for
+        def _slow_warmup(wkb_id: str) -> None:
+            slow_event.wait(60)  # blocks until set or 60 s — never set in test
 
-        def _patched_backend_for(kb_id: str):  # type: ignore[return]
-            backend = original_backend_for(kb_id)
-
-            def _slow_warmup(wkb_id: str) -> None:
-                slow_event.wait(60)  # blocks until set or 60 s — never set in test
-
-            backend.warmup = _slow_warmup
-            return backend
-
-        svc._backend_for = _patched_backend_for  # type: ignore[method-assign]
+        # v0.13.0: single-backend service.
+        svc._backend.warmup = _slow_warmup  # type: ignore[method-assign]
 
         # Patch the 30 s wait() timeout down to 2 s so the test runs fast.
         import concurrent.futures as cf
