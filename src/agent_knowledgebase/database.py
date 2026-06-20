@@ -38,7 +38,8 @@ CREATE TABLE IF NOT EXISTS sources (
     metadata TEXT,
     ingested_at TEXT,
     chunk_count INTEGER DEFAULT 0,
-    status TEXT NOT NULL DEFAULT 'pending'
+    status TEXT NOT NULL DEFAULT 'pending',
+    dedup_key TEXT
 );
 
 CREATE TABLE IF NOT EXISTS wiki_pages (
@@ -136,7 +137,13 @@ class Database:
     def __init__(self, db_path: Path) -> None:
         self.db_path = db_path
         db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(str(db_path))
+        # check_same_thread=False lets a connection built on thread A be
+        # reused from thread B (e.g., the MCP tool-timeout worker thread
+        # created lazily on the first @_with_tool_timeout call).  MCP's
+        # stdio transport serialises tool calls, and the per-KB
+        # ingestion lock in KnowledgebaseService serialises writes, so
+        # only one caller uses the connection at a time.
+        self._conn = sqlite3.connect(str(db_path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
@@ -152,6 +159,88 @@ class Database:
         # FTS virtual table must be created outside executescript in some
         # SQLite builds, so we run it separately.
         cur.executescript(_FTS_SQL)
+        self._conn.commit()
+        # Additive migration: add dedup_key column to pre-existing databases
+        # that were created before this column was added to the schema DDL.
+        cols = {row[1] for row in self._conn.execute("PRAGMA table_info(sources)").fetchall()}
+        if "dedup_key" not in cols:
+            self._conn.execute("ALTER TABLE sources ADD COLUMN dedup_key TEXT")
+            self._conn.commit()
+        # v0.6.0 additive migration: the kb-pipeline-status telemetry row
+        # adds 9 new columns to `pipeline_runs`. Additive-only; running
+        # _init_schema twice is a no-op (guarded by PRAGMA column probe).
+        # Rollback SQL is documented in CHANGELOG.md.
+        run_cols = {
+            row[1] for row in self._conn.execute("PRAGMA table_info(pipeline_runs)").fetchall()
+        }
+        _PIPELINE_RUN_MIGRATION_COLUMNS: list[tuple[str, str]] = [
+            ("ended_at", "TEXT"),
+            ("ingested", "INTEGER"),
+            ("skipped", "INTEGER"),
+            ("replaced", "INTEGER"),
+            ("failed", "INTEGER"),
+            ("batch_size", "INTEGER"),
+            ("dedup_policy", "TEXT"),
+            ("request_id", "TEXT"),
+            ("tool_caller_version", "TEXT"),
+        ]
+        added_any = False
+        for col_name, col_type in _PIPELINE_RUN_MIGRATION_COLUMNS:
+            if col_name not in run_cols:
+                self._conn.execute(f"ALTER TABLE pipeline_runs ADD COLUMN {col_name} {col_type}")
+                added_any = True
+        if added_any:
+            self._conn.commit()
+        # v0.10.0 / Phase 4 additive migration: per-page provider snapshot.
+        # `chunks` table gains `embedding_provider` and `embed_base_url`
+        # columns (both nullable TEXT) so an existing v0.6.0 KB ingested
+        # under provider=ollama/base_url=http://127.0.0.1:11434 stays
+        # queryable after the Phase 5 default flip to remote/text-
+        # embedding-3-small. The snapshot is read at query time by
+        # ``create_embedder_for_model(model_name, provider=..., base_url=...)``
+        # so the original embedder is faithfully rebuilt even after the
+        # global Settings defaults move on. Strictly ALTER ADD —
+        # non-destructive; rollback SQL documented in CHANGELOG.md.
+        #
+        # v0.11.0 / Phase 5 additive migration: per-chunk
+        # ``embedder_version`` column. Stamped at ingest time by
+        # ``KnowledgebaseService._ingest_source_locked`` so a KB whose
+        # chunks were ingested under e.g. ``fastembed/MiniLM-L6-v2-int8``
+        # cannot be silently mixed with chunks ingested under
+        # ``sentence-transformers/all-MiniLM-L6-v2@hf-fp32`` — same
+        # nominal model_name, different vector geometry. The mixed-
+        # version rejection at ingest time uses
+        # :meth:`get_embedder_versions` (below); the
+        # ``AGENT_KB_AUTO_REEMBED=1`` env var is the documented
+        # bypass. Strictly ALTER ADD — non-destructive — and idempotent
+        # across re-opens. spec_id: 70ab2170-381a-4657-bcd1-28a40c6f369b
+        chunk_cols = {row[1] for row in self._conn.execute("PRAGMA table_info(chunks)").fetchall()}
+        _CHUNK_PROVIDER_SNAPSHOT_COLUMNS: list[tuple[str, str]] = [
+            ("embedding_provider", "TEXT"),
+            ("embed_base_url", "TEXT"),
+            # Phase 5 (v0.11.0):
+            ("embedder_version", "TEXT"),
+        ]
+        added_provider_snapshot = False
+        for col_name, col_type in _CHUNK_PROVIDER_SNAPSHOT_COLUMNS:
+            if col_name not in chunk_cols:
+                self._conn.execute(f"ALTER TABLE chunks ADD COLUMN {col_name} {col_type}")
+                added_provider_snapshot = True
+        if added_provider_snapshot:
+            self._conn.commit()
+        # Phase 5 (I-07) — composite index on (kb_id, embedder_version)
+        # for the per-ingest mixed-version probe in
+        # :meth:`get_embedder_versions`. The probe runs once per ingest
+        # under the per-kb_id lock; without this index a 100k-chunk KB
+        # paid a full table scan because the existing single-column
+        # ``kb_id`` filter would still need a row read for each match
+        # to fetch the embedder_version. ``IF NOT EXISTS`` keeps the
+        # migration idempotent across re-opens.
+        # spec_id: 70ab2170-381a-4657-bcd1-28a40c6f369b
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_chunks_kb_embedder_version "
+            "ON chunks (kb_id, embedder_version)"
+        )
         self._conn.commit()
 
     # ------------------------------------------------------------------
@@ -182,17 +271,13 @@ class Database:
         self._conn.commit()
 
     def get_knowledgebase(self, id: str) -> Optional[Knowledgebase]:
-        row = self._conn.execute(
-            "SELECT * FROM knowledgebases WHERE id = ?", (id,)
-        ).fetchone()
+        row = self._conn.execute("SELECT * FROM knowledgebases WHERE id = ?", (id,)).fetchone()
         if row is None:
             return None
         return self._row_to_knowledgebase(row)
 
     def list_knowledgebases(self) -> list[Knowledgebase]:
-        rows = self._conn.execute(
-            "SELECT * FROM knowledgebases ORDER BY created_at"
-        ).fetchall()
+        rows = self._conn.execute("SELECT * FROM knowledgebases ORDER BY created_at").fetchall()
         return [self._row_to_knowledgebase(r) for r in rows]
 
     def delete_knowledgebase(self, id: str) -> None:
@@ -217,8 +302,8 @@ class Database:
     def insert_source(self, source: Source) -> None:
         self._conn.execute(
             "INSERT INTO sources "
-            "(id, kb_id, source_type, uri, metadata, ingested_at, chunk_count, status) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "(id, kb_id, source_type, uri, metadata, ingested_at, chunk_count, status, dedup_key) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 source.id,
                 source.kb_id,
@@ -228,6 +313,7 @@ class Database:
                 _iso(source.ingested_at),
                 source.chunk_count,
                 source.status.value,
+                source.dedup_key,
             ),
         )
         self._conn.commit()
@@ -239,9 +325,7 @@ class Database:
         return self._row_to_source(row)
 
     def list_sources(self, kb_id: str) -> list[Source]:
-        rows = self._conn.execute(
-            "SELECT * FROM sources WHERE kb_id = ?", (kb_id,)
-        ).fetchall()
+        rows = self._conn.execute("SELECT * FROM sources WHERE kb_id = ?", (kb_id,)).fetchall()
         return [self._row_to_source(r) for r in rows]
 
     def delete_source(self, id: str) -> None:
@@ -259,7 +343,18 @@ class Database:
             ingested_at=row["ingested_at"],
             chunk_count=row["chunk_count"],
             status=row["status"],
+            dedup_key=row["dedup_key"],
         )
+
+    def find_source_by_dedup_key(self, kb_id: str, dedup_key: str) -> Optional[Source]:
+        """Return the first Source in *kb_id* whose dedup_key matches, or None."""
+        row = self._conn.execute(
+            "SELECT * FROM sources WHERE kb_id = ? AND dedup_key = ? LIMIT 1",
+            (kb_id, dedup_key),
+        ).fetchone()
+        if row is None:
+            return None
+        return self._row_to_source(row)
 
     # ------------------------------------------------------------------
     # WikiPage CRUD
@@ -302,25 +397,20 @@ class Database:
         self._conn.commit()
 
     def get_wiki_page(self, id: str) -> Optional[WikiPage]:
-        row = self._conn.execute(
-            "SELECT * FROM wiki_pages WHERE id = ?", (id,)
-        ).fetchone()
+        row = self._conn.execute("SELECT * FROM wiki_pages WHERE id = ?", (id,)).fetchone()
         if row is None:
             return None
         return self._row_to_wiki_page(row)
 
     def list_wiki_pages(self, kb_id: str) -> list[WikiPage]:
-        rows = self._conn.execute(
-            "SELECT * FROM wiki_pages WHERE kb_id = ?", (kb_id,)
-        ).fetchall()
+        rows = self._conn.execute("SELECT * FROM wiki_pages WHERE kb_id = ?", (kb_id,)).fetchall()
         return [self._row_to_wiki_page(r) for r in rows]
 
     def update_wiki_page(self, page: WikiPage) -> None:
         """Update an existing wiki page and sync FTS."""
         # Delete old FTS entry.
         self._conn.execute(
-            "DELETE FROM wiki_pages_fts WHERE rowid = "
-            "(SELECT rowid FROM wiki_pages WHERE id = ?)",
+            "DELETE FROM wiki_pages_fts WHERE rowid = (SELECT rowid FROM wiki_pages WHERE id = ?)",
             (page.id,),
         )
         # Update the page.
@@ -364,8 +454,7 @@ class Database:
     def delete_wiki_page(self, id: str) -> None:
         # Remove FTS entry.
         self._conn.execute(
-            "DELETE FROM wiki_pages_fts WHERE rowid = "
-            "(SELECT rowid FROM wiki_pages WHERE id = ?)",
+            "DELETE FROM wiki_pages_fts WHERE rowid = (SELECT rowid FROM wiki_pages WHERE id = ?)",
             (id,),
         )
         # Remove link/source associations.
@@ -428,7 +517,9 @@ class Database:
         )
         self._conn.commit()
 
-    def get_wiki_links(self, page_id: str, direction: Literal["inbound", "outbound"] = "outbound") -> list[str]:
+    def get_wiki_links(
+        self, page_id: str, direction: Literal["inbound", "outbound"] = "outbound"
+    ) -> list[str]:
         """Return linked page IDs.
 
         Parameters
@@ -479,9 +570,26 @@ class Database:
     # ------------------------------------------------------------------
 
     def insert_chunk(self, chunk: Chunk) -> None:
+        # Phase 4: stamp the per-page provider snapshot into native
+        # columns when present in chunk.metadata so the read-path's
+        # snapshot resolution (get_embedding_snapshot) sees non-NULL
+        # column values instead of having to fall back to the metadata
+        # blob. The metadata bag is left intact so older readers keep
+        # working unchanged. spec_id: 70ab2170-381a-4657-bcd1-28a40c6f369b
+        #
+        # Phase 5 (v0.11.0): also stamp ``embedder_version`` so the
+        # mixed-version rejection in
+        # ``KnowledgebaseService._ingest_source_locked`` can compare
+        # the incoming embedder against the kb's existing embedders
+        # cheaply via :meth:`get_embedder_versions`.
+        meta = chunk.metadata if isinstance(chunk.metadata, dict) else {}
+        embedding_provider = meta.get("embedding_provider")
+        embed_base_url = meta.get("embed_base_url")
+        embedder_version = meta.get("embedder_version")
         self._conn.execute(
-            "INSERT INTO chunks (id, source_id, kb_id, content, metadata, embedding_id) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO chunks (id, source_id, kb_id, content, metadata, "
+            "embedding_id, embedding_provider, embed_base_url, embedder_version) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 chunk.id,
                 chunk.source_id,
@@ -489,6 +597,9 @@ class Database:
                 chunk.content,
                 _json_dumps(chunk.metadata),
                 chunk.embedding_id,
+                embedding_provider,
+                embed_base_url,
+                embedder_version,
             ),
         )
         self._conn.commit()
@@ -527,8 +638,10 @@ class Database:
     def insert_pipeline_run(self, run: PipelineRun) -> None:
         self._conn.execute(
             "INSERT INTO pipeline_runs "
-            "(id, kb_id, source_id, phase, status, started_at, completed_at, error, metadata) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "(id, kb_id, source_id, phase, status, started_at, completed_at, error, metadata, "
+            "ended_at, ingested, skipped, replaced, failed, batch_size, dedup_policy, "
+            "request_id, tool_caller_version) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 run.id,
                 run.kb_id,
@@ -539,14 +652,21 @@ class Database:
                 _iso(run.completed_at),
                 run.error,
                 _json_dumps(run.metadata),
+                _iso(run.ended_at),
+                run.ingested,
+                run.skipped,
+                run.replaced,
+                run.failed,
+                run.batch_size,
+                run.dedup_policy,
+                run.request_id,
+                run.tool_caller_version,
             ),
         )
         self._conn.commit()
 
     def get_pipeline_run(self, id: str) -> Optional[PipelineRun]:
-        row = self._conn.execute(
-            "SELECT * FROM pipeline_runs WHERE id = ?", (id,)
-        ).fetchone()
+        row = self._conn.execute("SELECT * FROM pipeline_runs WHERE id = ?", (id,)).fetchone()
         if row is None:
             return None
         return self._row_to_pipeline_run(row)
@@ -560,8 +680,28 @@ class Database:
     def update_pipeline_run(self, run: PipelineRun) -> None:
         """Update an existing pipeline run record."""
         self._conn.execute(
-            "UPDATE pipeline_runs SET phase=?, status=?, started_at=?, completed_at=?, error=?, metadata=? WHERE id=?",
-            (run.phase.value, run.status.value, _iso(run.started_at), _iso(run.completed_at), run.error, _json_dumps(run.metadata), run.id),
+            "UPDATE pipeline_runs SET phase=?, status=?, started_at=?, completed_at=?, "
+            "error=?, metadata=?, ended_at=?, ingested=?, skipped=?, replaced=?, "
+            "failed=?, batch_size=?, dedup_policy=?, request_id=?, tool_caller_version=? "
+            "WHERE id=?",
+            (
+                run.phase.value,
+                run.status.value,
+                _iso(run.started_at),
+                _iso(run.completed_at),
+                run.error,
+                _json_dumps(run.metadata),
+                _iso(run.ended_at),
+                run.ingested,
+                run.skipped,
+                run.replaced,
+                run.failed,
+                run.batch_size,
+                run.dedup_policy,
+                run.request_id,
+                run.tool_caller_version,
+                run.id,
+            ),
         )
         self._conn.commit()
 
@@ -571,6 +711,14 @@ class Database:
 
     @staticmethod
     def _row_to_pipeline_run(row: sqlite3.Row) -> PipelineRun:
+        # The new v0.6.0 columns may not be present on rows inserted before
+        # the migration ran (sqlite3.Row access raises IndexError for absent
+        # keys). Probe the row's keys so this helper keeps working on legacy
+        # databases that haven't been re-opened through `_init_schema` yet.
+        try:
+            keys = set(row.keys())
+        except AttributeError:  # pragma: no cover — defensive for non-Row rows
+            keys = set()
         return PipelineRun(
             id=row["id"],
             kb_id=row["kb_id"],
@@ -581,6 +729,17 @@ class Database:
             completed_at=row["completed_at"],
             error=row["error"],
             metadata=_json_loads(row["metadata"]) or {},
+            ended_at=row["ended_at"] if "ended_at" in keys else None,
+            ingested=row["ingested"] if "ingested" in keys else None,
+            skipped=row["skipped"] if "skipped" in keys else None,
+            replaced=row["replaced"] if "replaced" in keys else None,
+            failed=row["failed"] if "failed" in keys else None,
+            batch_size=row["batch_size"] if "batch_size" in keys else None,
+            dedup_policy=row["dedup_policy"] if "dedup_policy" in keys else None,
+            request_id=row["request_id"] if "request_id" in keys else None,
+            tool_caller_version=(
+                row["tool_caller_version"] if "tool_caller_version" in keys else None
+            ),
         )
 
     # ------------------------------------------------------------------
@@ -614,7 +773,7 @@ class Database:
         """Update an existing source record."""
         self._conn.execute(
             "UPDATE sources SET kb_id=?, source_type=?, uri=?, metadata=?, "
-            "ingested_at=?, chunk_count=?, status=? WHERE id=?",
+            "ingested_at=?, chunk_count=?, status=?, dedup_key=? WHERE id=?",
             (
                 source.kb_id,
                 source.source_type.value,
@@ -623,6 +782,7 @@ class Database:
                 _iso(source.ingested_at),
                 source.chunk_count,
                 source.status.value,
+                source.dedup_key,
                 source.id,
             ),
         )
@@ -650,9 +810,7 @@ class Database:
             ).fetchall()
         ]
         for sid in source_ids:
-            self._conn.execute(
-                "DELETE FROM page_sources WHERE source_id = ?", (sid,)
-            )
+            self._conn.execute("DELETE FROM page_sources WHERE source_id = ?", (sid,))
         self._conn.execute("DELETE FROM sources WHERE kb_id = ?", (kb_id,))
         self._conn.commit()
 
@@ -682,9 +840,7 @@ class Database:
 
     def delete_pipeline_runs_by_source(self, source_id: str) -> None:
         """Delete all pipeline runs associated with a source."""
-        self._conn.execute(
-            "DELETE FROM pipeline_runs WHERE source_id = ?", (source_id,)
-        )
+        self._conn.execute("DELETE FROM pipeline_runs WHERE source_id = ?", (source_id,))
         self._conn.commit()
 
     def count_sources(self, kb_id: str) -> int:
@@ -700,3 +856,185 @@ class Database:
             "SELECT COUNT(*) AS cnt FROM wiki_pages WHERE kb_id = ?", (kb_id,)
         ).fetchone()
         return row["cnt"]
+
+    def count_chunks_by_embedding_model(self, kb_id: str) -> dict[str, int]:
+        """Return a mapping of embedding model name -> chunk count for *kb_id*.
+
+        Reads only the ``metadata`` JSON column from the chunks table and
+        tallies the ``"embedding_model"`` key.  Chunks whose metadata lacks
+        the key (e.g. ingested before this feature was added) are skipped.
+        """
+        rows = self._conn.execute(
+            "SELECT metadata FROM chunks WHERE kb_id = ?", (kb_id,)
+        ).fetchall()
+        counts: dict[str, int] = {}
+        for row in rows:
+            meta = _json_loads(row["metadata"])
+            if not isinstance(meta, dict):
+                continue
+            model = meta.get("embedding_model")
+            if model is None:
+                continue
+            counts[model] = counts.get(model, 0) + 1
+        return counts
+
+    # ------------------------------------------------------------------
+    # Phase 4 — per-page (per-chunk) embedding-provider snapshot
+    # ------------------------------------------------------------------
+
+    def get_embedding_snapshot(
+        self, kb_id: str
+    ) -> tuple[Optional[str], Optional[str], Optional[str]] | None:
+        """Return the *(model, provider, base_url)* snapshot for *kb_id*.
+
+        Reads the per-chunk snapshot stamped at ingest time (see Phase 4
+        spec task: "Stamp ``(embedding_provider, embed_base_url)``
+        alongside ``dominant_embedding_model`` on every page").
+
+        Resolution order, picking the dominant tuple by chunk count:
+
+        1. Native ``chunks.embedding_provider`` / ``chunks.embed_base_url``
+           columns added by the Phase 4 ALTER TABLE migration.
+        2. Fallback to ``chunks.metadata["embedding_provider"]`` /
+           ``chunks.metadata["embed_base_url"]`` so KBs ingested via the
+           metadata-bag path are still recognized.
+        3. ``chunks.metadata["embedding_model"]`` for the model name (the
+           v0.6.0 stamping path that pre-dates Phase 4).
+
+        Returns ``None`` when no chunks exist for *kb_id*. Otherwise
+        returns a 3-tuple ``(model, provider, base_url)`` where
+        ``provider`` and ``base_url`` may individually be ``None`` for
+        legacy chunks that were not backfilled.
+
+        Performance (I-01): aggregation runs SQLite-side via
+        ``json_extract`` + ``GROUP BY`` so a 100k-chunk KB pays a
+        single index pass and zero Python-side ``json.loads`` calls,
+        rather than the previous full table scan + per-row Python
+        decoding. ``COALESCE`` collapses the native-column / metadata
+        fallback into the same group key in one pass.
+        """
+        # Single-pass aggregation: group by the COALESCE-resolved
+        # (model, provider, base_url) tuple and count. ORDER BY count
+        # DESC + LIMIT 1 picks the dominant tuple without pulling all
+        # groups into Python.
+        row = self._conn.execute(
+            "SELECT "
+            "  json_extract(metadata, '$.embedding_model') AS model, "
+            "  COALESCE("
+            "    embedding_provider, "
+            "    json_extract(metadata, '$.embedding_provider')"
+            "  ) AS provider, "
+            "  COALESCE("
+            "    embed_base_url, "
+            "    json_extract(metadata, '$.embed_base_url')"
+            "  ) AS base_url, "
+            "  COUNT(*) AS cnt "
+            "FROM chunks WHERE kb_id = ? "
+            "GROUP BY model, provider, base_url "
+            "ORDER BY cnt DESC LIMIT 1",
+            (kb_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return (row["model"], row["provider"], row["base_url"])
+
+    def backfill_embedding_snapshot(
+        self,
+        *,
+        kb_id: str,
+        provider: Optional[str],
+        base_url: Optional[str],
+        embedding_model: Optional[str] = None,
+    ) -> int:
+        """Backfill ``embedding_provider`` / ``embed_base_url`` columns
+        for chunks in *kb_id* that lack them.
+
+        Used by the Phase 4 backfill script (``services/migration.py``
+        ``backfill_provider_snapshot``) to populate legacy v0.6.0 KBs
+        from each KB's ``config.json`` so the snapshot read path
+        (:meth:`get_embedding_snapshot`) returns non-None values for
+        existing rows. Strictly UPDATE — non-destructive (only sets
+        columns that are currently NULL; never overwrites a stamped
+        value).
+
+        ``embedding_model`` (I-02): when supplied, the UPDATE is
+        restricted to rows whose ``metadata.embedding_model`` matches.
+        This avoids misstamping a heterogeneous KB whose chunks were
+        ingested under MULTIPLE different embedders — without the
+        filter, the current process-wide ``Settings.embedding_provider``
+        would be stamped onto chunks that came from a different
+        embedder (e.g. stamping ``provider='remote'`` onto chunks
+        actually produced by Ollama). Callers should pass the model
+        whose ``(provider, base_url)`` they're stamping.
+
+        Returns the number of rows updated.
+        """
+        if provider is None and base_url is None:
+            return 0
+        # Only touch rows missing BOTH columns so a partially-backfilled
+        # KB stays consistent across reruns. When embedding_model is
+        # supplied, additionally restrict to rows whose stamped
+        # ``metadata.embedding_model`` matches — sqlite's json_extract
+        # handles the metadata blob server-side so we don't pay the
+        # Python-side json.loads cost per row.
+        if embedding_model is None:
+            cur = self._conn.execute(
+                "UPDATE chunks SET embedding_provider = COALESCE(embedding_provider, ?), "
+                "embed_base_url = COALESCE(embed_base_url, ?) "
+                "WHERE kb_id = ? AND (embedding_provider IS NULL OR embed_base_url IS NULL)",
+                (provider, base_url, kb_id),
+            )
+        else:
+            cur = self._conn.execute(
+                "UPDATE chunks SET embedding_provider = COALESCE(embedding_provider, ?), "
+                "embed_base_url = COALESCE(embed_base_url, ?) "
+                "WHERE kb_id = ? "
+                "AND (embedding_provider IS NULL OR embed_base_url IS NULL) "
+                "AND json_extract(metadata, '$.embedding_model') = ?",
+                (provider, base_url, kb_id, embedding_model),
+            )
+        self._conn.commit()
+        return cur.rowcount or 0
+
+    # ------------------------------------------------------------------
+    # Phase 5 — embedder_version stamping
+    # ------------------------------------------------------------------
+
+    def get_embedder_versions(self, kb_id: str) -> set[str]:
+        """Return the set of distinct ``embedder_version`` values for *kb_id*.
+
+        Used by ``KnowledgebaseService._ingest_source_locked`` to detect
+        mixed-version ingests: when a KB already carries chunks under
+        embedder version ``A`` and a new ingest would write chunks under
+        embedder version ``B`` (``A != B``), the ingest is rejected with
+        ``EMBEDDER_VERSION_MISMATCH`` unless ``AGENT_KB_AUTO_REEMBED=1``
+        is set.
+
+        The version string is opaque to this layer — the embedder
+        provides it via :attr:`Embedder.embedder_version` (Phase 5)
+        with a format like ``"fastembed/MiniLM-L6-v2-int8"`` or
+        ``"sentence-transformers/all-MiniLM-L6-v2@hf-fp32"``.
+
+        NULL values (legacy v0.6.0/v0.10.x chunks ingested before the
+        Phase 5 column existed) are silently ignored so a legacy KB
+        can still receive new ingests under whatever embedder is
+        configured today.
+
+        Resolution order, mirroring :meth:`get_embedding_snapshot`:
+
+        1. Native ``chunks.embedder_version`` column.
+        2. Fallback to ``json_extract(metadata, '$.embedder_version')``
+           so chunks stamped via the metadata-only path are still
+           recognized.
+
+        spec_id: 70ab2170-381a-4657-bcd1-28a40c6f369b
+        """
+        rows = self._conn.execute(
+            "SELECT DISTINCT COALESCE("
+            "  embedder_version, "
+            "  json_extract(metadata, '$.embedder_version')"
+            ") AS version "
+            "FROM chunks WHERE kb_id = ?",
+            (kb_id,),
+        ).fetchall()
+        return {row["version"] for row in rows if row["version"] is not None}

@@ -5,6 +5,7 @@ __pycache__/
 dist/
 build/
 .venv/
+.venv.lock
 
 # IDE
 .idea/
@@ -26,3 +27,31 @@ htmlcov/
 
 # Project
 *.db
+pipeline_mcp_data/
+docs/superpowers/
+.tmp_saves/
+
+# Per-host docker overrides (bind mounts, secrets, etc.)
+docker/docker-compose.override.yml
+
+# Per-session handoff notes (dev artifact, not a tracked doc)
+HANDOFF.md
+
+# Integration smoke run outputs
+tests/integration/fixtures/ingest_summary.json
+
+# Agent / validation runtime
+.acv/
+.claude/scheduled_tasks.lock
+.claude/settings.local.json
+
+# Build / dependency lockfiles (this is a plugin/library, not an app)
+uv.lock
+
+# Linter / type-checker caches
+.mypy_cache/
+.ruff_cache/
+.pytype/
+
+# Node (for any future JS tooling)
+node_modules/

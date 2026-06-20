@@ -20,6 +20,7 @@ from agent_knowledgebase.models import (
     SourceType,
     WikiPage,
 )
+from agent_knowledgebase.services.dedup_service import DedupPolicy
 from agent_knowledgebase.server import (
     _serialize_dataclass,
     _serialize_dataclass_list,
@@ -220,7 +221,8 @@ class TestKbIngest:
         parsed = json.loads(result)
         assert parsed["source_type"] == "file"
         mock_service.ingest_source.assert_called_once_with(
-            "kb-1", SourceType.file, "/tmp/test.txt", {}
+            "kb-1", SourceType.file, "/tmp/test.txt", {},
+            dedup_key=None, dedup_policy=DedupPolicy.skip,
         )
 
     def test_with_metadata(self, mock_service):
@@ -228,7 +230,8 @@ class TestKbIngest:
         meta = json.dumps({"lang": "python"})
         kb_ingest("kb-1", "file", "/tmp/test.py", meta)
         mock_service.ingest_source.assert_called_once_with(
-            "kb-1", SourceType.file, "/tmp/test.py", {"lang": "python"}
+            "kb-1", SourceType.file, "/tmp/test.py", {"lang": "python"},
+            dedup_key=None, dedup_policy=DedupPolicy.skip,
         )
 
     def test_invalid_source_type(self, mock_service):
@@ -389,7 +392,47 @@ class TestKbQuery:
     def test_default_top_k(self, mock_service):
         mock_service.query.return_value = []
         kb_query("kb-1", "test")
-        mock_service.query.assert_called_once_with("kb-1", "test", 10)
+        mock_service.query.assert_called_once_with("kb-1", "test", None)
+
+    def test_embedder_timeout_returns_structured_error(self, mock_service):
+        """FIELD-14: when the embedder times out, return a JSON error object
+        instead of blocking the RPC or bubbling a raw exception."""
+        from agent_knowledgebase.services.embeddings import EmbedderUnavailableError
+
+        mock_service.query.side_effect = EmbedderUnavailableError(
+            error="embed_timeout",
+            model="qwen3-embedding:8b",
+            phase="embed_query",
+            latency_ms=30_000,
+            detail="APITimeoutError",
+        )
+
+        result = kb_query("kb-1", "any query")
+        parsed = json.loads(result)
+        assert parsed == {
+            "error": "embed_timeout",
+            "model": "qwen3-embedding:8b",
+            "phase": "embed_query",
+            "latency_ms": 30_000,
+            "detail": "APITimeoutError",
+        }
+
+    def test_embedder_unreachable_returns_structured_error(self, mock_service):
+        """Connection errors (e.g. Ollama offline) surface as JSON, not exceptions."""
+        from agent_knowledgebase.services.embeddings import EmbedderUnavailableError
+
+        mock_service.query.side_effect = EmbedderUnavailableError(
+            error="embed_unreachable",
+            model="qwen3-embedding:8b",
+            phase="embed_query",
+            latency_ms=42,
+        )
+
+        result = kb_query("kb-1", "q")
+        parsed = json.loads(result)
+        assert parsed["error"] == "embed_unreachable"
+        assert parsed["model"] == "qwen3-embedding:8b"
+        assert "detail" not in parsed  # omitted when empty
 
 
 class TestKbSearch:
@@ -611,3 +654,392 @@ class TestResponseFormat:
             result = call()
             assert isinstance(result, str), f"Tool #{i} did not return str"
             json.loads(result)  # must be valid JSON
+
+
+class TestKbConfigPath:
+    def test_returns_both_paths(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from agent_knowledgebase import server as srv
+        saves = tmp_path / "saves"
+        saves.mkdir()
+        user_cfg = tmp_path / "user.json"
+        user_cfg.write_text("{}")
+        monkeypatch.setenv("AGENT_KB_SAVES_DIR", str(saves))
+        monkeypatch.setenv("AGENT_KB_USER_CONFIG", str(user_cfg))
+        monkeypatch.setenv("AGENT_KB_PROJECT_CONFIG", str(tmp_path / "proj.json"))
+        result = json.loads(srv.kb_config_path())
+        assert result["user"]["path"] == str(user_cfg)
+        assert result["user"]["exists"] is True
+        assert result["user"]["resolved_via"] == "env_override"
+        assert result["project"]["exists"] is False
+        assert result["project"]["resolved_via"] == "env_override"
+
+    def test_default_when_env_vars_unset(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """When no AGENT_KB_*_CONFIG env var is set, resolved_via is 'default'."""
+        saves = tmp_path / "saves"
+        saves.mkdir()
+        monkeypatch.setenv("AGENT_KB_SAVES_DIR", str(saves))
+        monkeypatch.delenv("AGENT_KB_USER_CONFIG", raising=False)
+        monkeypatch.delenv("AGENT_KB_PROJECT_CONFIG", raising=False)
+        from agent_knowledgebase import server as srv
+        result = json.loads(srv.kb_config_path())
+        assert result["user"]["resolved_via"] == "default"
+        assert result["project"]["resolved_via"] == "default"
+
+
+class TestKbConfigShow:
+    def _env(self, monkeypatch, tmp_path, *, user_payload=None, project_payload=None):
+        saves = tmp_path / "saves"
+        saves.mkdir()
+        user_cfg = tmp_path / "user.json"
+        proj_cfg = tmp_path / "proj.json"
+        user_cfg.write_text(json.dumps(user_payload) if user_payload is not None else "{}")
+        proj_cfg.write_text(json.dumps(project_payload) if project_payload is not None else "{}")
+        monkeypatch.setenv("AGENT_KB_SAVES_DIR", str(saves))
+        monkeypatch.setenv("AGENT_KB_USER_CONFIG", str(user_cfg))
+        monkeypatch.setenv("AGENT_KB_PROJECT_CONFIG", str(proj_cfg))
+
+    def test_show_merged(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from agent_knowledgebase import server as srv
+        self._env(
+            monkeypatch, tmp_path,
+            user_payload={"embedding": {"model": "from-user"}},
+            project_payload={"chunk": {"size": 256}},
+        )
+        result = json.loads(srv.kb_config_show("merged"))
+        assert result["values"]["embedding"]["model"] == "from-user"
+        assert result["values"]["chunk"]["size"] == 256
+        assert result["provenance"]["embedding.model"] == "user_json"
+        assert result["provenance"]["chunk.size"] == "project_json"
+        # A value no one set comes from default
+        assert result["provenance"]["embedding.provider"] == "default"
+
+    def test_show_user_only(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from agent_knowledgebase import server as srv
+        self._env(monkeypatch, tmp_path, user_payload={"embedding": {"model": "user-only"}})
+        result = json.loads(srv.kb_config_show("user"))
+        assert result == {"embedding": {"model": "user-only"}}
+
+    def test_show_env_only(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from agent_knowledgebase import server as srv
+        self._env(monkeypatch, tmp_path)
+        monkeypatch.setenv("AGENT_KB_CHUNK_SIZE", "777")
+        result = json.loads(srv.kb_config_show("env"))
+        # `chunk_size` is in env; others absent → not returned in env scope
+        assert result["chunk"]["size"] == 777
+
+    def test_show_invalid_scope(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from agent_knowledgebase import server as srv
+        self._env(monkeypatch, tmp_path)
+        with pytest.raises(ValueError, match="scope"):
+            srv.kb_config_show("bogus")
+
+    def test_show_defaults(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """defaults scope returns every field's default value, not PydanticUndefined."""
+        from agent_knowledgebase import server as srv
+        self._env(monkeypatch, tmp_path)
+        result = json.loads(srv.kb_config_show("defaults"))
+        # v0.13.0 defaults: ollama provider, qwen3-embedding:8b model.
+        assert result["embedding"]["provider"] == "ollama"
+        assert result["embedding"]["model"] == "qwen3-embedding:8b"
+        assert result["chunk"]["size"] == 512
+        assert result["chunk"]["overlap"] == 64
+        assert result["query"]["default_top_k"] == 10
+        # default_factory field (ingest.excluded_dirs)
+        assert "__pycache__" in result["ingest"]["excluded_dirs"]
+        assert ".git" in result["ingest"]["excluded_dirs"]
+        # No stringified sentinel sneaks through
+        flat_text = json.dumps(result)
+        assert "PydanticUndefined" not in flat_text
+
+
+class TestKbConfigGet:
+    def test_returns_value_and_provenance(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from agent_knowledgebase import server as srv
+        saves = tmp_path / "saves"
+        saves.mkdir()
+        user_cfg = tmp_path / "user.json"
+        user_cfg.write_text(json.dumps({"embedding": {"model": "x-from-user"}}))
+        monkeypatch.setenv("AGENT_KB_SAVES_DIR", str(saves))
+        monkeypatch.setenv("AGENT_KB_USER_CONFIG", str(user_cfg))
+        monkeypatch.setenv("AGENT_KB_PROJECT_CONFIG", str(tmp_path / "no.json"))
+        result = json.loads(srv.kb_config_get("embedding.model"))
+        assert result["key"] == "embedding.model"
+        assert result["value"] == "x-from-user"
+        assert result["provenance"] == "user_json"
+        assert result["effective_type"] == "str"
+
+    def test_unknown_key_errors(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from agent_knowledgebase import server as srv
+        saves = tmp_path / "saves"
+        saves.mkdir()
+        monkeypatch.setenv("AGENT_KB_SAVES_DIR", str(saves))
+        with pytest.raises(ValueError, match="unknown_key"):
+            srv.kb_config_get("unknown_key.path")
+
+    def test_returns_int_type(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Integer-typed fields round-trip with effective_type='int'."""
+        from agent_knowledgebase import server as srv
+        saves = tmp_path / "saves"
+        saves.mkdir()
+        monkeypatch.setenv("AGENT_KB_SAVES_DIR", str(saves))
+        # Point at nonexistent files so layered discovery sees "no override".
+        monkeypatch.setenv("AGENT_KB_USER_CONFIG", str(tmp_path / "no_user.json"))
+        monkeypatch.setenv("AGENT_KB_PROJECT_CONFIG", str(tmp_path / "no_proj.json"))
+        monkeypatch.setenv("AGENT_KB_CHUNK_SIZE", "1024")
+        result = json.loads(srv.kb_config_get("chunk.size"))
+        assert result["value"] == 1024
+        assert result["effective_type"] == "int"
+        assert result["provenance"] == "env"
+
+    def test_returns_list_type_with_default_provenance(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """List-typed field from defaults returns list with default provenance."""
+        from agent_knowledgebase import server as srv
+        saves = tmp_path / "saves"
+        saves.mkdir()
+        monkeypatch.setenv("AGENT_KB_SAVES_DIR", str(saves))
+        monkeypatch.setenv("AGENT_KB_USER_CONFIG", str(tmp_path / "no_user.json"))
+        monkeypatch.setenv("AGENT_KB_PROJECT_CONFIG", str(tmp_path / "no_proj.json"))
+        monkeypatch.delenv("AGENT_KB_INGEST_EXCLUDED_DIRS", raising=False)
+        result = json.loads(srv.kb_config_get("ingest.excluded_dirs"))
+        assert result["effective_type"] == "list"
+        assert "__pycache__" in result["value"]
+        assert result["provenance"] == "default"
+
+    def test_unknown_key_lists_valid_keys(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Error message must list valid keys so callers can recover."""
+        from agent_knowledgebase import server as srv
+        saves = tmp_path / "saves"
+        saves.mkdir()
+        monkeypatch.setenv("AGENT_KB_SAVES_DIR", str(saves))
+        with pytest.raises(ValueError) as exc:
+            srv.kb_config_get("bogus.path")
+        msg = str(exc.value)
+        # Several representative valid keys must appear in the error
+        assert "embedding.model" in msg
+        assert "chunk.size" in msg
+        assert "embedding.provider" in msg
+
+
+class TestKbConfigSet:
+    def _env(self, monkeypatch, tmp_path):
+        saves = tmp_path / "saves"
+        saves.mkdir()
+        user_cfg = tmp_path / "user.json"
+        proj_cfg = tmp_path / ".agent-kb" / "config.json"
+        monkeypatch.setenv("AGENT_KB_SAVES_DIR", str(saves))
+        monkeypatch.setenv("AGENT_KB_USER_CONFIG", str(user_cfg))
+        monkeypatch.setenv("AGENT_KB_PROJECT_CONFIG", str(proj_cfg))
+        return user_cfg, proj_cfg
+
+    def test_set_user_creates_file(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from agent_knowledgebase import server as srv
+        user_cfg, _ = self._env(monkeypatch, tmp_path)
+        assert not user_cfg.exists()
+        result = json.loads(srv.kb_config_set("user", "embedding.model", "new-model"))
+        assert user_cfg.exists()
+        on_disk = json.loads(user_cfg.read_text())
+        assert on_disk == {"embedding": {"model": "new-model"}}
+        assert result["value"] == "new-model"
+        assert result["provenance"] == "user_json"
+
+    def test_set_project_creates_dotdir(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from agent_knowledgebase import server as srv
+        _, proj_cfg = self._env(monkeypatch, tmp_path)
+        assert not proj_cfg.exists()
+        srv.kb_config_set("project", "chunk.size", 256)
+        assert proj_cfg.exists()
+        assert json.loads(proj_cfg.read_text()) == {"chunk": {"size": 256}}
+
+    def test_set_rejects_invalid_scope(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from agent_knowledgebase import server as srv
+        self._env(monkeypatch, tmp_path)
+        with pytest.raises(ValueError, match="scope"):
+            srv.kb_config_set("global", "embedding.model", "x")
+
+    def test_set_rejects_unknown_key(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from agent_knowledgebase import server as srv
+        self._env(monkeypatch, tmp_path)
+        with pytest.raises(ValueError, match="unknown"):
+            srv.kb_config_set("user", "nonsense.key", "x")
+
+    def test_set_rejects_forbidden_key(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from agent_knowledgebase import server as srv
+        self._env(monkeypatch, tmp_path)
+        # Fake forbidden — the writeable API shouldn't expose it at all,
+        # but guard anyway
+        with pytest.raises(ValueError):
+            srv.kb_config_set("user", "embed_api_key", "sk-...")
+
+    def test_set_rollback_on_validation_fail(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from agent_knowledgebase import server as srv
+        user_cfg, _ = self._env(monkeypatch, tmp_path)
+        user_cfg.parent.mkdir(parents=True, exist_ok=True)
+        user_cfg.write_text(json.dumps({"chunk": {"size": 512}}))
+        # overlap >= size → fails _validate_chunk_overlap
+        with pytest.raises(Exception):
+            srv.kb_config_set("user", "chunk.overlap", 512)
+        # File must be untouched
+        assert json.loads(user_cfg.read_text()) == {"chunk": {"size": 512}}
+        # No tmp file left behind
+        tmp = user_cfg.with_suffix(user_cfg.suffix + ".tmp")
+        assert not tmp.exists()
+
+    def test_set_succeeds_after_failed_rollback(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """After a failed-then-rolled-back set, the next valid set still works."""
+        from agent_knowledgebase import server as srv
+        user_cfg, _ = self._env(monkeypatch, tmp_path)
+        user_cfg.parent.mkdir(parents=True, exist_ok=True)
+        user_cfg.write_text(json.dumps({"chunk": {"size": 512}}))
+
+        # Attempt invalid write (overlap >= size) — must raise, leave file intact
+        with pytest.raises(Exception):
+            srv.kb_config_set("user", "chunk.overlap", 512)
+        assert json.loads(user_cfg.read_text()) == {"chunk": {"size": 512}}
+
+        # Now perform a valid write — should succeed
+        result = json.loads(srv.kb_config_set("user", "chunk.overlap", 32))
+        assert result["value"] == 32
+        on_disk = json.loads(user_cfg.read_text())
+        assert on_disk == {"chunk": {"size": 512, "overlap": 32}}
+
+        # No tmp file left
+        tmp = user_cfg.with_suffix(user_cfg.suffix + ".tmp")
+        assert not tmp.exists()
+
+
+class TestKbConfigValidate:
+    def test_both_ok(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from agent_knowledgebase import server as srv
+        saves = tmp_path / "saves"
+        saves.mkdir()
+        user_cfg = tmp_path / "user.json"
+        user_cfg.write_text(json.dumps({"embedding": {"model": "foo"}}))
+        monkeypatch.setenv("AGENT_KB_SAVES_DIR", str(saves))
+        monkeypatch.setenv("AGENT_KB_USER_CONFIG", str(user_cfg))
+        monkeypatch.setenv("AGENT_KB_PROJECT_CONFIG", str(tmp_path / "none.json"))
+        result = json.loads(srv.kb_config_validate())
+        assert result["user"]["status"] == "ok"
+        assert result["project"]["status"] == "missing"
+        assert "merged" in result
+
+    def test_error_on_malformed_file(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from agent_knowledgebase import server as srv
+        saves = tmp_path / "saves"
+        saves.mkdir()
+        bad = tmp_path / "bad.json"
+        bad.write_text("{not json")
+        monkeypatch.setenv("AGENT_KB_SAVES_DIR", str(saves))
+        monkeypatch.setenv("AGENT_KB_USER_CONFIG", str(bad))
+        monkeypatch.setenv("AGENT_KB_PROJECT_CONFIG", str(tmp_path / "none.json"))
+        result = json.loads(srv.kb_config_validate())
+        assert result["user"]["status"] == "error"
+        assert "json" in result["user"]["error"].lower() or "parse" in result["user"]["error"].lower()
+        assert "merged" not in result
+
+    def test_project_error_suppresses_merged(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Even one 'error' status must suppress the merged block."""
+        from agent_knowledgebase import server as srv
+        saves = tmp_path / "saves"
+        saves.mkdir()
+        user_cfg = tmp_path / "user.json"
+        user_cfg.write_text("{}")
+        bad_proj = tmp_path / "proj.json"
+        bad_proj.write_text("{invalid")
+        monkeypatch.setenv("AGENT_KB_SAVES_DIR", str(saves))
+        monkeypatch.setenv("AGENT_KB_USER_CONFIG", str(user_cfg))
+        monkeypatch.setenv("AGENT_KB_PROJECT_CONFIG", str(bad_proj))
+        result = json.loads(srv.kb_config_validate())
+        assert result["user"]["status"] == "ok"
+        assert result["project"]["status"] == "error"
+        assert "merged" not in result
+
+    def test_merged_error_on_cross_field_violation(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Per-file shape is valid, but cross-field validation fails at merge."""
+        from agent_knowledgebase import server as srv
+        saves = tmp_path / "saves"
+        saves.mkdir()
+        # overlap (300) >= size (256) — fails _validate_chunk_overlap on merge
+        user_cfg = tmp_path / "user.json"
+        user_cfg.write_text(json.dumps({"chunk": {"size": 256, "overlap": 300}}))
+        monkeypatch.setenv("AGENT_KB_SAVES_DIR", str(saves))
+        monkeypatch.setenv("AGENT_KB_USER_CONFIG", str(user_cfg))
+        monkeypatch.setenv("AGENT_KB_PROJECT_CONFIG", str(tmp_path / "none.json"))
+        result = json.loads(srv.kb_config_validate())
+        # Per-file shape is valid so both statuses are 'ok'/'missing'
+        assert result["user"]["status"] == "ok"
+        assert result["project"]["status"] == "missing"
+        # Merged tried, failed — merged_error present, merged absent
+        assert "merged_error" in result
+        assert "chunk_overlap" in result["merged_error"]
+        assert "merged" not in result
+
+    def test_merged_structure_has_values_and_provenance(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """When both files are ok/missing, merged includes values and provenance."""
+        from agent_knowledgebase import server as srv
+        saves = tmp_path / "saves"
+        saves.mkdir()
+        user_cfg = tmp_path / "user.json"
+        user_cfg.write_text(json.dumps({"embedding": {"model": "my-model"}}))
+        monkeypatch.setenv("AGENT_KB_SAVES_DIR", str(saves))
+        monkeypatch.setenv("AGENT_KB_USER_CONFIG", str(user_cfg))
+        monkeypatch.setenv("AGENT_KB_PROJECT_CONFIG", str(tmp_path / "none.json"))
+        result = json.loads(srv.kb_config_validate())
+        merged = result["merged"]
+        # values is a nested dict keyed by the dotted parents
+        assert merged["values"]["embedding"]["model"] == "my-model"
+        # every DOT_TO_FLAT key must appear in provenance with a classification
+        prov = merged["provenance"]
+        assert prov["embedding.model"] == "user_json"
+        assert prov["embedding.provider"] == "default"  # no override
+        # Provenance must cover every known dotted key
+        from agent_knowledgebase.config_files import DOT_TO_FLAT
+        for dotted_key in DOT_TO_FLAT:
+            assert dotted_key in prov, f"missing provenance for {dotted_key}"

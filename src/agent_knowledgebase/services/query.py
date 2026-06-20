@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from agent_knowledgebase.models import WikiPage
 from agent_knowledgebase.services.embeddings import Embedder
 from agent_knowledgebase.services.vectorstore import QueryResult, VectorStore
 from agent_knowledgebase.services.wiki import WikiManager
+
+if TYPE_CHECKING:
+    from agent_knowledgebase.config import Settings
 
 
 # ---------------------------------------------------------------------------
@@ -49,6 +53,39 @@ def _normalize_scores(results: list[SearchResult]) -> list[SearchResult]:
         result.score = (result.score - min_score) / span if span > 0 else 1.0
 
     return results
+
+
+# ---------------------------------------------------------------------------
+# Settings-derived helpers
+# ---------------------------------------------------------------------------
+
+
+def hybrid_weights_from(settings: "Settings") -> tuple[float, float, int]:
+    """Return ``(vector_weight, fts_weight, fetch_multiplier)`` from settings."""
+    return (
+        settings.query_hybrid_vector_weight,
+        settings.query_hybrid_fts_weight,
+        settings.query_hybrid_fetch_multiplier,
+    )
+
+
+def default_top_k(settings: "Settings") -> int:
+    """Return the default top-k value from settings."""
+    return settings.query_default_top_k
+
+
+# B-03: ``mmr_lambda_for`` and the matching ``Settings.query_mmr_lambda_*``
+# fields were deleted in v0.11.0 follow-up. Nothing in
+# :class:`QueryOrchestrator` actually invokes MMR re-ranking — the chunk
+# path uses raw cosine + FTS rank — so shipping the helper + config knobs
+# without the rerank pass was unimplemented surface. The
+# ``test_fastembed_recall_parity`` Jaccard@10 ≥ 0.95 result demonstrates
+# fastembed-int8 and ST-fp32 already produce nearly-identical neighbour
+# sets, removing the empirical motivation for fastembed-specific MMR
+# tuning. If a future version of the orchestrator wires MMR into the
+# query path, the helper can be re-introduced alongside the actual
+# rerank logic.
+# spec_id: 70ab2170-381a-4657-bcd1-28a40c6f369b
 
 
 # ---------------------------------------------------------------------------
@@ -150,6 +187,7 @@ class QueryOrchestrator:
         top_k: int = 10,
         vector_weight: float = 0.7,
         fts_weight: float = 0.3,
+        fetch_multiplier: int = 2,
     ) -> list[SearchResult]:
         """Combined semantic + keyword search.
 
@@ -160,7 +198,7 @@ class QueryOrchestrator:
         5. Return *top_k* results sorted by combined score (descending).
         """
         # Over-fetch to get better merge candidates.
-        fetch_k = top_k * 2
+        fetch_k = top_k * fetch_multiplier
 
         vector_results = self.query(text, kb_id, top_k=fetch_k)
         fts_results = self.search(text, kb_id, top_k=fetch_k)

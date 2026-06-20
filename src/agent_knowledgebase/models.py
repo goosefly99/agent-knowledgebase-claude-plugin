@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 from typing import Optional
 from uuid import uuid4
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, computed_field
 
 
 # ---------------------------------------------------------------------------
@@ -93,6 +93,14 @@ class Knowledgebase(BaseModel):
     source_count: int = Field(default=0, description="Computed — not stored in DB")
     page_count: int = Field(default=0, description="Computed — not stored in DB")
     config: dict = Field(default_factory=dict)
+    dominant_embedding_model: Optional[str] = Field(
+        default=None,
+        description="Populated by kb_info from chunk metadata; not persisted.",
+    )
+    embedding_model_counts: dict[str, int] = Field(
+        default_factory=dict,
+        description="Populated by kb_info from chunk metadata; not persisted.",
+    )
 
 
 class Source(BaseModel):
@@ -106,6 +114,12 @@ class Source(BaseModel):
     ingested_at: Optional[datetime] = None
     chunk_count: int = 0
     status: SourceStatus = SourceStatus.pending
+    dedup_key: Optional[str] = None
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def source_id(self) -> str:
+        return self.id
 
 
 class WikiPage(BaseModel):
@@ -122,6 +136,38 @@ class WikiPage(BaseModel):
     updated_at: datetime = Field(default_factory=_utcnow)
     inbound_links: list[str] = Field(default_factory=list)
     outbound_links: list[str] = Field(default_factory=list)
+    source_type: Optional[str] = Field(
+        default=None,
+        description=(
+            "Denormalized from page.source_ids[0] (first entry in list order, not "
+            "chronological). Populated by KnowledgebaseService.list_pages only — "
+            "get_page, direct model construction, and direct DB reads leave this None. "
+            "Not persisted on the wiki_pages table."
+        ),
+    )
+    uri: Optional[str] = Field(
+        default=None,
+        description=(
+            "Denormalized from page.source_ids[0] (first entry in list order, not "
+            "chronological). Populated by KnowledgebaseService.list_pages only — "
+            "get_page, direct model construction, and direct DB reads leave this None. "
+            "Not persisted on the wiki_pages table."
+        ),
+    )
+    dedup_key: Optional[str] = Field(
+        default=None,
+        description=(
+            "Denormalized from page.source_ids[0] (first entry in list order, not "
+            "chronological). Populated by KnowledgebaseService.list_pages only — "
+            "get_page, direct model construction, and direct DB reads leave this None. "
+            "Not persisted on the wiki_pages table."
+        ),
+    )
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def page_id(self) -> str:
+        return self.id
 
 
 class Chunk(BaseModel):
@@ -136,7 +182,14 @@ class Chunk(BaseModel):
 
 
 class PipelineRun(BaseModel):
-    """A single pipeline execution record."""
+    """A single pipeline execution record.
+
+    The v0.6.0 kb-pipeline-status telemetry row adds 9 additive fields
+    carried through from :class:`KnowledgebaseService` to the
+    ``kb_pipeline_status`` MCP tool's JSON response. All are ``Optional``
+    with ``None`` default so existing rows (ingested before the schema
+    migration ran) remain readable unchanged.
+    """
 
     id: str = Field(default_factory=_uuid)
     kb_id: str
@@ -147,3 +200,13 @@ class PipelineRun(BaseModel):
     completed_at: Optional[datetime] = None
     error: Optional[str] = None
     metadata: dict = Field(default_factory=dict)
+    # v0.6.0 telemetry row additions (all additive / optional):
+    ended_at: Optional[datetime] = None
+    ingested: Optional[int] = None
+    skipped: Optional[int] = None
+    replaced: Optional[int] = None
+    failed: Optional[int] = None
+    batch_size: Optional[int] = None
+    dedup_policy: Optional[str] = None
+    request_id: Optional[str] = None
+    tool_caller_version: Optional[str] = None

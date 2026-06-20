@@ -42,12 +42,12 @@
 
 ## Task 3: Embedding Provider Abstraction
 
-**Goal:** Implement the embeddings service with SentenceTransformer (default) and OpenAI providers behind a common interface.
+**Goal:** Implement the embeddings service with SentenceTransformer (default) and a remote HTTP provider (any server speaking the ``/v1/embeddings`` JSON contract) behind a common interface.
 
 **Files to create:**
 - `src/agent_knowledgebase/services/__init__.py`
-- `src/agent_knowledgebase/services/embeddings.py` — `Embedder` protocol, `SentenceTransformerEmbedder`, `OpenAIEmbedder`, `create_embedder()` factory
-- `tests/test_embeddings.py` — test both providers (mock OpenAI, real sentence-transformers with small model)
+- `src/agent_knowledgebase/services/embeddings.py` — `Embedder` protocol, `SentenceTransformerEmbedder`, `RemoteEmbedder` (httpx-based), `create_embedder()` factory
+- `tests/test_embeddings.py` — test both providers (mock httpx for remote, real sentence-transformers with small model)
 
 **Verification:** `uv run pytest tests/test_embeddings.py` passes.
 

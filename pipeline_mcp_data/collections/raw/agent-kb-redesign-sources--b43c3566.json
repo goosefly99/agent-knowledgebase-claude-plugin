@@ -1,0 +1,265 @@
+{
+  "collection_id": "agent-kb-redesign-sources--b43c3566",
+  "created_date": "2026-04-24T21:25:01.501Z",
+  "status": "raw",
+  "source_runs": [
+    {
+      "source_type": "local_ingest",
+      "path": "C:\\Users\\olive\\claude_projects\\coding\\agent_tools_dev\\data_etl_orchestrator_dev\\agent_knowledge_base_plugin_dev\\pipeline_mcp_data\\ingest_staging\\agent-kb-research.json",
+      "executed_at": "2026-04-24T21:25:01.501Z",
+      "items_found": 9,
+      "items_stored": 9
+    }
+  ],
+  "items": [
+    {
+      "id": "local_agent-kb-research_yt-QHlB-RJfx8w",
+      "source_type": "local_ingest",
+      "source_ref": "file:C:\\Users\\olive\\claude_projects\\coding\\agent_tools_dev\\data_etl_orchestrator_dev\\agent_knowledge_base_plugin_dev\\pipeline_mcp_data\\ingest_staging\\agent-kb-research.json",
+      "title": "The death of RAG has been greatly exaggerated — LightRAG + Graph RAG for Claude Code in 2026",
+      "content": "{\n  \"id\": \"yt-QHlB-RJfx8w\",\n  \"title\": \"The death of RAG has been greatly exaggerated — LightRAG + Graph RAG for Claude Code in 2026\",\n  \"source_type\": \"youtube_transcript\",\n  \"url\": \"https://youtube.com/watch?v=QHlB-RJfx8w\",\n  \"tags\": [\n    \"rag\",\n    \"graph-rag\",\n    \"lightrag\",\n    \"claude-code\",\n    \"vector-db\",\n    \"knowledge-graph\",\n    \"embeddings\",\n    \"ollama\",\n    \"openai\",\n    \"docker\",\n    \"skills\"\n  ],\n  \"author\": \"ClaudeCode Masterclass channel\",\n  \"date\": \"2026-04-13\",\n  \"content\": \"KEY IDEA: Even with 1M+ context windows (Opus 4.6), RAG is still essential at 500–2000+ pages — cheaper and faster than agent-GP (grep-style) search. But NAIVE RAG is dead: pure Pinecone/Supabase 'chunk → embed → cosine' no longer cuts it. What works in 2026 is GRAPH RAG / HYBRID RAG / AGENTIC RAG.\\n\\nHOW RAG BASELINE WORKS: (1) document → chunked; (2) each chunk → embedding model → vector in 1000s-dim space; (3) query → same embedding model → vector; (4) cosine similarity retrieves closest chunks; (5) augment prompt; (6) generate. This is naive RAG. It fails to capture relationships between concepts.\\n\\nGRAPH RAG (LightRAG): Same chunking + vector store, BUT also build a knowledge graph in parallel — entities = nodes, relationships between entities = edges with text descriptions. Example: chunk 'Anthropic created Claude Code' becomes two entities (Anthropic, Claude Code) + one edge (created). Query retrieval does vector lookup AND traverses the knowledge graph, so you can ask 'how do theories X and Y relate' instead of just 'what says warships'.\\n\\nLIGHTRAG: Open-source repo, competes with Microsoft GraphRAG at a small percentage of the cost. Dockerized (Docker Desktop + docker compose). Web UI at localhost:9621. Supports OpenAI text-embedding-3-large embeddings OR fully local Ollama. Exposes REST API — each endpoint becomes a Claude Code skill. Four main skills: query, upload, explore, status.\\n\\nCLAUDE CODE INTEGRATION: Each LightRAG API endpoint → one skill file. Skills use a standard schema (description, parameters, call pattern). Claude Code summarizes the raw JSON response from LightRAG and cites references.\\n\\nCOST AT SCALE: Study showed RAG ~1250x cheaper than textual-LLM at large corpus sizes (Gemini 2.0, July 2025 — ratio has narrowed but RAG is still cheaper at 500+ page scale). Break-even point: ~2000 text pages / ~1M tokens worth of corpus.\\n\\nDEPLOYMENT OPTIONS: Local (fully inside one Docker container with local storage), semi-local (Docker + remote embeddings), or cloud (Postgres-backed LightRAG on Neon / managed Postgres).\\n\\nDIRECT IMPLICATIONS FOR agent-knowledgebase PLUGIN:\\n- Current naive-RAG chromadb-only stack is out of date; consider adding graph layer (entity + relationship extraction) OR admit naive-RAG scope and just make it work.\\n- Embedding model choice matters: text-embedding-3-large is the modern OpenAI default; local default all-MiniLM-L6-v2 is fine for semantic proximity but doesn't give dimension matching with remote models.\\n- Document chunking is the biggest source of silent retrieval failure. Consider fixed-size + overlap (already in config) but also consider semantic chunking.\\n- Consider offering a 'skill-based' CRUD interface (upload / query / explore / status) as a first-class plugin surface, in addition to raw MCP tools.\"\n}",
+      "url": "https://youtube.com/watch?v=QHlB-RJfx8w",
+      "date": "2026-04-13T00:00:00.000Z",
+      "tags": [
+        "rag",
+        "graph-rag",
+        "lightrag",
+        "claude-code",
+        "vector-db",
+        "knowledge-graph",
+        "embeddings",
+        "ollama",
+        "openai",
+        "docker",
+        "skills"
+      ],
+      "metadata": {
+        "file_type": "json",
+        "file_size": 28517,
+        "json_split": true,
+        "json_array_key": "items",
+        "item_index": 0,
+        "author": "ClaudeCode Masterclass channel"
+      }
+    },
+    {
+      "id": "local_agent-kb-research_yt-pIoKdpsuODg",
+      "source_type": "local_ingest",
+      "source_ref": "file:C:\\Users\\olive\\claude_projects\\coding\\agent_tools_dev\\data_etl_orchestrator_dev\\agent_knowledge_base_plugin_dev\\pipeline_mcp_data\\ingest_staging\\agent-kb-research.json",
+      "title": "The 4 Design Patterns Behind Every AI Agent — Tool Use, RAG, Planning, Multi-Agent",
+      "content": "{\n  \"id\": \"yt-pIoKdpsuODg\",\n  \"title\": \"The 4 Design Patterns Behind Every AI Agent — Tool Use, RAG, Planning, Multi-Agent\",\n  \"source_type\": \"youtube_transcript\",\n  \"url\": \"https://youtube.com/watch?v=pIoKdpsuODg\",\n  \"tags\": [\n    \"ai-agent-patterns\",\n    \"rag\",\n    \"tool-use\",\n    \"planning\",\n    \"multi-agent\",\n    \"claude-code\",\n    \"architecture\"\n  ],\n  \"author\": \"Tech Whistle\",\n  \"date\": \"2026-04-13\",\n  \"content\": \"FOUR FUNDAMENTAL AI-AGENT DESIGN PATTERNS (Andrew Ng): (1) Tool use; (2) RAG; (3) Planning; (4) Multi-agent. Every real agent is some combination of these four.\\n\\nPATTERN 1 — TOOL USE: LLM generates a structured request (JSON), calling code executes the tool and returns the result. LLM never runs the tool itself — that is the safety boundary. Claude Code file edits, ChatGPT browsing, Copilot running tests — all tool use. 87% of IT leaders rank tool interoperability as critical for AI adoption.\\n\\nPATTERN 2 — RAG: Gives the agent memory. Three steps: retrieve (similarity search over chunks/vectors) → augment (inject into prompt) → generate (LLM reads context and answers). Claude Code reading CLAUDE.md = RAG. GitHub Copilot repo indexing = RAG. Key: RAG is a REACTIVE pattern — agent only responds when asked.\\n\\nPATTERN 3 — PLANNING: Three phases — decompose (goal → steps), execute (run each step via tool use), reflect (check result, replan on failure). 'Add authentication to my app' → Claude Code identifies patterns, creates ~10 steps, executes and adjusts. Planning composes with tool use + RAG: can use RAG to gather context before planning, tool use to execute each step.\\n\\nPATTERN 4 — MULTI-AGENT: Team of specialized agents (researcher, analyst, writer, manager) each with own tools, knowledge, role. Single agent hits context-window ceiling + bloated instructions + tool conflicts. Solution: split responsibilities like microservices. Multi-agent is really patterns 1–3 composed: each agent uses tool use, some use RAG, the manager uses planning.\\n\\nWHICH PATTERN TO USE: External systems (APIs/DBs/files) → tool use. Knowledge not in training data (docs/code/data) → RAG. Multi-step tasks → planning. Too complex for one agent → multi-agent. You almost never use just one — Claude Code uses three (tool use + RAG + planning), Devin uses all four.\\n\\nDIRECT IMPLICATIONS FOR agent-knowledgebase PLUGIN: The plugin exposes only RAG-style tools (kb_query, kb_search, kb_ingest_*). It should be designed so consuming agents compose it with their own planning / tool-use / multi-agent loops — i.e. the plugin's tool surface should be fast, stateless per-call, return structured JSON, and NOT try to be an agent itself. Consumer agents will orchestrate.\"\n}",
+      "url": "https://youtube.com/watch?v=pIoKdpsuODg",
+      "date": "2026-04-13T00:00:00.000Z",
+      "tags": [
+        "ai-agent-patterns",
+        "rag",
+        "tool-use",
+        "planning",
+        "multi-agent",
+        "claude-code",
+        "architecture"
+      ],
+      "metadata": {
+        "file_type": "json",
+        "file_size": 28517,
+        "json_split": true,
+        "json_array_key": "items",
+        "item_index": 1,
+        "author": "Tech Whistle"
+      }
+    },
+    {
+      "id": "local_agent-kb-research_yt-Ek0tZootK00",
+      "source_type": "local_ingest",
+      "source_ref": "file:C:\\Users\\olive\\claude_projects\\coding\\agent_tools_dev\\data_etl_orchestrator_dev\\agent_knowledge_base_plugin_dev\\pipeline_mcp_data\\ingest_staging\\agent-kb-research.json",
+      "title": "ReFrag (Meta Super Intelligence Labs) — Precomputed embeddings during inference, 31× faster TTFT",
+      "content": "{\n  \"id\": \"yt-Ek0tZootK00\",\n  \"title\": \"ReFrag (Meta Super Intelligence Labs) — Precomputed embeddings during inference, 31× faster TTFT\",\n  \"source_type\": \"youtube_transcript\",\n  \"url\": \"https://youtube.com/watch?v=Ek0tZootK00\",\n  \"tags\": [\n    \"refrag\",\n    \"meta\",\n    \"embeddings\",\n    \"long-context\",\n    \"rag\",\n    \"compression\",\n    \"vector-db\",\n    \"colbert\",\n    \"late-interaction\",\n    \"mmr\",\n    \"diversity\",\n    \"inference\"\n  ],\n  \"author\": \"Weaviate (Connor Shorten)\",\n  \"date\": \"2026-04-11\",\n  \"content\": \"REFRAG (Representation for RAG): Instead of throwing away the retrieved chunk's vector after retrieval, use it directly in LLM inference. Gains: 31× faster TTFT, 3× iterative-token speed, 7× throughput over LLaMA-2 7B.\\n\\nARCHITECTURE: (1) Chunk vector DB into ~256-token chunks (standard). (2) Each 256-token chunk is further split into fine-grained sub-chunks (e.g. 16×16-token sub-chunks). (3) Each sub-chunk is compressed to ONE embedding vector. (4) An RL-trained policy network (GRPO+PPO) decides which sub-chunks to SELECTIVELY EXPAND back into full token vectors — the rest stay as single compressed vectors. (5) Query token vectors + expanded sub-chunks + compressed sub-chunks all feed into the decoder.\\n\\nWHY SO MUCH FASTER: Prefill is O(N²) attention. Compressing 16K input tokens to ~1000 chunk embeddings → 256× fewer FLOPs in prefill, smaller KV cache, faster decode.\\n\\nTRAINING: 4-stage pipeline — (a) reconstruction: freeze decoder, train encoder + projection layer to reconstruct context from chunk embeddings (aligns encoder's latent space with decoder's); (b) continual pre-training: unfreeze decoder, curriculum-learning next-paragraph prediction; (c) RL selective-expansion policy with GRPO+PPO using negative-perplexity reward; (d) end-to-end fine-tune on downstream QA/summarization.\\n\\nABLATIONS: Curriculum learning is CRITICAL. Reconstruction (encoder-decoder latent-space alignment) is CRITICAL. The RL selective-expansion policy is not dramatically better than perplexity-based or even random expansion — so the complexity may not always be worth it.\\n\\nDIVERSITY IN SEARCH RESULTS is the other big theme: not just top-K similar results, but MMR (Maximal Marginal Relevance), vector clustering, symbolic filters (metadata), multi-collection retrieval (query spanning papers + blogs + code). FreshStack benchmark measures 'nugget coverage' — how many distinct knowledge units the retrieved set covers, not just relevance.\\n\\nMULTI-VECTOR PATTERN: The vector-database usage pattern has evolved: (a) single collection, billions of vectors; (b) multi-tenant (million tenants per schema); (c) NEW: MANY vectors per object (one object → 1 dense vector + N sub-chunk vectors + 256 token vectors for Colbert late-interaction). Weaviate named-vectors, Colbert late-interaction, Matryoshka representations, rotational quantization all enable this.\\n\\nDIRECT IMPLICATIONS FOR agent-knowledgebase PLUGIN:\\n- Current schema: one page → one chunk vector. Consider allowing N vectors per page (title vector + body vector + summary vector) to enable diversity filtering.\\n- Add MMR option to query: rerank top-K-vector-multiplier with MMR for coverage rather than only relevance.\\n- Symbolic filters (metadata.tags, metadata.source_type, metadata.date_range) + vector search = the production pattern.\\n- For long corpora, chunk-level summaries ('knowledge nuggets') stored alongside the chunk enables better retrieval quality without ReFrag-level training complexity.\"\n}",
+      "url": "https://youtube.com/watch?v=Ek0tZootK00",
+      "date": "2026-04-11T00:00:00.000Z",
+      "tags": [
+        "refrag",
+        "meta",
+        "embeddings",
+        "long-context",
+        "rag",
+        "compression",
+        "vector-db",
+        "colbert",
+        "late-interaction",
+        "mmr",
+        "diversity",
+        "inference"
+      ],
+      "metadata": {
+        "file_type": "json",
+        "file_size": 28517,
+        "json_split": true,
+        "json_array_key": "items",
+        "item_index": 2,
+        "author": "Weaviate (Connor Shorten)"
+      }
+    },
+    {
+      "id": "local_agent-kb-research_yt-sboNwYmH3AY",
+      "source_type": "local_ingest",
+      "source_ref": "file:C:\\Users\\olive\\claude_projects\\coding\\agent_tools_dev\\data_etl_orchestrator_dev\\agent_knowledge_base_plugin_dev\\pipeline_mcp_data\\ingest_staging\\agent-kb-research.json",
+      "title": "Karpathy's LLM Wiki — Markdown-based knowledge base with LLM-maintained index, no vector DB required",
+      "content": "{\n  \"id\": \"yt-sboNwYmH3AY\",\n  \"title\": \"Karpathy's LLM Wiki — Markdown-based knowledge base with LLM-maintained index, no vector DB required\",\n  \"source_type\": \"youtube_transcript\",\n  \"url\": \"https://youtube.com/watch?v=sboNwYmH3AY\",\n  \"tags\": [\n    \"karpathy\",\n    \"llm-wiki\",\n    \"markdown\",\n    \"obsidian\",\n    \"knowledge-base\",\n    \"claude-code\",\n    \"index\",\n    \"no-embeddings\",\n    \"hot-cache\",\n    \"lint\",\n    \"backlinks\",\n    \"second-brain\"\n  ],\n  \"author\": \"Nate (uPAI)\",\n  \"date\": \"2026-04-11\",\n  \"content\": \"CORE INSIGHT (Andrej Karpathy): 'I thought I had to reach for fancy RAG, but the LLM has been pretty good about auto-maintaining index files and brief summaries of all documents and it reads all the important related data fairly easily at this small scale.' — At 100s of articles / ~500K words, a plain markdown wiki with an LLM-maintained index outperforms a vector DB for retrieval QUALITY because the LLM follows EXPLICIT LINKS rather than COSINE SIMILARITY.\\n\\nSTRUCTURE: A single vault directory containing:\\n  raw/              — ingested source documents (PDFs, articles, transcripts)\\n  wiki/             — LLM-generated wiki pages, one per entity/concept\\n    index.md        — flat index of every wiki page, organized by category (tools, techniques, concepts, people, sources, comparisons)\\n    hot.md          — ~500-char 'hot cache' of most-recent context (skips wiki crawl when irrelevant)\\n    log.md          — operation history (what was ingested, when, by whom)\\n    <subdir>/       — optional category subdirs (concepts, entities, analysis, sources)\\n  CLAUDE.md         — project rules: when to read wiki, when to skip, how to write new pages, how to lint\\n\\nINGEST FLOW: (1) Drop a source (PDF/article/transcript) into raw/. (2) Prompt: 'Ingest X into the wiki.' (3) LLM reads, identifies entities + concepts + relationships, writes 5–25 wiki pages each linking to related pages via [[wikilinks]]. (4) Updates index.md with new entries under appropriate category. (5) Appends log.md entry. Takes ~10 min per article, ~14 min for 36 YouTube transcripts.\\n\\nQUERY FLOW: (1) User asks a question via Claude Code. (2) Claude reads CLAUDE.md (knows the project). (3) Claude reads index.md to find relevant pages. (4) Claude follows [[backlinks]] to related pages. (5) Answers with citations. ONE user reported 95% token-usage reduction vs. loading all context files directly.\\n\\nVS. VECTOR-DB RAG: Wiki wins on relationship understanding (explicit links > cosine similarity), infrastructure (0 — just markdown files), cost (~0 except LLM tokens), maintenance (periodic 'lint'). Vector RAG wins on scale (millions of docs) and true semantic-similarity-without-explicit-link recall.\\n\\nLINT: Karpathy runs periodic LLM 'health checks' over the wiki: find inconsistent data, impute missing data with web search, find interesting connections for new-article candidates, detect unreachable pages.\\n\\nWHEN TO USE WIKI-STYLE VS. VECTOR RAG:\\n  Wiki-style — 100s of pages, ~500K–1M words, single domain, consumption via an LLM agent.\\n  Vector RAG — 1000+ docs, true 'semantic fuzzy match' required, multi-user/multi-tenant, latency-sensitive lookup.\\n  BOTH — when you want backup retrieval quality: wiki for relationship questions, vector for 'what's similar to X' questions.\\n\\nCLAUDE CODE AS RUNTIME: The entire wiki is read/written by Claude Code reading the filesystem. No server, no embedding, no DB. Plays naturally with version control (git).\\n\\nDIRECT IMPLICATIONS FOR agent-knowledgebase PLUGIN — this is the BIGGEST SIGNAL in the research:\\n- The CURRENT agent-knowledgebase plugin architecture (chromadb + sentence-transformers + SQLite per-KB) is MASSIVELY over-engineered for the small-scale personal-KB use case it actually serves.\\n- Simpler alternative: the plugin could ship a mode where each KB is a directory of markdown files + an LLM-maintained index.md. No embeddings. No vector store. Just file-reading tools.\\n- This directly solves BOTH problems in the requirement: (a) embeddings don't need to work because they're not needed; (b) no uv required because no Python runtime is needed at all — Claude Code itself reads the markdown files.\\n- If we keep Python MCP server mode (for batch ingest / de-dup / SQL-source import), it becomes a THIN layer that populates the markdown wiki rather than a heavy vector pipeline.\"\n}",
+      "url": "https://youtube.com/watch?v=sboNwYmH3AY",
+      "date": "2026-04-11T00:00:00.000Z",
+      "tags": [
+        "karpathy",
+        "llm-wiki",
+        "markdown",
+        "obsidian",
+        "knowledge-base",
+        "claude-code",
+        "index",
+        "no-embeddings",
+        "hot-cache",
+        "lint",
+        "backlinks",
+        "second-brain"
+      ],
+      "metadata": {
+        "file_type": "json",
+        "file_size": 28517,
+        "json_split": true,
+        "json_array_key": "items",
+        "item_index": 3,
+        "author": "Nate (uPAI)"
+      }
+    },
+    {
+      "id": "local_agent-kb-research_yt-Cyv-dgv80kE",
+      "source_type": "local_ingest",
+      "source_ref": "file:C:\\Users\\olive\\claude_projects\\coding\\agent_tools_dev\\data_etl_orchestrator_dev\\agent_knowledge_base_plugin_dev\\pipeline_mcp_data\\ingest_staging\\agent-kb-research.json",
+      "title": "LangChain AI Engineer's Guide — fundamentals of chains, agents, RAG (large transcript summary)",
+      "content": "{\n  \"id\": \"yt-Cyv-dgv80kE\",\n  \"title\": \"LangChain AI Engineer's Guide — fundamentals of chains, agents, RAG (large transcript summary)\",\n  \"source_type\": \"youtube_transcript_summary\",\n  \"url\": \"https://youtube.com/watch?v=Cyv-dgv80kE\",\n  \"tags\": [\n    \"langchain\",\n    \"langgraph\",\n    \"rag\",\n    \"chains\",\n    \"agents\",\n    \"framework\",\n    \"educational\"\n  ],\n  \"author\": \"AI Engineer course\",\n  \"date\": \"2026-04-11\",\n  \"content\": \"Large (243KB) 4-chapter course on LangChain/LangGraph. Key concepts relevant to agent-knowledgebase redesign:\\n- LangChain Expression Language (LCEL) treats chains as composable pipelines: retriever | prompt | LLM | parser.\\n- Retrievers are a first-class abstraction in LangChain with a consistent interface (invoke(query) -> List[Document]); any backend (Chroma, FAISS, Pinecone, custom) slots in.\\n- Document schema: page_content + metadata dict. Used by retrievers, text splitters, vector stores.\\n- Text splitters hierarchy: CharacterTextSplitter (naive) → RecursiveCharacterTextSplitter (respects paragraph/sentence boundaries) → MarkdownHeaderTextSplitter (structure-aware) → SemanticChunker (embedding-based boundary detection).\\n- MultiQueryRetriever / SelfQueryRetriever / ParentDocumentRetriever — advanced retrieval patterns: MultiQuery paraphrases the query N times, SelfQuery extracts metadata filters from natural language, ParentDocument retrieves a small chunk but returns its parent document to the LLM.\\n- Reranking (Cohere Rerank, BGE-Reranker) applied to top-K-vector-multiplier is the 2026 standard pattern.\\n- LangGraph: state-machine agent framework — each node is a function, edges define transitions. Replaces AgentExecutor for complex agents.\\n\\nDIRECT IMPLICATIONS FOR agent-knowledgebase PLUGIN:\\n- Retriever abstraction layer: current codebase has QueryOrchestrator — consider making it pluggable so the vector backend is swappable (chromadb → in-memory → LightRAG → markdown-wiki) WITHOUT changing the MCP tool surface.\\n- Adopt Markdown-header-aware splitter as default for markdown sources (one of the documented source_types).\\n- Add optional reranking pass (BGE-Reranker-v2 runs fully local and is small).\"\n}",
+      "url": "https://youtube.com/watch?v=Cyv-dgv80kE",
+      "date": "2026-04-11T00:00:00.000Z",
+      "tags": [
+        "langchain",
+        "langgraph",
+        "rag",
+        "chains",
+        "agents",
+        "framework",
+        "educational"
+      ],
+      "metadata": {
+        "file_type": "json",
+        "file_size": 28517,
+        "json_split": true,
+        "json_array_key": "items",
+        "item_index": 4,
+        "author": "AI Engineer course"
+      }
+    },
+    {
+      "id": "local_agent-kb-research_yt-yF9kGESAi3M",
+      "source_type": "local_ingest",
+      "source_ref": "file:C:\\Users\\olive\\claude_projects\\coding\\agent_tools_dev\\data_etl_orchestrator_dev\\agent_knowledge_base_plugin_dev\\pipeline_mcp_data\\ingest_staging\\agent-kb-research.json",
+      "title": "LangChain Master Class for beginners — building RAG chatbots and agents (large transcript summary)",
+      "content": "{\n  \"id\": \"yt-yF9kGESAi3M\",\n  \"title\": \"LangChain Master Class for beginners — building RAG chatbots and agents (large transcript summary)\",\n  \"source_type\": \"youtube_transcript_summary\",\n  \"url\": \"https://youtube.com/watch?v=yF9kGESAi3M\",\n  \"tags\": [\n    \"langchain\",\n    \"rag\",\n    \"chatbot\",\n    \"agent\",\n    \"educational\",\n    \"embeddings\",\n    \"vectorstore\"\n  ],\n  \"author\": \"Beginner LangChain course\",\n  \"date\": \"2026-04-11\",\n  \"content\": \"Large (233KB) master class on LangChain for beginners. Key patterns relevant to agent-knowledgebase:\\n- Standard RAG pipeline: (load) DocumentLoader → (split) TextSplitter → (embed) Embeddings → (store) VectorStore → (retrieve) Retriever → (generate) LLM-with-RetrievalQAChain.\\n- Conversational RAG adds a history-aware retriever: rewrite the current query using the chat history before embedding it, so pronoun-resolution works ('what about its author?' becomes 'who wrote X?').\\n- Tool-calling agents use tools like 'search_knowledgebase(query)' that the LLM invokes — same surface as the agent-knowledgebase MCP tools.\\n- Common mistakes: chunk_size too small (loses context) or too big (dilutes similarity); overlap=0 (missed boundary facts); reusing embeddings across different models (dimension or semantic-space mismatch — exactly the bug the current plugin's dominant_embedding_model field was added to prevent).\\n\\nDIRECT IMPLICATIONS FOR agent-knowledgebase PLUGIN:\\n- Existing embedding_model tracking per page is correct. Enforce it strictly: if a KB has N pages embedded with model A and you try to add page with model B, the service should either refuse or auto-reembed — not mix.\\n- History-aware rewriting should happen client-side (in the agent calling the plugin), not inside the plugin. Keep the plugin's query API stateless.\"\n}",
+      "url": "https://youtube.com/watch?v=yF9kGESAi3M",
+      "date": "2026-04-11T00:00:00.000Z",
+      "tags": [
+        "langchain",
+        "rag",
+        "chatbot",
+        "agent",
+        "educational",
+        "embeddings",
+        "vectorstore"
+      ],
+      "metadata": {
+        "file_type": "json",
+        "file_size": 28517,
+        "json_split": true,
+        "json_array_key": "items",
+        "item_index": 5,
+        "author": "Beginner LangChain course"
+      }
+    },
+    {
+      "id": "local_agent-kb-research_web-pep723-uv-alternatives",
+      "source_type": "local_ingest",
+      "source_ref": "file:C:\\Users\\olive\\claude_projects\\coding\\agent_tools_dev\\data_etl_orchestrator_dev\\agent_knowledge_base_plugin_dev\\pipeline_mcp_data\\ingest_staging\\agent-kb-research.json",
+      "title": "Running Python MCP servers without uv: pip/venv, pipx, uvx, Docker, and PEP-723 script runners",
+      "content": "{\n  \"id\": \"web-pep723-uv-alternatives\",\n  \"title\": \"Running Python MCP servers without uv: pip/venv, pipx, uvx, Docker, and PEP-723 script runners\",\n  \"source_type\": \"web_research\",\n  \"url\": \"https://code.claude.com/docs/en/mcp\",\n  \"tags\": [\n    \"uv\",\n    \"pipx\",\n    \"venv\",\n    \"docker\",\n    \"pep723\",\n    \"mcp\",\n    \"claude-code\",\n    \"plugin-distribution\",\n    \"python\"\n  ],\n  \"author\": \"Web research synthesis\",\n  \"date\": \"2026-04-24\",\n  \"content\": \"PROBLEM: The agent-knowledgebase plugin currently ships with `command: \\\"uv\\\", args: [\\\"run\\\", \\\"--directory\\\", \\\"${CLAUDE_PLUGIN_ROOT}\\\", \\\"python\\\", \\\"-m\\\", \\\"agent_knowledgebase.server\\\"]` in its .mcp.json. This requires every user to have uv installed. Requirement: remove uv as a hard dependency.\\n\\nALTERNATIVES SURVEYED:\\n\\n1) PLAIN pip + venv (no uv). Setup steps: (a) `python -m venv .venv` in plugin root; (b) `.venv/Scripts/pip install -e .`; (c) .mcp.json invokes `${CLAUDE_PLUGIN_ROOT}/.venv/Scripts/python.exe -m agent_knowledgebase.server` (Windows) or `.venv/bin/python` (Unix). PROS: zero extra tools, standard library only. CONS: (a) the user must run setup once manually; (b) no lock file by default (pip-compile optional); (c) cross-platform script paths in .mcp.json require branching.\\n\\n2) pipx (install from GitHub or PyPI). Setup: `pipx install agent-knowledgebase` or `pipx install git+https://github.com/goosefly99/agent-knowledgebase-claude-plugin.git`. .mcp.json becomes: `command: \\\"agent-knowledgebase-server\\\"` (a console_scripts entry point). PROS: isolated env, one-command install, widely available (shipped with many distros' python-pipx packages). CONS: (a) user must install pipx — still a dependency; (b) updating the plugin requires `pipx upgrade`; (c) pipx is slower than uv to install.\\n\\n3) uvx (no uv-run, just uvx) — 'uvx agent-knowledgebase-server' ephemerally resolves + executes. Same basic story as uv run but using the subcommand that mirrors pipx. Still requires uv. NOT a real solution for removing uv dependency.\\n\\n4) DOCKER CONTAINER. Setup: (a) provide Dockerfile in plugin root; (b) publish image to Docker Hub / GHCR on each release; (c) .mcp.json: `command: \\\"docker\\\", args: [\\\"run\\\", \\\"-i\\\", \\\"--rm\\\", \\\"-v\\\", \\\"${AGENT_KB_SAVES_DIR}:/data\\\", \\\"ghcr.io/goosefly99/agent-knowledgebase:0.7.0\\\"]`. PROS: zero Python-on-host required, lockfile-equivalent via image pinning, clean reproducibility. CONS: (a) Docker on Windows requires Docker Desktop; (b) host-container filesystem permissions are a setup hurdle; (c) startup is slower (~2s cold) than native Python; (d) 200+ MB image.\\n\\n5) PEP-723 INLINE-DEPS SCRIPT. Python 3.13+ supports inline dependency metadata in single-file scripts. Setup: the plugin's entry point is a single Python file with a leading comment block listing its dependencies; `python script.py` automatically installs and runs with any PEP-723-aware runner (uv supports this, and CPython 3.14+ has stdlib support via `pip run`). NOT YET MAINSTREAM in 2026 — skip as primary solution, note as future.\\n\\n6) PRE-INSTALLED VIRTUAL ENV SHIPPED WITH PLUGIN. The plugin installer script creates .venv on first run (postinstall hook or SessionStart hook) using stdlib `venv` + pip. After install, .mcp.json invokes the venv's python directly. NO TOOLS required besides Python itself. PROS: (a) pure stdlib; (b) one-time cost; (c) zero user friction after first run. CONS: platform-specific script paths (Scripts/ vs bin/), duplicated install logic.\\n\\n7) PRE-BUILT BINARY (PyInstaller / Nuitka / shiv). Setup: bundle the plugin + all dependencies into a single executable, ship per-platform binary as a GitHub release artifact; .mcp.json invokes the binary directly. PROS: zero Python-on-host required, fast startup, no dependency install. CONS: larger artifact, CI needed for every platform, awkward for development iterations.\\n\\nRECOMMENDATION (research synthesis): Option 6 (stdlib venv + SessionStart hook OR documented one-time setup) is the cleanest path forward for a Claude Code plugin targeting individual developer machines. Option 2 (pipx) is a reasonable fallback for users already in the Python-CLI-tool ecosystem. Option 4 (Docker) is attractive for heavy dependencies (chromadb, sentence-transformers, tree-sitter) but adds a Docker Desktop requirement that may exceed the plugin's target user base.\\n\\nMOST IMPORTANT INSIGHT: If the plugin adopts the Karpathy-style markdown wiki architecture (see yt-sboNwYmH3AY), MOST OF THE CURRENT PYTHON DEPENDENCIES VANISH (no chromadb, no sentence-transformers, no sqlparse/sqlalchemy for vector-store-driven code paths), which in turn makes Option 6 (stdlib venv auto-bootstrap) trivial — just pydantic, httpx, mcp. The fastest path to removing uv is to first reduce the dependency surface area.\"\n}",
+      "url": "https://code.claude.com/docs/en/mcp",
+      "date": "2026-04-24T00:00:00.000Z",
+      "tags": [
+        "uv",
+        "pipx",
+        "venv",
+        "docker",
+        "pep723",
+        "mcp",
+        "claude-code",
+        "plugin-distribution",
+        "python"
+      ],
+      "metadata": {
+        "file_type": "json",
+        "file_size": 28517,
+        "json_split": true,
+        "json_array_key": "items",
+        "item_index": 6,
+        "author": "Web research synthesis"
+      }
+    },
+    {
+      "id": "local_agent-kb-research_web-embedding-alternatives",
+      "source_type": "local_ingest",
+      "source_ref": "file:C:\\Users\\olive\\claude_projects\\coding\\agent_tools_dev\\data_etl_orchestrator_dev\\agent_knowledge_base_plugin_dev\\pipeline_mcp_data\\ingest_staging\\agent-kb-research.json",
+      "title": "Lightweight embedding alternatives to sentence-transformers in 2026",
+      "content": "{\n  \"id\": \"web-embedding-alternatives\",\n  \"title\": \"Lightweight embedding alternatives to sentence-transformers in 2026\",\n  \"source_type\": \"web_research\",\n  \"url\": \"https://www.bentoml.com/blog/a-guide-to-open-source-embedding-models\",\n  \"tags\": [\n    \"embeddings\",\n    \"sentence-transformers\",\n    \"minilm\",\n    \"bge\",\n    \"gte\",\n    \"embeddinggemma\",\n    \"model-selection\"\n  ],\n  \"author\": \"Web research synthesis\",\n  \"date\": \"2026-04-24\",\n  \"content\": \"CURRENT DEFAULT IN PLUGIN: `all-MiniLM-L6-v2` via sentence-transformers — 22M params, 384-dim, ~5-14k sentences/sec on CPU. Solid baseline but a large dependency.\\n\\nWHY EMBEDDINGS DEPENDENCY IS HEAVY: sentence-transformers pulls in torch, transformers, tokenizers. On first install this is ~2 GB download. This contributes significantly to the plugin's install surface area.\\n\\nALTERNATIVES:\\n\\n1) STAY WITH all-MiniLM-L6-v2 but use ONNX Runtime instead of torch. `fastembed` library from Qdrant provides sentence-transformers-compatible API but uses ONNX models — ~100 MB install vs. ~2 GB for torch. Same MiniLM model, same vectors.\\n\\n2) EMBEDDINGGEMMA (Google, 2025) — lightweight, designed for on-device retrieval. Fast inference on mobile-class hardware.\\n\\n3) BGE-SMALL-EN-V1.5 — 33M params, 384-dim, often outperforms MiniLM on MTEB. Ships as GGUF and ONNX.\\n\\n4) gte-multilingual-base (Alibaba) — 305M params, multilingual. Overkill for English-only plugin.\\n\\n5) REMOTE-ONLY (skip local embeddings). The v0.7.0 changelog shows the plugin already supports `provider=remote` talking to any OpenAI-compatible /embeddings endpoint (Ollama, vLLM, LocalAI, OpenAI). If the plugin stops shipping a local embedder entirely, the sentence-transformers dep drops.\\n\\nRECOMMENDATION: If embeddings remain in scope after redesign:\\n- (a) Replace sentence-transformers with `fastembed` for a 20× smaller install footprint with identical vectors.\\n- (b) Make local embeddings OPTIONAL; default to remote Ollama (`http://localhost:11434/v1`). This pushes the heavy model off the plugin and onto the user's existing Ollama install, which many Claude Code users already have running.\\n- (c) If remote-only, install size of the plugin drops from ~2 GB to ~20 MB — dramatically easier to bootstrap without uv.\\n\\nIF PLUGIN GOES WIKI-STYLE (per yt-sboNwYmH3AY): Embeddings become entirely unnecessary. Delete the whole embeddings/vectorstore module. Retrieval is file-read over markdown + LLM-guided link traversal.\"\n}",
+      "url": "https://www.bentoml.com/blog/a-guide-to-open-source-embedding-models",
+      "date": "2026-04-24T00:00:00.000Z",
+      "tags": [
+        "embeddings",
+        "sentence-transformers",
+        "minilm",
+        "bge",
+        "gte",
+        "embeddinggemma",
+        "model-selection"
+      ],
+      "metadata": {
+        "file_type": "json",
+        "file_size": 28517,
+        "json_split": true,
+        "json_array_key": "items",
+        "item_index": 7,
+        "author": "Web research synthesis"
+      }
+    },
+    {
+      "id": "local_agent-kb-research_claude-code-mcp-config-best-practices",
+      "source_type": "local_ingest",
+      "source_ref": "file:C:\\Users\\olive\\claude_projects\\coding\\agent_tools_dev\\data_etl_orchestrator_dev\\agent_knowledge_base_plugin_dev\\pipeline_mcp_data\\ingest_staging\\agent-kb-research.json",
+      "title": "Claude Code plugin MCP server config patterns — command, args, env, CLAUDE_PLUGIN_ROOT",
+      "content": "{\n  \"id\": \"claude-code-mcp-config-best-practices\",\n  \"title\": \"Claude Code plugin MCP server config patterns — command, args, env, CLAUDE_PLUGIN_ROOT\",\n  \"source_type\": \"web_research\",\n  \"url\": \"https://code.claude.com/docs/en/mcp\",\n  \"tags\": [\n    \"claude-code\",\n    \"mcp\",\n    \"plugin\",\n    \"mcp-json\",\n    \"plugin-root\",\n    \"distribution\"\n  ],\n  \"author\": \"Web research synthesis\",\n  \"date\": \"2026-04-24\",\n  \"content\": \"CLAUDE CODE PLUGIN .mcp.json contract: (a) `command` is the executable; (b) `args` are positional args; (c) `env` is optional envvar dict; (d) `${CLAUDE_PLUGIN_ROOT}` is substituted with the plugin install path at launch time; (e) `type` defaults to stdio; (f) transport can be stdio/http/sse.\\n\\nCURRENT PLUGIN CONFIG (.mcp.json):\\n```\\n{\\n  \\\"mcpServers\\\": {\\n    \\\"agent-knowledgebase\\\": {\\n      \\\"command\\\": \\\"uv\\\",\\n      \\\"args\\\": [\\\"run\\\", \\\"--directory\\\", \\\"${CLAUDE_PLUGIN_ROOT}\\\", \\\"python\\\", \\\"-m\\\", \\\"agent_knowledgebase.server\\\"]\\n    }\\n  }\\n}\\n```\\n\\nWORKING PATTERNS WITHOUT uv (distilled from community plugins):\\n\\nPATTERN A — Plugin-local venv + platform-dispatching wrapper script:\\n```\\n{\\n  \\\"command\\\": \\\"${CLAUDE_PLUGIN_ROOT}/bin/run-server\\\",\\n  \\\"args\\\": []\\n}\\n```\\nWhere `bin/run-server` is a tiny platform-specific shim (bash + .cmd) that activates the plugin's .venv and runs the server. Venv is bootstrapped on first call if absent.\\n\\nPATTERN B — System Python + PYTHONPATH:\\n```\\n{\\n  \\\"command\\\": \\\"python\\\",\\n  \\\"args\\\": [\\\"-m\\\", \\\"agent_knowledgebase.server\\\"],\\n  \\\"env\\\": { \\\"PYTHONPATH\\\": \\\"${CLAUDE_PLUGIN_ROOT}/src\\\" }\\n}\\n```\\nRequires user to `pip install` the plugin's deps themselves. Simplest but highest friction.\\n\\nPATTERN C — pipx console-script:\\n```\\n{\\n  \\\"command\\\": \\\"agent-knowledgebase-server\\\",\\n  \\\"args\\\": []\\n}\\n```\\nPlugin `pyproject.toml` defines `[project.scripts] agent-knowledgebase-server = \\\"agent_knowledgebase.server:main\\\"`. User runs `pipx install agent-knowledgebase-claude-plugin` once.\\n\\nPATTERN D — Docker:\\n```\\n{\\n  \\\"command\\\": \\\"docker\\\",\\n  \\\"args\\\": [\\\"run\\\", \\\"-i\\\", \\\"--rm\\\", \\\"-v\\\", \\\"${AGENT_KB_SAVES_DIR}:/data\\\", \\\"ghcr.io/goosefly99/agent-knowledgebase:0.8.0\\\"]\\n}\\n```\\nZero Python-on-host. Slowest cold start.\\n\\nDIRECT IMPLICATIONS FOR agent-knowledgebase PLUGIN:\\n- PATTERN A (plugin-local venv + wrapper script) is the best fit for current maturity: no new user tooling, auto-bootstraps first run, cross-platform via two small scripts (bash + .cmd) that live in the plugin.\\n- Ship PATTERN B as the 'advanced / bring-your-own-env' alternative in documentation.\\n- PATTERN C (pipx) is documented as a 'if you already have pipx' alternative.\\n- Document PATTERN D (docker) as the 'zero-install' alternative for users uncomfortable with Python tooling.\"\n}",
+      "url": "https://code.claude.com/docs/en/mcp",
+      "date": "2026-04-24T00:00:00.000Z",
+      "tags": [
+        "claude-code",
+        "mcp",
+        "plugin",
+        "mcp-json",
+        "plugin-root",
+        "distribution"
+      ],
+      "metadata": {
+        "file_type": "json",
+        "file_size": 28517,
+        "json_split": true,
+        "json_array_key": "items",
+        "item_index": 8,
+        "author": "Web research synthesis"
+      }
+    }
+  ]
+}

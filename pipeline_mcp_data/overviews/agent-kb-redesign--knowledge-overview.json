@@ -1,0 +1,1006 @@
+{
+  "overview_id": "dc4370d2",
+  "title": "agent-knowledgebase Plugin Redesign",
+  "created_date": "2026-04-24T21:34:46.416Z",
+  "status": "complete",
+  "sources": [
+    {
+      "collection": "agent-kb-redesign-sources",
+      "item_id": "yt-QHlB-RJfx8w",
+      "title": "LightRAG + Graph RAG for Claude Code in 2026"
+    },
+    {
+      "collection": "agent-kb-redesign-sources",
+      "item_id": "yt-pIoKdpsuODg",
+      "title": "The 4 Design Patterns Behind Every AI Agent"
+    },
+    {
+      "collection": "agent-kb-redesign-sources",
+      "item_id": "yt-Ek0tZootK00",
+      "title": "ReFrag (Meta) — precomputed embeddings + multi-vector + MMR"
+    },
+    {
+      "collection": "agent-kb-redesign-sources",
+      "item_id": "yt-sboNwYmH3AY",
+      "title": "Karpathy's LLM Wiki — Markdown-based KB with no vector DB"
+    },
+    {
+      "collection": "agent-kb-redesign-sources",
+      "item_id": "yt-Cyv-dgv80kE",
+      "title": "LangChain AI Engineer's Guide — retriever abstraction, splitters, rerank"
+    },
+    {
+      "collection": "agent-kb-redesign-sources",
+      "item_id": "yt-yF9kGESAi3M",
+      "title": "LangChain Master Class — classic RAG failure modes"
+    },
+    {
+      "collection": "agent-kb-redesign-sources",
+      "item_id": "web-pep723-uv-alternatives",
+      "title": "Running Python MCP servers without uv (pip/venv, pipx, Docker, PEP-723)"
+    },
+    {
+      "collection": "agent-kb-redesign-sources",
+      "item_id": "web-embedding-alternatives",
+      "title": "Lightweight embedding alternatives to sentence-transformers in 2026"
+    },
+    {
+      "collection": "agent-kb-redesign-sources",
+      "item_id": "claude-code-mcp-config-best-practices",
+      "title": "Claude Code plugin .mcp.json config patterns"
+    }
+  ],
+  "summary": "The agent-knowledgebase Claude Code plugin currently fails on two axes: (a) its retrieval stack (chromadb + sentence-transformers) is broken at runtime and over-engineered for the ~500K-word single-user scale it actually serves, and (b) its .mcp.json hard-binds launch to 'uv run ...', forcing every user to install uv. Nine curated research sources converge on a two-stage redesign. The single highest-leverage decision (Karpathy's LLM Wiki, relevance 1.0) is architectural: at plugin-target scale a markdown-wiki with an LLM-maintained index.md and [[wikilinks]] beats a vector DB on retrieval quality and simultaneously eliminates the heavy Python dependency surface, which in turn makes the runtime-bootstrap problem trivial. If vector-RAG is retained, the 2026 production patterns are multi-vector-per-object storage, MMR for result diversity, symbolic metadata filters, rerankers (BGE-Reranker), a strict retriever abstraction boundary, and either remote-only embeddings or fastembed/ONNX to shrink the install from ~2 GB to ~100 MB / ~20 MB. For the runtime problem, Pattern A — a plugin-local stdlib venv auto-bootstrapped by a tiny bash+.cmd wrapper at ${CLAUDE_PLUGIN_ROOT}/bin/run-server — is the cleanest primary path, with pipx console-script and Docker as documented alternates. Across all sources the plugin's MCP surface should remain stateless, structured-JSON, and stripped of any embedded agent behavior (planning, chat-history) — consumer agents compose RAG with tool-use / planning / multi-agent themselves.",
+  "concepts": [
+    {
+      "name": "Naive RAG (chunk + embed + cosine top-K)",
+      "category": "architecture",
+      "description": "The baseline RAG pipeline — document splitter, embedding model, vector store, cosine-similarity top-K retrieval, prompt augmentation, LLM generation. It is the architecture the current plugin implements, and it is the architecture every curated source flags as insufficient on its own in 2026.",
+      "key_details": [
+        "Standard pipeline: load -> split -> embed -> store -> retrieve -> generate.",
+        "Fails to capture relationships between concepts: 'how do X and Y relate?' is not a cosine-similarity query.",
+        "Break-even vs full-context stuffing is real: RAG ~1250x cheaper at 2000+ pages / ~1M tokens (Gemini 2.0, July 2025 study).",
+        "Classic failure modes: chunk_size too small (loses context), too large (dilutes similarity), overlap=0 (missed boundary facts)."
+      ],
+      "source_items": [
+        "yt-QHlB-RJfx8w",
+        "yt-pIoKdpsuODg",
+        "yt-yF9kGESAi3M",
+        "yt-Cyv-dgv80kE"
+      ],
+      "relationships": [
+        {
+          "concept": "Graph RAG (LightRAG)",
+          "relationship": "is-superseded-by for relationship queries"
+        },
+        {
+          "concept": "LLM-Maintained Markdown Wiki (Karpathy)",
+          "relationship": "is-superseded-by at small-scale (~500K-word) single-user scope"
+        },
+        {
+          "concept": "Multi-Vector-Per-Object Retrieval",
+          "relationship": "is-extended-by"
+        },
+        {
+          "concept": "Chunk Size / Overlap / Semantic Splitting",
+          "relationship": "fails-silently-when-misconfigured"
+        }
+      ]
+    },
+    {
+      "name": "LLM-Maintained Markdown Wiki (Karpathy)",
+      "category": "architecture",
+      "description": "A knowledge-base architecture in which a plain directory of markdown files, plus an LLM-maintained index.md with [[wikilinks]], replaces vector DB retrieval entirely. At the plugin's actual target scale (hundreds of articles, ~500K words, one user), it outperforms vector RAG on retrieval quality by following explicit links rather than fuzzy cosine similarity. Zero embeddings, zero server, zero Python at query time — Claude Code reads the filesystem natively.",
+      "key_details": [
+        "Layout: raw/ (sources), wiki/index.md (flat index by category), wiki/hot.md (~500-char hot cache), wiki/log.md (operation history), CLAUDE.md (project rules), optional wiki/<subdir>/.",
+        "Ingest: 'Ingest X into the wiki' -> LLM emits 5-25 wiki pages linked via [[wikilinks]], updates index.md, appends log.md. ~10 min per article.",
+        "Query: Claude reads CLAUDE.md -> index.md -> follows [[backlinks]] -> answers with citations. One user reported 95% token reduction vs loading all files.",
+        "Lint: periodic LLM health-check for inconsistent data, dangling pages, unreachable pages, new-article candidates.",
+        "Wins on: relationship understanding, infrastructure (zero), cost (~LLM tokens only), maintenance simplicity.",
+        "Loses on: >1000 docs, multi-tenant, latency-sensitive lookup, pure semantic-similarity recall."
+      ],
+      "source_items": [
+        "yt-sboNwYmH3AY"
+      ],
+      "relationships": [
+        {
+          "concept": "Naive RAG (chunk + embed + cosine top-K)",
+          "relationship": "replaces-at-small-scale"
+        },
+        {
+          "concept": "Remove uv as Hard Runtime Dependency",
+          "relationship": "enables-directly (zero Python needed at query time)"
+        },
+        {
+          "concept": "Embedding Dependency Bloat (~2 GB torch stack)",
+          "relationship": "eliminates"
+        },
+        {
+          "concept": "Pluggable Retriever Backend (QueryOrchestrator boundary)",
+          "relationship": "slots-in-as 'backend=markdown'"
+        },
+        {
+          "concept": "Decision Point: WIKI-STYLE vs VECTOR-RAG vs HYBRID",
+          "relationship": "is-the-WIKI-STYLE-option"
+        }
+      ]
+    },
+    {
+      "name": "Graph RAG (LightRAG)",
+      "category": "architecture",
+      "description": "Hybrid retrieval that builds a knowledge graph (entities = nodes, typed relationships = edges with text descriptions) alongside the vector store. Query path does both cosine similarity AND graph traversal, enabling relationship questions ('how do X and Y relate?') that naive RAG cannot answer. LightRAG is the open-source, Dockerized implementation that mirrors Microsoft GraphRAG at a fraction of the cost.",
+      "key_details": [
+        "Dockerized (docker compose), web UI at localhost:9621, exposes REST API.",
+        "Each REST endpoint maps cleanly to a Claude Code skill: query / upload / explore / status.",
+        "Supports OpenAI text-embedding-3-large OR fully local Ollama embeddings.",
+        "Deployment options: all-local Docker, semi-local (Docker + remote embeddings), cloud (Postgres-backed on Neon).",
+        "Example extraction: chunk 'Anthropic created Claude Code' -> entities {Anthropic, Claude Code} + edge 'created'."
+      ],
+      "source_items": [
+        "yt-QHlB-RJfx8w"
+      ],
+      "relationships": [
+        {
+          "concept": "Naive RAG (chunk + embed + cosine top-K)",
+          "relationship": "extends"
+        },
+        {
+          "concept": "LLM-Maintained Markdown Wiki (Karpathy)",
+          "relationship": "overlaps-with (both surface entity-relationships, wiki uses explicit links, graph-RAG uses extracted edges)"
+        },
+        {
+          "concept": "Skills-Based Plugin Surface (CRUD skills)",
+          "relationship": "exemplifies"
+        },
+        {
+          "concept": "Decision Point: WIKI-STYLE vs VECTOR-RAG vs HYBRID",
+          "relationship": "is-the-HYBRID-option"
+        }
+      ]
+    },
+    {
+      "name": "Multi-Vector-Per-Object Retrieval",
+      "category": "technique",
+      "description": "The 2026 production pattern of storing multiple embeddings per document — a dense vector plus title vector, body vector, summary vector, and optionally token-level Colbert late-interaction vectors — instead of one vector per page. Enables diversity filtering, symbolic filters, and better recall on 'nugget coverage' benchmarks like FreshStack.",
+      "key_details": [
+        "One object -> 1 dense vector + N sub-chunk vectors + optionally 256 token vectors (Colbert late-interaction).",
+        "Enabled by Weaviate named-vectors, Colbert, Matryoshka representations, rotational quantization.",
+        "Current plugin schema is one-chunk-one-vector; migrating to title+body+summary is the high-value low-complexity win.",
+        "Chunk-level LLM-generated summaries ('knowledge nuggets') stored alongside chunks improve retrieval without ReFrag-level training complexity."
+      ],
+      "source_items": [
+        "yt-Ek0tZootK00"
+      ],
+      "relationships": [
+        {
+          "concept": "Naive RAG (chunk + embed + cosine top-K)",
+          "relationship": "extends"
+        },
+        {
+          "concept": "MMR Diversity Reranking",
+          "relationship": "feeds-into"
+        },
+        {
+          "concept": "Symbolic Metadata Filters",
+          "relationship": "is-complementary-to"
+        },
+        {
+          "concept": "ReFrag Precomputed-Embedding Inference",
+          "relationship": "is-the-shipping-subset-of (same storage shape, without decoder changes)"
+        }
+      ]
+    },
+    {
+      "name": "MMR Diversity Reranking",
+      "category": "technique",
+      "description": "Maximal Marginal Relevance — a reranker applied to a top-K-vector-multiplier candidate set that trades raw relevance for coverage of distinct knowledge units. Beats pure cosine top-K on FreshStack 'nugget coverage' by avoiding the classic failure of returning three near-duplicate chunks that all match the query well.",
+      "key_details": [
+        "Retrieve top-K*multiplier candidates via cosine, then rerank with MMR for diversity.",
+        "FreshStack benchmark measures how many distinct knowledge units the retrieved set covers, not just relevance.",
+        "Complements but does not replace BGE-Reranker / Cohere Rerank (those rerank for relevance; MMR reranks for coverage).",
+        "Cheap to implement — no new model required, just a similarity-to-already-selected penalty term."
+      ],
+      "source_items": [
+        "yt-Ek0tZootK00",
+        "yt-Cyv-dgv80kE"
+      ],
+      "relationships": [
+        {
+          "concept": "Multi-Vector-Per-Object Retrieval",
+          "relationship": "is-fed-by"
+        },
+        {
+          "concept": "BGE-Reranker Rerank Stage",
+          "relationship": "is-complementary-to"
+        },
+        {
+          "concept": "Naive RAG (chunk + embed + cosine top-K)",
+          "relationship": "extends"
+        }
+      ]
+    },
+    {
+      "name": "Symbolic Metadata Filters",
+      "category": "technique",
+      "description": "First-class query parameters over metadata (tags, source_type, date_range) evaluated alongside vector similarity. The 2026 production pattern is vector search + symbolic filter, not pure vector. Optionally combined with SelfQuery-style NL-to-filter parsing so 'recent YouTube transcripts about uv' becomes a symbolic filter.",
+      "key_details": [
+        "metadata.tags, metadata.source_type, metadata.date_range as predictable query parameters.",
+        "SelfQueryRetriever pattern: LLM parses natural language into a symbolic filter before vector search.",
+        "Enables multi-collection retrieval (one query spanning papers + blogs + code).",
+        "Current plugin has per-page metadata — exposing it as filter params is low-cost."
+      ],
+      "source_items": [
+        "yt-Ek0tZootK00",
+        "yt-Cyv-dgv80kE"
+      ],
+      "relationships": [
+        {
+          "concept": "Multi-Vector-Per-Object Retrieval",
+          "relationship": "is-complementary-to"
+        },
+        {
+          "concept": "Advanced Retrievers (MultiQuery / SelfQuery / ParentDocument)",
+          "relationship": "is-parsed-by"
+        }
+      ]
+    },
+    {
+      "name": "Chunk Size / Overlap / Semantic Splitting",
+      "category": "technique",
+      "description": "The splitter hierarchy (Character -> RecursiveCharacter -> MarkdownHeader -> Semantic) and its parameters (chunk_size, chunk_overlap) are — at small scale — the dominant driver of retrieval quality. Multiple sources flag mis-tuning here as the single largest cause of silent retrieval failure in the current plugin's profile.",
+      "key_details": [
+        "Hierarchy: CharacterTextSplitter (naive) -> RecursiveCharacterTextSplitter (respects paragraph/sentence boundaries) -> MarkdownHeaderTextSplitter (structure-aware) -> SemanticChunker (embedding-based boundaries).",
+        "Default MarkdownHeaderTextSplitter for markdown source_type; recursive-char for prose; semantic for dense material.",
+        "Per-KB config for chunk_size and chunk_overlap with sane defaults per source_type (prose/code/markdown).",
+        "chunk_size too small -> loses context; too large -> dilutes similarity; overlap=0 -> misses boundary facts."
+      ],
+      "source_items": [
+        "yt-QHlB-RJfx8w",
+        "yt-yF9kGESAi3M",
+        "yt-Cyv-dgv80kE"
+      ],
+      "relationships": [
+        {
+          "concept": "Naive RAG (chunk + embed + cosine top-K)",
+          "relationship": "is-the-dominant-failure-mode-of"
+        },
+        {
+          "concept": "Per-Page Embedding Model Stamping",
+          "relationship": "is-complementary-to"
+        }
+      ]
+    },
+    {
+      "name": "Advanced Retrievers (MultiQuery / SelfQuery / ParentDocument)",
+      "category": "technique",
+      "description": "LangChain-popularized retrieval patterns that materially improve recall over naive top-K: MultiQuery paraphrases the query N times, SelfQuery extracts metadata filters from natural language, ParentDocument retrieves a small chunk but returns its parent document to the LLM for context.",
+      "key_details": [
+        "MultiQuery: N paraphrases, union results, dedup.",
+        "SelfQuery: NL -> {vector_query, metadata_filter} via LLM.",
+        "ParentDocument: index on small chunks, return parent (paragraph or whole doc) at retrieval time for context.",
+        "All three slot behind the retriever abstraction (invoke(query) -> List[Document])."
+      ],
+      "source_items": [
+        "yt-Cyv-dgv80kE"
+      ],
+      "relationships": [
+        {
+          "concept": "Pluggable Retriever Backend (QueryOrchestrator boundary)",
+          "relationship": "is-composed-behind"
+        },
+        {
+          "concept": "Symbolic Metadata Filters",
+          "relationship": "is-parsed-for"
+        }
+      ]
+    },
+    {
+      "name": "BGE-Reranker Rerank Stage",
+      "category": "technique",
+      "description": "An optional rerank pass applied to a top-K-vector-multiplier candidate set using a cross-encoder (BGE-Reranker-v2, Cohere Rerank). The 2026 standard RAG pattern. BGE-Reranker-v2 runs CPU-local with a small footprint, so no new heavy dependency.",
+      "key_details": [
+        "Retrieve top-K*multiplier, then cross-encode (query, chunk) pairs and rerank for relevance.",
+        "BGE-Reranker-v2 is small, CPU-friendly, and can be loaded via fastembed/ONNX.",
+        "Cohere Rerank is the managed alternative (network dependency)."
+      ],
+      "source_items": [
+        "yt-Cyv-dgv80kE"
+      ],
+      "relationships": [
+        {
+          "concept": "MMR Diversity Reranking",
+          "relationship": "is-complementary-to"
+        },
+        {
+          "concept": "fastembed / ONNX Embeddings",
+          "relationship": "is-packaged-with"
+        }
+      ]
+    },
+    {
+      "name": "ReFrag Precomputed-Embedding Inference",
+      "category": "technique",
+      "description": "Meta's research technique: reuse the retrieved chunk's embedding vector directly in decoder prefill instead of re-tokenizing and re-encoding. 31x faster TTFT, 7x throughput over LLaMA-2 7B. Requires encoder-decoder latent-space alignment and curriculum learning — explicitly out of scope for the plugin, but establishes multi-vector storage as the correct forward-compatible shape.",
+      "key_details": [
+        "256-token chunks, each split into 16x16-token sub-chunks, each sub-chunk -> one embedding.",
+        "RL policy (GRPO+PPO) selectively expands sub-chunks back into full token vectors.",
+        "Prefill becomes O(N^2) over ~1000 chunk embeddings instead of 16K tokens -> 256x fewer FLOPs.",
+        "Ablations: curriculum learning CRITICAL; reconstruction CRITICAL; RL policy marginal over perplexity/random.",
+        "NOT a plugin-scope change — documented as the forward-compatible ceiling."
+      ],
+      "source_items": [
+        "yt-Ek0tZootK00"
+      ],
+      "relationships": [
+        {
+          "concept": "Multi-Vector-Per-Object Retrieval",
+          "relationship": "is-the-full-version-of"
+        },
+        {
+          "concept": "Naive RAG (chunk + embed + cosine top-K)",
+          "relationship": "supersedes-at-LLM-training-time"
+        }
+      ]
+    },
+    {
+      "name": "Pluggable Retriever Backend (QueryOrchestrator boundary)",
+      "category": "architecture",
+      "description": "A strict retriever abstraction (invoke(query, k, filters) -> List[Document]) that lets backends swap without changing the MCP tool surface. The current codebase has a QueryOrchestrator — this concept promotes it to a real boundary so chromadb, in-memory, LightRAG, and markdown-wiki are all peer backends.",
+      "key_details": [
+        "Interface shape: retriever.invoke(query, k, filters) -> List[Document{page_content, metadata}].",
+        "Backend candidates: backend=chromadb (current), backend=markdown, backend=lightrag, backend=inmemory.",
+        "MCP tool surface (kb_query, kb_search, kb_ingest_*) must not change when backend changes.",
+        "Document schema mirrors LangChain: page_content + metadata dict."
+      ],
+      "source_items": [
+        "yt-Cyv-dgv80kE",
+        "yt-sboNwYmH3AY",
+        "yt-QHlB-RJfx8w"
+      ],
+      "relationships": [
+        {
+          "concept": "LLM-Maintained Markdown Wiki (Karpathy)",
+          "relationship": "is-enabled-by (slots in as backend=markdown)"
+        },
+        {
+          "concept": "Graph RAG (LightRAG)",
+          "relationship": "is-enabled-by (slots in as backend=lightrag)"
+        },
+        {
+          "concept": "Stateless Structured-JSON Tool Contract",
+          "relationship": "preserves"
+        }
+      ]
+    },
+    {
+      "name": "Stateless Structured-JSON Tool Contract",
+      "category": "architecture",
+      "description": "The plugin's MCP tools must be fast, stateless per-call, and return structured JSON. No chat-history, no hidden planning, no ambient state. Consumer agents (Claude Code, planners, multi-agent systems) compose the plugin with their own tool-use / planning / multi-agent loops. RAG is one of four agent patterns — the plugin owns exactly that one and no more.",
+      "key_details": [
+        "Andrew Ng's four agent patterns: Tool Use, RAG, Planning, Multi-Agent — the plugin owns RAG only.",
+        "Tool descriptions must be unambiguous JSON-schema-shaped so tool-using agents can select them.",
+        "Include predictable cost/latency characteristics in tool descriptions for planners.",
+        "RAG is a REACTIVE pattern — the plugin never decides what to retrieve on its own.",
+        "Primary search shape: search(query, k, filters) to mirror every tool-calling agent convention."
+      ],
+      "source_items": [
+        "yt-pIoKdpsuODg",
+        "yt-yF9kGESAi3M"
+      ],
+      "relationships": [
+        {
+          "concept": "History-Aware Retrieval is Client-Side",
+          "relationship": "implies"
+        },
+        {
+          "concept": "Pluggable Retriever Backend (QueryOrchestrator boundary)",
+          "relationship": "is-preserved-by"
+        },
+        {
+          "concept": "Skills-Based Plugin Surface (CRUD skills)",
+          "relationship": "is-compatible-with"
+        }
+      ]
+    },
+    {
+      "name": "History-Aware Retrieval is Client-Side",
+      "category": "architecture",
+      "description": "Conversational query rewriting (resolve pronouns against chat history before embedding) must live in the calling agent, not in the plugin. The plugin's query API must remain stateless. This is the direct corollary of the stateless tool contract.",
+      "key_details": [
+        "Example: 'what about its author?' becomes 'who wrote X?' via history-aware retriever — this rewrite lives in the client.",
+        "Plugin's kb_search / kb_query accept a single fully-resolved query string.",
+        "Plugin must not accept chat history or session tokens; no ambient state per kb_id at query time."
+      ],
+      "source_items": [
+        "yt-yF9kGESAi3M",
+        "yt-pIoKdpsuODg"
+      ],
+      "relationships": [
+        {
+          "concept": "Stateless Structured-JSON Tool Contract",
+          "relationship": "is-a-consequence-of"
+        }
+      ]
+    },
+    {
+      "name": "Skills-Based Plugin Surface (CRUD skills)",
+      "category": "architecture",
+      "description": "Pairing the plugin's raw MCP tools with a set of first-class Claude Code skills — one skill per high-level operation (query / upload / explore / status / lint / index-rebuild / dead-link-check). Skills are the right shape for LLM-visible affordances; MCP tools are the right shape for programmatic calls. Both surfaces front the same retriever abstraction.",
+      "key_details": [
+        "LightRAG maps four REST endpoints to four Claude Code skills: query, upload, explore, status.",
+        "Markdown-wiki mode adds: lint, index-rebuild, dead-link-check as first-class operations.",
+        "Each skill is a markdown file with a description + parameters + call pattern.",
+        "Claude Code summarizes raw JSON from the tools and cites references."
+      ],
+      "source_items": [
+        "yt-QHlB-RJfx8w",
+        "yt-sboNwYmH3AY"
+      ],
+      "relationships": [
+        {
+          "concept": "Stateless Structured-JSON Tool Contract",
+          "relationship": "wraps"
+        },
+        {
+          "concept": "LLM-Maintained Markdown Wiki (Karpathy)",
+          "relationship": "provides-lint-skill-for"
+        },
+        {
+          "concept": "Graph RAG (LightRAG)",
+          "relationship": "is-shipped-with"
+        }
+      ]
+    },
+    {
+      "name": "Embedding Dependency Bloat (~2 GB torch stack)",
+      "category": "constraint",
+      "description": "The sentence-transformers dependency pulls torch, transformers, and tokenizers for a ~2 GB first-install footprint. This is the single biggest obstacle to a clean uv-free runtime bootstrap and the primary reason the current plugin needs uv at all.",
+      "key_details": [
+        "sentence-transformers -> torch + transformers + tokenizers = ~2 GB download.",
+        "chromadb adds ~400 MB.",
+        "tree-sitter-languages adds ~100 MB.",
+        "Baseline target: ~20 MB (remote-only) or ~100 MB (fastembed-local)."
+      ],
+      "source_items": [
+        "web-embedding-alternatives",
+        "web-pep723-uv-alternatives"
+      ],
+      "relationships": [
+        {
+          "concept": "fastembed / ONNX Embeddings",
+          "relationship": "is-mitigated-by (20x install shrink)"
+        },
+        {
+          "concept": "Remote-Only Embeddings (Ollama / OpenAI-compatible)",
+          "relationship": "is-eliminated-by"
+        },
+        {
+          "concept": "LLM-Maintained Markdown Wiki (Karpathy)",
+          "relationship": "is-eliminated-by"
+        },
+        {
+          "concept": "Stdlib venv Auto-Bootstrap (Pattern A)",
+          "relationship": "is-the-primary-blocker-for"
+        }
+      ]
+    },
+    {
+      "name": "fastembed / ONNX Embeddings",
+      "category": "technique",
+      "description": "Qdrant's fastembed library offers the sentence-transformers API but uses ONNX Runtime instead of torch — ~100 MB install vs ~2 GB for torch, identical all-MiniLM-L6-v2 vectors. If local embeddings stay in scope, this is a drop-in replacement that closes most of the dependency-bloat gap.",
+      "key_details": [
+        "Same all-MiniLM-L6-v2 vectors as current default (22M params, 384-dim).",
+        "~100 MB install footprint (~20x smaller than torch stack).",
+        "ONNX Runtime is a standalone runtime — no torch dependency.",
+        "Also provides BGE-Reranker-v2 and BGE-small-en-v1.5 as ONNX models."
+      ],
+      "source_items": [
+        "web-embedding-alternatives"
+      ],
+      "relationships": [
+        {
+          "concept": "Embedding Dependency Bloat (~2 GB torch stack)",
+          "relationship": "replaces"
+        },
+        {
+          "concept": "BGE-Reranker Rerank Stage",
+          "relationship": "packages"
+        },
+        {
+          "concept": "Modern Small Embedding Models (BGE-small, EmbeddingGemma, gte)",
+          "relationship": "serves"
+        }
+      ]
+    },
+    {
+      "name": "Remote-Only Embeddings (Ollama / OpenAI-compatible)",
+      "category": "technique",
+      "description": "Push embeddings entirely off the plugin and onto any OpenAI-compatible /embeddings endpoint — Ollama (default at http://localhost:11434/v1), vLLM, LocalAI, or OpenAI. The plugin already supports this as of v0.7.0 via the httpx embeddings client. Making it the default drops plugin install from ~2 GB to ~20 MB.",
+      "key_details": [
+        "Endpoint shape: POST /embeddings with {model, input} -> {data: [{embedding: [...]}]}.",
+        "Default target: http://localhost:11434/v1 (many Claude Code users already run Ollama).",
+        "Env-only secret: AGENT_KB_EMBED_API_KEY (for managed endpoints).",
+        "Trade-off: local (private, zero network) vs remote (fast, tiny install) — per-KB choice."
+      ],
+      "source_items": [
+        "web-embedding-alternatives"
+      ],
+      "relationships": [
+        {
+          "concept": "Embedding Dependency Bloat (~2 GB torch stack)",
+          "relationship": "eliminates"
+        },
+        {
+          "concept": "Stdlib venv Auto-Bootstrap (Pattern A)",
+          "relationship": "enables-fully"
+        },
+        {
+          "concept": "Per-Page Embedding Model Stamping",
+          "relationship": "is-required-by"
+        }
+      ]
+    },
+    {
+      "name": "Modern Small Embedding Models (BGE-small, EmbeddingGemma, gte)",
+      "category": "data source",
+      "description": "The 2026 cohort of lightweight embedding models that outperform the plugin's current all-MiniLM-L6-v2 baseline on MTEB while remaining small. BGE-small-en-v1.5 (33M, 384-dim) is the leading drop-in upgrade; EmbeddingGemma is Google's on-device-optimized model; gte-multilingual covers multilingual.",
+      "key_details": [
+        "BGE-small-en-v1.5: 33M params, 384-dim, outperforms MiniLM on MTEB, ships as GGUF and ONNX.",
+        "EmbeddingGemma (Google, 2025): designed for on-device retrieval, fast on mobile-class hardware.",
+        "gte-multilingual-base (Alibaba): 305M params, multilingual — overkill for English-only plugin.",
+        "all-MiniLM-L6-v2 (current default): 22M params, 384-dim, ~5-14k sentences/sec on CPU."
+      ],
+      "source_items": [
+        "web-embedding-alternatives"
+      ],
+      "relationships": [
+        {
+          "concept": "fastembed / ONNX Embeddings",
+          "relationship": "is-served-by"
+        },
+        {
+          "concept": "Per-Page Embedding Model Stamping",
+          "relationship": "must-be-tracked-by"
+        }
+      ]
+    },
+    {
+      "name": "Per-Page Embedding Model Stamping",
+      "category": "architecture",
+      "description": "Each page / chunk records the exact embedding model used at write time. Queries must either use the same model or the service refuses / auto-reembeds. Mixing is the classic silent-failure bug in naive RAG stacks. The plugin already has dominant_embedding_model tracking; this concept argues it must be strictly enforced.",
+      "key_details": [
+        "Each chunk row stores embedding_model_id (e.g. 'all-MiniLM-L6-v2', 'text-embedding-3-large').",
+        "On ingest: reject if chunk model != KB dominant model, OR auto-reembed.",
+        "On query: embed query with KB dominant model (never the client's preference).",
+        "Dimension mismatch is the obvious failure; semantic-space mismatch at the same dimension is the silent failure."
+      ],
+      "source_items": [
+        "yt-yF9kGESAi3M",
+        "yt-QHlB-RJfx8w"
+      ],
+      "relationships": [
+        {
+          "concept": "Modern Small Embedding Models (BGE-small, EmbeddingGemma, gte)",
+          "relationship": "tracks"
+        },
+        {
+          "concept": "Remote-Only Embeddings (Ollama / OpenAI-compatible)",
+          "relationship": "is-required-by"
+        }
+      ]
+    },
+    {
+      "name": "Remove uv as Hard Runtime Dependency",
+      "category": "constraint",
+      "description": "The plugin's .mcp.json currently reads 'command: uv, args: [run, --directory, ${CLAUDE_PLUGIN_ROOT}, python, -m, agent_knowledgebase.server]'. Every user must install uv. This is an explicit redesign requirement. uvx is not a solution (still requires uv). The real answer is a combination of dependency-surface reduction and a plugin-local stdlib venv wrapper.",
+      "key_details": [
+        "Seven alternatives surveyed: pip+venv, pipx, uvx (invalid), Docker, PEP-723 (not mainstream in 2026), stdlib-venv auto-bootstrap, pre-built binary.",
+        "uvx is NOT a valid 'remove uv' solution.",
+        "PEP-723 inline-deps not mainstream in 2026 — document as future path only.",
+        "Prerequisite: shrink dependency surface first (drop chromadb/sentence-transformers if possible)."
+      ],
+      "source_items": [
+        "web-pep723-uv-alternatives",
+        "claude-code-mcp-config-best-practices"
+      ],
+      "relationships": [
+        {
+          "concept": "Stdlib venv Auto-Bootstrap (Pattern A)",
+          "relationship": "is-solved-by"
+        },
+        {
+          "concept": "pipx Console-Script (Pattern C)",
+          "relationship": "is-solved-alternately-by"
+        },
+        {
+          "concept": "Docker Plugin Distribution (Pattern D)",
+          "relationship": "is-solved-alternately-by"
+        },
+        {
+          "concept": "Embedding Dependency Bloat (~2 GB torch stack)",
+          "relationship": "is-blocked-by"
+        },
+        {
+          "concept": "Decision Point: Runtime Bootstrap Strategy",
+          "relationship": "motivates"
+        }
+      ]
+    },
+    {
+      "name": "Stdlib venv Auto-Bootstrap (Pattern A)",
+      "category": "architecture",
+      "description": "Pattern A from the Claude Code MCP config research: .mcp.json invokes ${CLAUDE_PLUGIN_ROOT}/bin/run-server (bash) or run-server.cmd (Windows), which creates .venv using stdlib venv on first call if absent, pip-installs requirements, then exec's the server. Pure stdlib, one-time cost, zero user friction after first run.",
+      "key_details": [
+        ".mcp.json: { command: '${CLAUDE_PLUGIN_ROOT}/bin/run-server', args: [] }.",
+        "Wrapper scripts: bin/run-server (bash) + bin/run-server.cmd (Windows).",
+        "First call: python -m venv .venv && .venv/{bin,Scripts}/pip install -r requirements.txt -> exec python -m agent_knowledgebase.server.",
+        "Requires only a system Python >= 3.11 on PATH.",
+        "Cross-platform paths: .venv/bin/ on Unix, .venv/Scripts/ on Windows."
+      ],
+      "source_items": [
+        "claude-code-mcp-config-best-practices",
+        "web-pep723-uv-alternatives"
+      ],
+      "relationships": [
+        {
+          "concept": "Remove uv as Hard Runtime Dependency",
+          "relationship": "resolves"
+        },
+        {
+          "concept": "Embedding Dependency Bloat (~2 GB torch stack)",
+          "relationship": "is-feasible-only-after-reducing"
+        },
+        {
+          "concept": "LLM-Maintained Markdown Wiki (Karpathy)",
+          "relationship": "is-trivialized-by (deps reduce to pydantic, httpx, mcp)"
+        },
+        {
+          "concept": "pipx Console-Script (Pattern C)",
+          "relationship": "is-preferred-over-by-default"
+        }
+      ]
+    },
+    {
+      "name": "pipx Console-Script (Pattern C)",
+      "category": "architecture",
+      "description": "Pattern C: pyproject.toml declares [project.scripts] agent-knowledgebase-server = 'agent_knowledgebase.server:main'. User runs 'pipx install agent-knowledgebase-claude-plugin' once. .mcp.json becomes { command: 'agent-knowledgebase-server', args: [] }. Clean for users already in the Python-CLI-tool ecosystem.",
+      "key_details": [
+        "Requires [project.scripts] entry point in pyproject.toml.",
+        "User must have pipx installed (one dependency, but widely available — python-pipx in most distros).",
+        "pipx upgrade for version bumps.",
+        "Slower than uv to install, but fully isolated env per tool."
+      ],
+      "source_items": [
+        "web-pep723-uv-alternatives",
+        "claude-code-mcp-config-best-practices"
+      ],
+      "relationships": [
+        {
+          "concept": "Remove uv as Hard Runtime Dependency",
+          "relationship": "resolves-alternately"
+        },
+        {
+          "concept": "Stdlib venv Auto-Bootstrap (Pattern A)",
+          "relationship": "is-fallback-to"
+        }
+      ]
+    },
+    {
+      "name": "Docker Plugin Distribution (Pattern D)",
+      "category": "architecture",
+      "description": "Pattern D: publish a GHCR image per release; .mcp.json runs 'docker run -i --rm -v ${AGENT_KB_SAVES_DIR}:/data ghcr.io/goosefly99/agent-knowledgebase:X.Y.Z'. Zero-Python-on-host, lockfile-equivalent via image pinning, clean reproducibility. Cost: Docker Desktop on Windows, ~2s cold start, 200+ MB image, filesystem-permission setup friction.",
+      "key_details": [
+        "Dockerfile in plugin root; GHCR publish workflow per release.",
+        ".mcp.json command: docker, args: ['run', '-i', '--rm', '-v', '${AGENT_KB_SAVES_DIR}:/data', 'ghcr.io/...:X.Y.Z'].",
+        "~2s cold start per invocation.",
+        "200+ MB image footprint.",
+        "Docker Desktop required on Windows."
+      ],
+      "source_items": [
+        "web-pep723-uv-alternatives",
+        "claude-code-mcp-config-best-practices"
+      ],
+      "relationships": [
+        {
+          "concept": "Remove uv as Hard Runtime Dependency",
+          "relationship": "resolves-alternately"
+        },
+        {
+          "concept": "Embedding Dependency Bloat (~2 GB torch stack)",
+          "relationship": "contains (image absorbs the bloat away from host)"
+        }
+      ]
+    },
+    {
+      "name": "PEP-723 Inline Script Dependencies",
+      "category": "technique",
+      "description": "Python 3.13+ supports inline dependency metadata in single-file scripts; CPython 3.14+ adds stdlib 'pip run' support. An elegant future path — the plugin's entry point becomes a single file with a leading dep-block — but the runtime support is not mainstream in 2026. Document as future-only.",
+      "key_details": [
+        "Single-file script with leading comment block listing dependencies.",
+        "uv supports PEP-723 today; CPython 3.14+ adds stdlib 'pip run'.",
+        "Not mainstream in 2026 — skip as primary solution.",
+        "Could become the cleanest answer once CPython 3.14 ships widely."
+      ],
+      "source_items": [
+        "web-pep723-uv-alternatives"
+      ],
+      "relationships": [
+        {
+          "concept": "Remove uv as Hard Runtime Dependency",
+          "relationship": "resolves-in-future"
+        },
+        {
+          "concept": "Stdlib venv Auto-Bootstrap (Pattern A)",
+          "relationship": "may-be-replaced-by-in-future"
+        }
+      ]
+    },
+    {
+      "name": "CLAUDE_PLUGIN_ROOT Launch Contract",
+      "category": "architecture",
+      "description": "Claude Code's .mcp.json contract: command + args + env + ${CLAUDE_PLUGIN_ROOT} substitution at launch time, with transport defaulting to stdio (http / sse also supported). This substitution is what enables self-contained launchers (Pattern A's bin/run-server, Pattern B's PYTHONPATH, etc.).",
+      "key_details": [
+        "${CLAUDE_PLUGIN_ROOT} is substituted with the plugin install path at launch.",
+        "Transport defaults to stdio; http and sse also supported.",
+        "env is an optional envvar dict passed to the process.",
+        "Enables all four community patterns: A (venv wrapper), B (PYTHONPATH), C (console-script), D (docker)."
+      ],
+      "source_items": [
+        "claude-code-mcp-config-best-practices"
+      ],
+      "relationships": [
+        {
+          "concept": "Stdlib venv Auto-Bootstrap (Pattern A)",
+          "relationship": "enables"
+        },
+        {
+          "concept": "pipx Console-Script (Pattern C)",
+          "relationship": "enables"
+        },
+        {
+          "concept": "Docker Plugin Distribution (Pattern D)",
+          "relationship": "enables"
+        }
+      ]
+    },
+    {
+      "name": "Decision Point: WIKI-STYLE vs VECTOR-RAG vs HYBRID",
+      "category": "decision-point",
+      "description": "THE SINGLE HIGHEST-LEVERAGE DECISION IN THIS REDESIGN. The Karpathy LLM Wiki source is flagged at relevance 1.0 precisely because at plugin-target scale (hundreds of articles / ~500K words, single user) a markdown wiki beats vector RAG on quality AND simultaneously solves the uv dependency problem by eliminating chromadb/sentence-transformers. Three forks: (1) WIKI-STYLE — delete embeddings, markdown files + LLM-maintained index; (2) VECTOR-RAG-REPAIR — fix current stack + adopt multi-vector + MMR + rerank + fastembed/remote; (3) HYBRID — both backends behind one retriever interface, user picks per-KB.",
+      "key_details": [
+        "WIKI-STYLE: deletes embeddings / vector store entirely; plugin becomes thin batch-ingest + SQL-import layer that populates markdown; query = Claude Code reads filesystem.",
+        "VECTOR-RAG-REPAIR: keeps chromadb OR moves to LightRAG; fastembed or remote embeddings; adds multi-vector, MMR, rerank, symbolic filters.",
+        "HYBRID: pluggable retriever backend so backend=markdown and backend=chromadb (or backend=lightrag) are peers; user picks per-KB with sane default.",
+        "Wiki wins at <1000 docs single-domain single-user; vector RAG wins at 1000+ docs / multi-tenant / latency-sensitive; hybrid wins when you want both classes of query (relationship + semantic-fuzzy-match).",
+        "WIKI-STYLE is the direct solver for both stated bugs (embeddings don't work, kb tool methods don't work) because it removes the stacks those bugs live in."
+      ],
+      "source_items": [
+        "yt-sboNwYmH3AY",
+        "yt-QHlB-RJfx8w",
+        "yt-Cyv-dgv80kE",
+        "web-embedding-alternatives"
+      ],
+      "relationships": [
+        {
+          "concept": "LLM-Maintained Markdown Wiki (Karpathy)",
+          "relationship": "is-option-A-of"
+        },
+        {
+          "concept": "Graph RAG (LightRAG)",
+          "relationship": "is-option-B-sub-choice-of"
+        },
+        {
+          "concept": "Pluggable Retriever Backend (QueryOrchestrator boundary)",
+          "relationship": "is-option-C-enabled-by"
+        },
+        {
+          "concept": "Embedding Dependency Bloat (~2 GB torch stack)",
+          "relationship": "is-eliminated-by-option-A"
+        }
+      ]
+    },
+    {
+      "name": "Decision Point: Runtime Bootstrap Strategy",
+      "category": "decision-point",
+      "description": "The second major fork: how does the plugin launch without uv? Four candidate patterns. Primary recommendation (Pattern A, stdlib-venv auto-bootstrap) is strongest after the architecture decision is made — because dependency-surface-area drives feasibility. If WIKI-STYLE is chosen, Pattern A is trivial (deps = pydantic, httpx, mcp). If VECTOR-RAG-REPAIR is chosen, Pattern A needs fastembed or remote-only embeddings to be feasible at a sane install size.",
+      "key_details": [
+        "Pattern A — Stdlib venv + bash/.cmd wrapper at ${CLAUDE_PLUGIN_ROOT}/bin/run-server. Primary recommendation.",
+        "Pattern B — System python + PYTHONPATH. Simplest, highest user friction.",
+        "Pattern C — pipx console-script. Good for Python-CLI ecosystem users.",
+        "Pattern D — Docker. Zero-Python-on-host but requires Docker Desktop.",
+        "Recommendation: ship Pattern A as default + document B/C/D in README."
+      ],
+      "source_items": [
+        "web-pep723-uv-alternatives",
+        "claude-code-mcp-config-best-practices"
+      ],
+      "relationships": [
+        {
+          "concept": "Remove uv as Hard Runtime Dependency",
+          "relationship": "resolves"
+        },
+        {
+          "concept": "Stdlib venv Auto-Bootstrap (Pattern A)",
+          "relationship": "is-primary-answer"
+        },
+        {
+          "concept": "Decision Point: WIKI-STYLE vs VECTOR-RAG vs HYBRID",
+          "relationship": "is-downstream-of"
+        }
+      ]
+    },
+    {
+      "name": "Decision Point: Embedding Provider Default",
+      "category": "decision-point",
+      "description": "Given the VECTOR-RAG or HYBRID path, which embedding provider is the DEFAULT? Three candidates: (1) fastembed-local (all-MiniLM-L6-v2 via ONNX, ~100 MB, private, zero network); (2) Remote Ollama (http://localhost:11434/v1, ~0 MB plugin install, requires user's Ollama); (3) Remote OpenAI (requires API key, fastest and best quality). Choice affects Pattern A feasibility and default-user-experience.",
+      "key_details": [
+        "Option 1 (fastembed): ~100 MB install, zero network, same MiniLM vectors, works offline.",
+        "Option 2 (Ollama): ~0 MB plugin install, but assumes user already runs Ollama (many Claude Code users do).",
+        "Option 3 (OpenAI): highest quality + speed, but requires API key and network.",
+        "Current plugin as of v0.7.0 supports remote OpenAI-compatible /embeddings — the code is already there.",
+        "Recommendation depends on target user: fastembed for offline-by-default; Ollama for 'already-running'; OpenAI-compatible with env secret for managed."
+      ],
+      "source_items": [
+        "web-embedding-alternatives"
+      ],
+      "relationships": [
+        {
+          "concept": "fastembed / ONNX Embeddings",
+          "relationship": "is-option-1-of"
+        },
+        {
+          "concept": "Remote-Only Embeddings (Ollama / OpenAI-compatible)",
+          "relationship": "is-options-2-3-of"
+        },
+        {
+          "concept": "Per-Page Embedding Model Stamping",
+          "relationship": "must-record-choice-from"
+        },
+        {
+          "concept": "Decision Point: WIKI-STYLE vs VECTOR-RAG vs HYBRID",
+          "relationship": "is-relevant-only-in-non-WIKI-branches"
+        }
+      ]
+    }
+  ],
+  "themes": [
+    {
+      "name": "Karpathy Wiki vs Vector RAG",
+      "description": "The single highest-leverage decision in the redesign — at plugin-target scale an LLM-maintained markdown wiki outperforms vector DBs on quality AND eliminates the dependency stack that causes the uv requirement.",
+      "concept_names": [
+        "LLM-Maintained Markdown Wiki (Karpathy)",
+        "Naive RAG (chunk + embed + cosine top-K)",
+        "Decision Point: WIKI-STYLE vs VECTOR-RAG vs HYBRID"
+      ]
+    },
+    {
+      "name": "Graph RAG Layer",
+      "description": "If vector RAG is retained, augment it with a knowledge-graph layer (entities + typed edges) to handle relationship queries that cosine similarity cannot answer.",
+      "concept_names": [
+        "Graph RAG (LightRAG)",
+        "Naive RAG (chunk + embed + cosine top-K)",
+        "Skills-Based Plugin Surface (CRUD skills)"
+      ]
+    },
+    {
+      "name": "Multi-Vector Retrieval and MMR",
+      "description": "The 2026 production upgrade path over naive cosine top-K: multiple vectors per object, MMR diversity reranking, symbolic metadata filters, optional cross-encoder rerank.",
+      "concept_names": [
+        "Multi-Vector-Per-Object Retrieval",
+        "MMR Diversity Reranking",
+        "Symbolic Metadata Filters",
+        "Advanced Retrievers (MultiQuery / SelfQuery / ParentDocument)",
+        "BGE-Reranker Rerank Stage",
+        "ReFrag Precomputed-Embedding Inference"
+      ]
+    },
+    {
+      "name": "Remote vs Local Embeddings",
+      "description": "Two orthogonal ways to shrink the embedding dependency footprint: swap torch for ONNX locally, or push embeddings off the plugin to any OpenAI-compatible endpoint.",
+      "concept_names": [
+        "Embedding Dependency Bloat (~2 GB torch stack)",
+        "fastembed / ONNX Embeddings",
+        "Remote-Only Embeddings (Ollama / OpenAI-compatible)",
+        "Modern Small Embedding Models (BGE-small, EmbeddingGemma, gte)",
+        "Per-Page Embedding Model Stamping",
+        "Decision Point: Embedding Provider Default"
+      ]
+    },
+    {
+      "name": "Plugin Runtime Bootstrap Without uv",
+      "description": "How the plugin launches without requiring uv on the host. Pattern A (stdlib-venv auto-bootstrap) is primary; pipx, Docker, and PEP-723 are documented alternates.",
+      "concept_names": [
+        "Remove uv as Hard Runtime Dependency",
+        "Stdlib venv Auto-Bootstrap (Pattern A)",
+        "pipx Console-Script (Pattern C)",
+        "Docker Plugin Distribution (Pattern D)",
+        "PEP-723 Inline Script Dependencies",
+        "CLAUDE_PLUGIN_ROOT Launch Contract",
+        "Decision Point: Runtime Bootstrap Strategy"
+      ]
+    },
+    {
+      "name": "Retriever Abstraction and Pluggable Backends",
+      "description": "A strict retriever interface (invoke(query, k, filters) -> List[Document]) that lets chromadb, markdown-wiki, LightRAG, and in-memory backends swap without changing the MCP tool surface.",
+      "concept_names": [
+        "Pluggable Retriever Backend (QueryOrchestrator boundary)",
+        "Advanced Retrievers (MultiQuery / SelfQuery / ParentDocument)",
+        "Chunk Size / Overlap / Semantic Splitting"
+      ]
+    },
+    {
+      "name": "Agent Composition: RAG as One Pattern",
+      "description": "The plugin owns exactly one of Andrew Ng's four agent patterns (RAG). Planning, tool-use orchestration, and multi-agent composition live in the calling agent. Implies a stateless, structured-JSON tool surface with no embedded agent behavior.",
+      "concept_names": [
+        "Stateless Structured-JSON Tool Contract",
+        "History-Aware Retrieval is Client-Side",
+        "Skills-Based Plugin Surface (CRUD skills)"
+      ]
+    },
+    {
+      "name": "Classic RAG Failure Modes",
+      "description": "The canonical small-scale RAG bugs — chunk-size/overlap mis-tuning and embedding-model mixing — that likely explain the 'embeddings don't work' user report and that strict engineering (per-page model stamping, per-KB chunk config) prevents.",
+      "concept_names": [
+        "Chunk Size / Overlap / Semantic Splitting",
+        "Per-Page Embedding Model Stamping",
+        "Naive RAG (chunk + embed + cosine top-K)"
+      ]
+    },
+    {
+      "name": "ReFrag Long-Context Compression",
+      "description": "Meta's research on decoder-side reuse of retrieved embeddings (31x TTFT, 7x throughput). Out of plugin scope for implementation, but anchors multi-vector-per-object as the forward-compatible storage shape.",
+      "concept_names": [
+        "ReFrag Precomputed-Embedding Inference",
+        "Multi-Vector-Per-Object Retrieval"
+      ]
+    },
+    {
+      "name": "Embedding Dependency Bloat",
+      "description": "The ~2 GB torch + transformers + tokenizers install is the primary reason uv exists in the current .mcp.json. Reducing the dependency surface is the prerequisite to every clean runtime-bootstrap story.",
+      "concept_names": [
+        "Embedding Dependency Bloat (~2 GB torch stack)",
+        "fastembed / ONNX Embeddings",
+        "Remote-Only Embeddings (Ollama / OpenAI-compatible)",
+        "LLM-Maintained Markdown Wiki (Karpathy)"
+      ]
+    }
+  ],
+  "key_findings": [
+    "The single highest-leverage decision is WIKI-STYLE vs VECTOR-RAG vs HYBRID. Karpathy's LLM Wiki is flagged at relevance 1.0 because it simultaneously (a) wins on quality at plugin-target scale and (b) eliminates the dependency stack that forces uv. A WIKI-STYLE path collapses both stated bugs ('embeddings don't work', 'kb tool methods don't work') by removing the modules those bugs live in.",
+    "If VECTOR-RAG is retained, the 2026 upgrade path is multi-vector-per-object + MMR + symbolic filters + optional BGE-Reranker, all behind a strict retriever abstraction so the backend (chromadb / LightRAG / markdown) can swap without touching the MCP tool surface.",
+    "The sentence-transformers/torch stack is ~2 GB and is the primary reason uv exists in .mcp.json. Replacing with fastembed (ONNX) shrinks to ~100 MB (20x); switching to remote Ollama/OpenAI shrinks to ~20 MB. This reduction is a prerequisite, not a nice-to-have, for a clean stdlib-venv auto-bootstrap.",
+    "Pattern A (stdlib-venv auto-bootstrapped by a bash/.cmd wrapper at ${CLAUDE_PLUGIN_ROOT}/bin/run-server) is the recommended primary runtime path. pipx console-script (Pattern C) and Docker (Pattern D) are documented alternates. uvx is NOT a valid 'remove uv' solution.",
+    "The MCP tool surface must remain stateless, structured-JSON, and free of embedded agent behavior. The plugin owns exactly one of Andrew Ng's four agent patterns (RAG). History-aware query rewriting, planning, multi-agent composition all live in the calling agent.",
+    "Per-page embedding-model stamping must be strictly enforced: mismatched models across ingest and query is the classic silent-failure bug. Current dominant_embedding_model field is correct — it must reject heterogeneous writes or auto-reembed.",
+    "If retaining vector retrieval, default to MarkdownHeaderTextSplitter for markdown source_type; expose chunk_size and chunk_overlap as per-KB config with sane per-source-type defaults (prose / code / markdown).",
+    "If WIKI-STYLE is adopted, the Python MCP server becomes a thin batch-ingest / SQL-import / de-dup / lint / index-rebuild layer that populates the markdown wiki; Claude Code reads the filesystem natively at query time.",
+    "If VECTOR-RAG is retained and a graph layer is added, LightRAG is the open-source reference implementation: Dockerized, supports Ollama or OpenAI embeddings, maps REST endpoints 1:1 to Claude Code skills (query / upload / explore / status).",
+    "The plugin should ship both an MCP tool surface (programmatic) AND a set of Claude Code skills (LLM-affordance). Skills include: query, upload, explore, status, lint, index-rebuild, dead-link-check. Both surfaces front the same retriever abstraction."
+  ],
+  "knowledge_gaps": [
+    "Concrete root-cause of the current embeddings.py breakage is NOT in the research — must be pinned by codebase grep. User report: 'current embeddings do not work'. Suspects (per codebase requirements): local sentence-transformers path may still reference removed openai SDK code after the v0.7.0 httpx rewrite; remote provider config validation may reject valid URLs; EmbedderUnavailableError may be masking the real exception.",
+    "Concrete root-cause of the current server.py / services/query.py kb tool method failures is NOT in the research — must be pinned by codebase grep. User report: 'kb tool methods do not work'. Suspects (per codebase requirements): 180s wall-clock timeout in server.py swallows stalls; sqlite3 thread-affinity bug forces service-rebuild on every timeout; hybrid-weights validation in query path may reject valid defaults.",
+    "Research does not contain benchmark numbers for WIKI-STYLE at plugin-exact-scale (user's ~N KBs of ~N pages each). Karpathy's 95% token-reduction figure is a single anecdote, not a controlled benchmark. A validation experiment is needed to confirm the quality claim on the user's actual corpora.",
+    "Research does not specify which markdown-wiki tools should ship as MCP methods vs Claude Code skills vs pure filesystem operations. The split between 'LLM reads files directly' and 'MCP server exposes wiki operations' is not fully resolved by the sources.",
+    "Research does not cover migration path from existing chromadb-indexed KBs to either WIKI-STYLE or updated VECTOR-RAG schema. Existing users have data — the redesign must answer how it travels.",
+    "Research does not benchmark BGE-Reranker-v2 cold-start latency via fastembed on typical Claude Code user hardware — this matters for whether rerank becomes a default or opt-in step.",
+    "Research does not cover how Windows-specific path handling (\\ vs /, Scripts/ vs bin/, .cmd vs bash) will be managed in the Pattern A bootstrap wrapper; cross-platform correctness is an implementation detail left open.",
+    "Research does not address existing query-log / telemetry schema (pipeline_runs columns added in v0.6.0) — whether and how it travels into any redesigned backend is unspecified.",
+    "Research does not cover how AGENT_KB_SAVES_DIR, cross-process-lock-recipe, and the consumer-side stderr-capture discipline carry forward into the redesigned runtime — these are v0.6.0 codebase invariants not in the curated sources.",
+    "Research does not specify how dedup_key / dedup_policy (incomplete ROADMAP item) interacts with either WIKI-STYLE (natural file-level dedup by filename?) or VECTOR-RAG (chunk-level)."
+  ],
+  "open_questions": [
+    "DECISION REQUIRED: WIKI-STYLE, VECTOR-RAG-REPAIR, or HYBRID? This decision gates every downstream design choice and has been pre-flagged by the research as the single highest-leverage fork.",
+    "DECISION REQUIRED: If VECTOR-RAG or HYBRID is chosen, default embedding provider — fastembed-local, remote Ollama, or remote OpenAI?",
+    "DECISION REQUIRED: Runtime bootstrap — ship Pattern A (stdlib-venv wrapper) as default with Pattern C (pipx) and Pattern D (Docker) documented, or pick a different primary?",
+    "Should the plugin expose Claude Code skills (skill files) AS WELL AS MCP tools, following the LightRAG model — or only MCP tools?",
+    "If WIKI-STYLE is chosen, does the plugin ship any query-time MCP tools at all, or is query-time purely Claude Code reading the filesystem with only ingest / lint / index-rebuild as MCP tools?",
+    "If WIKI-STYLE is chosen, what is the CLAUDE.md that ships as part of each KB directory — what project rules does it encode, and does the plugin template it per-KB?",
+    "Should the plugin adopt the Document schema (page_content + metadata dict) shape from LangChain to maximize interop with tool-calling agents, or keep the existing KBPage shape?",
+    "What is the migration path for existing chromadb KBs to the redesigned backend — export-and-reimport, dual-backend transition period, or hard cutover?",
+    "Does 'backend=markdown' need a read-only query MCP tool for callers that can't read the filesystem directly (remote agents, web UIs) — or is filesystem-read the entire contract?",
+    "Should the plugin promote MMR, rerank, multi-vector as per-KB config flags or as first-class kb_query parameters?",
+    "Should Graph-RAG (LightRAG) be offered as a THIRD backend (backend=lightrag) alongside chromadb and markdown, or is it out of scope for this redesign?",
+    "How is the current v0.6.0 telemetry schema (pipeline_runs 9-column addition, stderr-tee discipline, cross-process-lock) preserved across backends?"
+  ]
+}

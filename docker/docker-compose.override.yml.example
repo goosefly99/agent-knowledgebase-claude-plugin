@@ -1,0 +1,16 @@
+# Copy to docker/docker-compose.override.yml to customize per-host.
+# Example below: bind-mount your host saves dir and use OpenAI instead
+# of Ollama.
+
+services:
+  agent-knowledgebase:
+    volumes:
+      - /path/on/your/host:/data/saves
+    environment:
+      AGENT_KB_EMBEDDING_PROVIDER: openai
+      AGENT_KB_EMBEDDING_MODEL: text-embedding-3-small
+      OPENAI_API_KEY: sk-...
+
+  # Disable the ollama sidecar entirely if you only use OpenAI.
+  ollama:
+    profiles: [disabled]

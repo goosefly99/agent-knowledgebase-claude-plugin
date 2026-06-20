@@ -1,97 +1,717 @@
-"""Top-level knowledgebase lifecycle service coordinating all sub-services."""
+"""Top-level knowledgebase lifecycle service coordinating all sub-services.
+
+Each knowledgebase is stored in its own subdirectory under
+``<saves_dir>/<sanitized-name>/``, containing a per-KB SQLite database
+and ChromaDB directory.  A lightweight ``.index.json`` at the
+``saves_dir`` level maps ``kb_id -> dir_name`` for fast lookups.
+
+Concurrency model
+-----------------
+FastMCP runs synchronous tool handlers in a thread pool.  To prevent
+races when multiple tool calls target the *same* kb_id concurrently
+(e.g., two ``kb_ingest_batch`` calls for the same KB), :meth:`ingest_source`
+holds a per-kb_id ``threading.Lock`` for the entire pipeline duration.
+
+This is **single-process-only** serialization — it does not coordinate
+across multiple Python processes.  Cross-process isolation (e.g.,
+Postgres advisory locks, filesystem ``flock``) is future work.
+
+Multi-process deployments: see ``docs/cross-process-lock-recipe.md``
+for opt-in ``filelock`` / ``portalocker`` / Postgres-advisory /
+raw-``fcntl`` recipes.  The built-in ``threading.Lock`` does NOT
+protect against concurrent ingest from a second Python process.
+
+Why ``threading.Lock`` and not ``asyncio.Lock``?
+Because this codebase is entirely synchronous — no ``async def``
+anywhere in ``src/agent_knowledgebase/``.  ``asyncio.Lock`` requires a
+running event loop and only provides mutual exclusion within a single
+event loop, so it would be wrong here.
+"""
 
 from __future__ import annotations
 
+import json
+import os
+import shutil
+import threading
+import time
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Optional
 
-from agent_knowledgebase.config import Settings
+from agent_knowledgebase.backends import RetrieverBackend, get_backend
+from agent_knowledgebase.config import Settings, sanitize_kb_dir_name
 from agent_knowledgebase.database import Database
 from agent_knowledgebase.models import (
     Knowledgebase,
     PageType,
     PipelineRun,
+    RunStatus,
     Source,
     SourceStatus,
     SourceType,
     WikiPage,
 )
-from agent_knowledgebase.services.embeddings import Embedder, create_embedder
+from agent_knowledgebase.services.dedup_service import (
+    DEFAULT_DEDUP_POLICY,
+    DedupPolicy,
+    resolve_dedup_action,
+)
+from agent_knowledgebase.services.embeddings import (
+    Embedder,
+    create_embedder,
+    create_embedder_for_model,
+)
 from agent_knowledgebase.services.export import MarkdownExporter
 from agent_knowledgebase.services.ingestion import IngestionOrchestrator
 from agent_knowledgebase.services.lint import LintIssue, LintReport, WikiLinter
 from agent_knowledgebase.services.pipeline import PipelineManager
-from agent_knowledgebase.services.query import QueryOrchestrator, SearchResult
+from agent_knowledgebase.services.query import (
+    QueryOrchestrator,
+    SearchResult,
+    default_top_k,
+    hybrid_weights_from,
+)
+from agent_knowledgebase.services.stderr_log import knowledgebase_stderr_log
 from agent_knowledgebase.services.vectorstore import VectorStore, create_vectorstore
 from agent_knowledgebase.services.wiki import WikiManager
+
+from concurrent.futures import ALL_COMPLETED, ThreadPoolExecutor, wait
+
+
+# ---------------------------------------------------------------------------
+# Phase 5 — mixed embedder_version rejection
+# ---------------------------------------------------------------------------
+
+
+class EmbedderVersionMismatchError(RuntimeError):
+    """Ingest under embedder *V_new* into a KB carrying chunks under *V_old*.
+
+    Phase 5 introduces per-chunk ``embedder_version`` stamping so two
+    embedders with the same nominal model_name but different
+    quantization or library (e.g. fastembed-MiniLM-int8 vs
+    sentence-transformers-MiniLM-fp32) cannot be silently mixed in the
+    same KB. Vectors from different embedder versions don't compose
+    correctly under cosine similarity even when their dimensions
+    match.
+
+    Bypass: set ``AGENT_KB_AUTO_REEMBED=1`` in the environment when
+    intentionally re-embedding an existing KB under a new embedder.
+
+    **IMPORTANT after bypass.** The bypass disables *this rejection
+    only* — it does NOT touch the chunks already stored under the OLD
+    embedder version. The result is a permanently mixed-version KB
+    where the snapshot resolver picks the dominant tuple at query time
+    and the minority chunks return wrong-geometry vectors that will
+    rank arbitrarily badly. To avoid silently-unreachable chunks, the
+    operator MUST re-ingest the prior chunks under the new embedder
+    (preferred), or call ``kb_delete`` and recreate the KB before
+    re-ingesting from raw sources. Using the bypass and then leaving
+    the KB in mixed state is a footgun; Phase 5 emits a structured
+    stderr ``MIXED_EMBEDDER_VERSIONS_DETECTED`` warning at query time
+    so the situation is visible to operators.
+
+    spec_id: 70ab2170-381a-4657-bcd1-28a40c6f369b
+    """
+
+    error_code = "EMBEDDER_VERSION_MISMATCH"
+
+    def __init__(
+        self,
+        *,
+        kb_id: str,
+        existing_versions: set[str],
+        incoming_version: str,
+    ) -> None:
+        self.kb_id = kb_id
+        self.existing_versions = set(existing_versions)
+        self.incoming_version = incoming_version
+        existing_repr = sorted(self.existing_versions)
+        super().__init__(
+            f"EMBEDDER_VERSION_MISMATCH: kb_id={kb_id!r} already carries "
+            f"chunks under embedder_version(s) {existing_repr}; refusing "
+            f"to ingest under {incoming_version!r}. Set "
+            f"AGENT_KB_AUTO_REEMBED=1 to bypass — but re-ingest the "
+            f"prior chunks under the new embedder afterwards (or "
+            f"kb_delete + recreate), otherwise the KB ends up in a "
+            f"permanently mixed state where the minority-version chunks "
+            f"are silently unreachable at query time."
+        )
+
+    def to_payload(self) -> dict[str, object]:
+        return {
+            "error": "embedder_version_mismatch",
+            "error_code": self.error_code,
+            "kb_id": self.kb_id,
+            "existing_versions": sorted(self.existing_versions),
+            "incoming_version": self.incoming_version,
+            "bypass_env": "AGENT_KB_AUTO_REEMBED=1",
+        }
+
+
+# ---------------------------------------------------------------------------
+# Per-KB context bundle
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _KBContext:
+    """Internal bundle of per-KB database, sub-services, and vectorstore."""
+
+    db: Database
+    wiki: WikiManager
+    pipeline: PipelineManager
+    linter: WikiLinter
+    exporter: MarkdownExporter
+    vectorstore: Optional[VectorStore] = field(default=None)
+
+
+# ---------------------------------------------------------------------------
+# Index file helpers
+# ---------------------------------------------------------------------------
+
+_INDEX_FILENAME = ".index.json"
+
+
+def _load_index(base_dir: Path) -> dict[str, str]:
+    """Load the ``kb_id -> dir_name`` index, returning ``{}`` if absent."""
+    path = base_dir / _INDEX_FILENAME
+    if not path.exists():
+        return {}
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _save_index(base_dir: Path, index: dict[str, str]) -> None:
+    """Atomically write the index file."""
+    path = base_dir / _INDEX_FILENAME
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(index, indent=2), encoding="utf-8")
+    tmp.replace(path)
+
+
+# ---------------------------------------------------------------------------
+# Service
+# ---------------------------------------------------------------------------
 
 
 class KnowledgebaseService:
     """Coordinates all sub-services for full knowledgebase lifecycle.
 
-    This is the primary entry-point for consumers who want to create KBs,
-    ingest sources, query, lint, and export -- without needing to manage
-    individual sub-services directly.
+    Each knowledgebase is stored in its own subdirectory with an
+    independent SQLite database and ChromaDB directory.
     """
 
     def __init__(self, config: Settings) -> None:
         self._config = config.resolve_paths()
+        self._base_dir = self._config.knowledgebases_dir
 
-        # Core storage
-        self._db = Database(self._config.db_path)
-
-        # Embedder (shared across KBs)
-        self._embedder: Embedder = create_embedder(self._config)
-
-        # Sub-services that depend only on DB
-        self._wiki = WikiManager(self._db)
-        self._pipeline = PipelineManager(self._db)
+        # Shared stateless services — embedder is loaded lazily the first
+        # time it is needed since the sentence-transformers model load takes
+        # several seconds and would otherwise dominate first-call latency.
+        self._embedder_instance: Embedder | None = None
         self._ingestion = IngestionOrchestrator(self._config)
-        self._linter = WikiLinter(self._wiki, self._db)
-        self._exporter = MarkdownExporter(self._wiki)
 
-        # Per-KB vectorstore cache (collection_name = kb_id)
-        self._vectorstores: dict[str, VectorStore] = {}
+        # Per-KB state — lazily populated
+        self._contexts: dict[str, _KBContext] = {}
+        self._index: dict[str, str] = _load_index(self._base_dir)
+
+        # Per-kb_id ingestion locks (threading, not asyncio — see module docstring).
+        # _kb_locks maps kb_id -> Lock; _kb_locks_guard serialises dict insertion
+        # so two threads discovering the same kb_id for the first time don't race.
+        self._kb_locks: dict[str, threading.Lock] = {}
+        self._kb_locks_guard: threading.Lock = threading.Lock()
+
+        # RetrieverBackend abstraction (v0.13.0 cut).  The factory now
+        # always returns ``ChromadbBackend`` — per-KB routing
+        # (``.migrated_to`` sentinel, ``kb_backend_per_kb`` mapping)
+        # was removed when the markdown / lightrag / textvec backends
+        # were dropped. The Protocol seam is retained.
+        self._backend: RetrieverBackend = get_backend(self._config, service=self)
+
+        # Phase 4 (I-01): per-(kb_id, snapshot-tuple) embedder cache so
+        # repeated queries against an unchanged KB don't pay the
+        # snapshot read + ``create_embedder_for_model`` build cost on
+        # every call. Keyed on (kb_id, model, provider, base_url) and
+        # invalidated on (a) per-KB backend cache invalidation
+        # (delete_kb / kb_migrate cutover), and (b) every
+        # ``_ingest_source_locked`` completion (the embedder identity
+        # may have shifted with new chunks). The lock guards both the
+        # dict mutation and the cached entries during invalidation.
+        self._query_embedder_cache: dict[
+            tuple[str, str | None, str | None, str | None], Embedder
+        ] = {}
+        self._query_embedder_cache_lock: threading.Lock = threading.Lock()
+
+        # Phase 5 (I-04): per-process set of kb_ids for which we've
+        # already emitted the MIXED_EMBEDDER_VERSIONS_DETECTED warning,
+        # so the structured stderr line fires at most once per KB per
+        # process. Reset on per-KB backend invalidation so a kb_delete +
+        # recreate gets a fresh emission.
+        # spec_id: 70ab2170-381a-4657-bcd1-28a40c6f369b
+        self._mixed_version_warned: set[str] = set()
+        self._mixed_version_warned_lock: threading.Lock = threading.Lock()
+
+        # Phase 5 (B-02): per-process set of kb_ids we've already
+        # auto-backfilled in this process. Idempotent guard so the
+        # legacy-NULL detection runs at most once per kb_id per process,
+        # even though the snapshot read itself is also idempotent (a
+        # second backfill writes 0 rows because the COALESCE makes the
+        # WHERE NULL filter exclude already-stamped rows). The set
+        # avoids a redundant SQL UPDATE on every query.
+        # spec_id: 70ab2170-381a-4657-bcd1-28a40c6f369b
+        self._auto_backfilled_kbs: set[str] = set()
+        self._auto_backfilled_kbs_lock: threading.Lock = threading.Lock()
+
+    @property
+    def _embedder(self) -> Embedder:
+        """Lazily instantiate the embedder on first use."""
+        if self._embedder_instance is None:
+            self._embedder_instance = create_embedder(self._config)
+        return self._embedder_instance
+
+    @staticmethod
+    def _is_legacy_ollama_model(model_name: str) -> bool:
+        """True when *model_name* is a known historical v0.6.0 Ollama default.
+
+        The Phase 4 backfill required operators to call
+        ``backfill_provider_snapshot`` before adopting Phase 5; the
+        Phase 5 follow-up (B-02) adds an automatic backfill for the
+        single most-common case: KBs ingested under the
+        ``qwen3-embedding:8b`` Ollama default that v0.6.0 shipped with.
+        New historical defaults (if any are added) extend the prefix
+        list here. spec_id: 70ab2170-381a-4657-bcd1-28a40c6f369b
+        """
+        return model_name.startswith("qwen3-embedding")
+
+    def _auto_backfill_legacy_ollama(self, kb_id: str, model_name: str) -> None:
+        """Stamp ``provider='ollama'`` + Ollama default base_url for *kb_id*.
+
+        Idempotent — guarded by ``_auto_backfilled_kbs``. Emits a
+        structured ``LEGACY_OLLAMA_KB_BACKFILLED`` stderr line so
+        operators see the auto-fix happen. The actual UPDATE is scoped
+        to chunks whose stamped model matches *model_name* so a
+        heterogeneous KB doesn't get other-model rows misstamped.
+        spec_id: 70ab2170-381a-4657-bcd1-28a40c6f369b
+        """
+        from agent_knowledgebase.services.embeddings import DEFAULT_OLLAMA_BASE_URL
+
+        with self._auto_backfilled_kbs_lock:
+            if kb_id in self._auto_backfilled_kbs:
+                return
+            ctx = self._ctx(kb_id)
+            rows_updated = ctx.db.backfill_embedding_snapshot(
+                kb_id=kb_id,
+                provider="ollama",
+                base_url=DEFAULT_OLLAMA_BASE_URL,
+                embedding_model=model_name,
+            )
+            self._auto_backfilled_kbs.add(kb_id)
+        knowledgebase_stderr_log(
+            kb_id=kb_id,
+            op="backfill_legacy",
+            phase="auto",
+            elapsed_ms=0,
+            rows_in=rows_updated,
+            rows_ok=rows_updated,
+            rows_skipped=0,
+            rows_failed=0,
+            dedup_policy="n/a",
+            request_id=None,
+            tool_caller_version=None,
+            error_code="LEGACY_OLLAMA_KB_BACKFILLED",
+            error_message=(
+                f"auto-backfilled provider='ollama' / base_url="
+                f"{DEFAULT_OLLAMA_BASE_URL!r} for legacy v0.6.0 KB "
+                f"with model={model_name!r}; {rows_updated} chunks updated"
+            ),
+        )
+
+    def _maybe_warn_mixed_versions(self, kb_id: str) -> None:
+        """Emit MIXED_EMBEDDER_VERSIONS_DETECTED at most once per kb_id per process.
+
+        Cheap probe via :meth:`Database.get_embedder_versions` (indexed
+        on (kb_id, embedder_version) since I-07). Suppression set guards
+        against repeated emission for the same KB; the set is reset on
+        per-KB backend invalidation so a kb_delete + recreate gets a
+        fresh emission if appropriate. spec_id:
+        70ab2170-381a-4657-bcd1-28a40c6f369b
+        """
+        if kb_id in self._mixed_version_warned:
+            return
+        ctx = self._ctx(kb_id)
+        try:
+            versions = ctx.db.get_embedder_versions(kb_id)
+        except Exception:  # noqa: BLE001 — diagnostic path; never raise
+            return
+        if len(versions) <= 1:
+            return
+        with self._mixed_version_warned_lock:
+            if kb_id in self._mixed_version_warned:
+                return
+            self._mixed_version_warned.add(kb_id)
+        version_list = sorted(versions)
+        knowledgebase_stderr_log(
+            kb_id=kb_id,
+            op="snapshot_resolve",
+            phase="warn",
+            elapsed_ms=0,
+            rows_in=0,
+            rows_ok=0,
+            rows_skipped=0,
+            rows_failed=0,
+            dedup_policy="n/a",
+            request_id=None,
+            tool_caller_version=None,
+            error_code="MIXED_EMBEDDER_VERSIONS_DETECTED",
+            error_message=(
+                f"kb_id={kb_id!r} carries chunks under multiple "
+                f"embedder_version values {version_list}; the snapshot "
+                f"resolver picks the dominant tuple, so minority-version "
+                f"chunks are silently unreachable at query time. "
+                f"Re-ingest minority chunks under the dominant embedder "
+                f"or kb_delete + recreate."
+            ),
+        )
+
+    def _query_embedder_for(self, kb_id: str) -> Embedder:
+        """Return the :class:`Embedder` to use when querying *kb_id*.
+
+        Retrieval requires the query vector to come from the same model
+        that produced the stored vectors — otherwise similarity scores
+        are meaningless (and dimensions may not even match).
+
+        Phase 4 (per-page provider snapshot): the resolution now reads
+        the *(model, provider, base_url)* triple stamped on each chunk
+        at ingest time via :meth:`Database.get_embedding_snapshot`. The
+        full snapshot is passed into
+        :func:`create_embedder_for_model` so an existing v0.6.0 KB
+        ingested under ``provider=ollama`` /
+        ``base_url=http://127.0.0.1:11434`` stays queryable AFTER the
+        Phase 5 default flip to ``provider=remote`` /
+        ``base_url=...openai.com``. Falls back to the globally
+        configured embedder when the KB has no chunks yet or no
+        ``embedding_model`` metadata (pre-0.7 ingestions).
+
+        Phase 5 (B-02) — auto-backfill legacy v0.6.0 KBs. When a KB's
+        snapshot is ``(model, None, None)`` AND the model is a known
+        historical Ollama default (``qwen3-embedding...``), backfill
+        ``provider='ollama'`` + ``base_url='http://127.0.0.1:11434'``
+        for that kb_id and re-read the snapshot. Without this auto-
+        backfill, an operator who jumps v0.6.0 → v0.11.0 directly
+        without running ``backfill_provider_snapshot`` first would hit
+        ``ValueError("AGENT_KB_EMBED_API_KEY required for remote
+        embeddings")`` on first ``kb_query`` because the snapshot would
+        resolve to the post-flip default. Idempotent — guarded by an
+        in-process set so a second call skips the SQL probe entirely.
+        Emits a ``LEGACY_OLLAMA_KB_BACKFILLED`` structured stderr line
+        so operators see what happened.
+        spec_id: 70ab2170-381a-4657-bcd1-28a40c6f369b
+
+        Phase 5 (I-04) — emit a structured
+        ``MIXED_EMBEDDER_VERSIONS_DETECTED`` warning at most once per
+        kb_id per process when the KB carries chunks under more than
+        one ``embedder_version`` (the documented but dangerous result
+        of ``AGENT_KB_AUTO_REEMBED=1`` without follow-up re-ingest).
+        Minority-version chunks are silently unreachable at query time
+        because the snapshot resolver picks the dominant tuple; the
+        warning makes that visible to operators.
+
+        Performance (I-01): the snapshot read uses sqlite-side
+        aggregation (single index pass, no Python-side json.loads), and
+        the rebuilt embedder is cached per
+        (kb_id, model, provider, base_url) so repeated queries against
+        an unchanged KB skip the rebuild entirely. The cache is
+        invalidated on per-KB backend invalidation (delete_kb /
+        kb_migrate) and on each ``_ingest_source_locked`` completion.
+        spec_id: 70ab2170-381a-4657-bcd1-28a40c6f369b
+        """
+        ctx = self._ctx(kb_id)
+        snapshot = ctx.db.get_embedding_snapshot(kb_id)
+        if snapshot is None:
+            return self._embedder
+        dominant_model, dominant_provider, dominant_base_url = snapshot
+        # B-02 auto-backfill: legacy v0.6.0 KBs stamped only the model
+        # name in chunk metadata; provider + base_url are NULL. After
+        # the Phase 5 default flip to provider='remote' the snapshot
+        # would resolve to (model, None, None) and fall through to
+        # _build_embedder with the global remote config — which raises
+        # if no API key is set. Detect the legacy NULL-provider shape
+        # and stamp the historical Ollama defaults onto the kb's chunks
+        # so the snapshot becomes (model, 'ollama', '<ollama-url>') and
+        # the Phase 4 rebuild path picks up the original embedder
+        # cleanly.
+        if (
+            dominant_model is not None
+            and dominant_provider is None
+            and dominant_base_url is None
+            and self._is_legacy_ollama_model(dominant_model)
+            and kb_id not in self._auto_backfilled_kbs
+        ):
+            self._auto_backfill_legacy_ollama(kb_id, dominant_model)
+            # Re-read the snapshot now that the columns are populated.
+            snapshot = ctx.db.get_embedding_snapshot(kb_id)
+            if snapshot is None:
+                return self._embedder
+            dominant_model, dominant_provider, dominant_base_url = snapshot
+        # I-04 mixed-version detection. Cheap probe via the indexed
+        # column. We don't bail or fall back — the dominant snapshot is
+        # still our best resolution — but we surface the situation to
+        # operators so they know to re-ingest the minority chunks (or
+        # accept the silent unreachability).
+        self._maybe_warn_mixed_versions(kb_id)
+        if dominant_model is None:
+            return self._embedder
+        # When the snapshot's tuple matches the currently-configured
+        # embedder we can return the cached instance and skip a fresh
+        # build; otherwise rebuild via the snapshot so the right
+        # provider+base_url is wired in.
+        #
+        # B-02 ordering: when the global ``self._embedder`` is already
+        # instantiated (lazy create finished, or a test injected it
+        # directly), comparing against its ``model_name`` is the
+        # canonical historical check — preserved here for existing
+        # tests + production paths. When the global embedder has NOT
+        # been instantiated yet, fall back to
+        # ``self._config.embedding_model`` for the comparison so a
+        # legacy-Ollama-snapshot KB (which never needs the global
+        # embedder anyway) never triggers the lazy ``create_embedder``
+        # path that would raise ValueError on a broken global config
+        # (e.g. provider='remote' with no API key after the Phase 5
+        # flip). This preserves the v0.10.x behaviour where
+        # already-instantiated embedders are reused, AND fixes the
+        # B-02 startup-on-broken-global trap.
+        comparison_model_name = (
+            self._embedder_instance.model_name
+            if self._embedder_instance is not None
+            else self._config.embedding_model
+        )
+        if (
+            dominant_model == comparison_model_name
+            and (dominant_provider is None or dominant_provider == self._config.embedding_provider)
+            and (dominant_base_url is None or dominant_base_url == self._config.embed_base_url)
+        ):
+            return self._embedder
+        # Snapshot diverges from the configured embedder; consult the
+        # per-(kb_id, snapshot-tuple) cache before rebuilding. The
+        # cache key includes kb_id so two KBs that share a
+        # (model, provider, base_url) tuple still get distinct cache
+        # entries — the embedder instance is the same shape, but
+        # invalidation is scoped per-KB (an ingest into KB A shouldn't
+        # invalidate KB B's cached entry).
+        cache_key = (
+            kb_id,
+            dominant_model,
+            dominant_provider,
+            dominant_base_url,
+        )
+        cached = self._query_embedder_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        with self._query_embedder_cache_lock:
+            cached = self._query_embedder_cache.get(cache_key)
+            if cached is not None:
+                return cached
+            embedder = create_embedder_for_model(
+                self._config,
+                dominant_model,
+                provider=dominant_provider,
+                base_url=dominant_base_url,
+            )
+            self._query_embedder_cache[cache_key] = embedder
+            return embedder
+
+    def _invalidate_query_embedder_cache(self, kb_id: str | None = None) -> None:
+        """Drop cached query embedders for *kb_id* (or all if None).
+
+        Called on per-KB backend invalidation and on each successful
+        ingest, since either event can shift the dominant snapshot
+        tuple for the KB.
+        """
+        with self._query_embedder_cache_lock:
+            if kb_id is None:
+                self._query_embedder_cache.clear()
+            else:
+                stale = [k for k in self._query_embedder_cache if k[0] == kb_id]
+                for key in stale:
+                    self._query_embedder_cache.pop(key, None)
+
+    def _invalidate_backend_cache(self, kb_id: str | None = None) -> None:
+        """Drop cached per-KB state so future calls re-resolve.
+
+        v0.13.0: the per-KB backend cache was removed (single global
+        ``ChromadbBackend``), but the per-KB query embedder cache,
+        mixed-version warning set, and auto-backfill set still need
+        invalidation on KB delete / recreate.
+        """
+        self._invalidate_query_embedder_cache(kb_id)
+        # I-04: clear the per-process MIXED_EMBEDDER_VERSIONS_DETECTED
+        # warning suppression set so a kb_delete + recreate gets a
+        # fresh emission if the new state is again mixed.
+        # B-02: clear the per-process auto-backfill suppression set so
+        # a recreated KB gets re-checked.
+        with self._mixed_version_warned_lock:
+            if kb_id is None:
+                self._mixed_version_warned.clear()
+            else:
+                self._mixed_version_warned.discard(kb_id)
+        with self._auto_backfilled_kbs_lock:
+            if kb_id is None:
+                self._auto_backfilled_kbs.clear()
+            else:
+                self._auto_backfilled_kbs.discard(kb_id)
+
+    def _get_kb_lock(self, kb_id: str) -> threading.Lock:
+        """Return (creating lazily) the per-kb_id ingestion lock.
+
+        The guard lock ensures that two threads discovering the same
+        kb_id simultaneously both see the *same* Lock object and don't
+        accidentally create two separate locks for the same kb_id.
+        """
+        # Fast path: lock already exists (no guard needed).
+        lock = self._kb_locks.get(kb_id)
+        if lock is not None:
+            return lock
+        # Slow path: atomically insert via guard.
+        with self._kb_locks_guard:
+            # Re-check under the guard to handle the race where two threads
+            # both passed the fast-path check simultaneously.
+            return self._kb_locks.setdefault(kb_id, threading.Lock())
+
+    # ------------------------------------------------------------------
+    # Per-KB context management
+    # ------------------------------------------------------------------
+
+    def _open_context(self, kb_id: str, dir_name: str) -> _KBContext:
+        """Open (or return cached) the per-KB context for *kb_id*."""
+        if kb_id in self._contexts:
+            return self._contexts[kb_id]
+        db = Database(self._config.kb_db_path(dir_name))
+        wiki = WikiManager(db)
+        ctx = _KBContext(
+            db=db,
+            wiki=wiki,
+            pipeline=PipelineManager(db),
+            linter=WikiLinter(wiki, db),
+            exporter=MarkdownExporter(wiki),
+        )
+        self._contexts[kb_id] = ctx
+        return ctx
+
+    def _ctx(self, kb_id: str) -> _KBContext:
+        """Get the context for *kb_id*, raising if not in the index."""
+        dir_name = self._index.get(kb_id)
+        if dir_name is None:
+            raise ValueError(f"KB {kb_id} not found")
+        return self._open_context(kb_id, dir_name)
+
+    def _get_vectorstore(self, kb_id: str) -> VectorStore:
+        """Get or create the vectorstore for *kb_id*."""
+        ctx = self._ctx(kb_id)
+        if ctx.vectorstore is None:
+            dir_name = self._index[kb_id]
+            ctx.vectorstore = create_vectorstore(
+                self._config,
+                collection_name=kb_id,
+                chroma_path=self._config.kb_chroma_path(dir_name),
+            )
+        return ctx.vectorstore
+
+    def _find_context_by_source(self, source_id: str) -> tuple[_KBContext, str]:
+        """Scan all KBs for a source, returning ``(context, kb_id)``."""
+        for kid, dname in self._index.items():
+            ctx = self._open_context(kid, dname)
+            if ctx.db.get_source(source_id) is not None:
+                return ctx, kid
+        raise ValueError(f"Source {source_id} not found")
+
+    def _find_context_by_page(self, page_id: str) -> tuple[_KBContext, str]:
+        """Scan all KBs for a wiki page, returning ``(context, kb_id)``."""
+        for kid, dname in self._index.items():
+            ctx = self._open_context(kid, dname)
+            if ctx.db.get_wiki_page(page_id) is not None:
+                return ctx, kid
+        raise ValueError(f"Page {page_id} not found")
 
     # ------------------------------------------------------------------
     # KB Lifecycle
     # ------------------------------------------------------------------
 
     def create_kb(self, name: str, description: str = "") -> Knowledgebase:
-        """Create a new knowledgebase."""
+        """Create a new knowledgebase and its on-disk directory."""
+        dir_name = sanitize_kb_dir_name(name)
+
+        # Prevent directory-name collisions
+        if dir_name in self._index.values():
+            raise ValueError(
+                f"A knowledgebase directory '{dir_name}' already exists (from name '{name}')"
+            )
+
         kb = Knowledgebase(name=name, description=description)
-        self._db.insert_knowledgebase(kb)
-        return self._enrich_kb(kb)
+
+        # Create the KB directory and open its database
+        self._config.kb_data_dir(dir_name).mkdir(parents=True, exist_ok=True)
+        ctx = self._open_context(kb.id, dir_name)
+        ctx.db.insert_knowledgebase(kb)
+
+        # Update the index
+        self._index[kb.id] = dir_name
+        _save_index(self._base_dir, self._index)
+
+        return self._enrich_kb(kb, ctx)
 
     def get_kb(self, kb_id: str) -> Knowledgebase | None:
         """Get KB by ID, enriched with source_count and page_count."""
-        kb = self._db.get_knowledgebase(kb_id)
+        dir_name = self._index.get(kb_id)
+        if dir_name is None:
+            return None
+        ctx = self._open_context(kb_id, dir_name)
+        kb = ctx.db.get_knowledgebase(kb_id)
         if kb is None:
             return None
-        return self._enrich_kb(kb)
+        return self._enrich_kb(kb, ctx)
 
     def list_kbs(self) -> list[Knowledgebase]:
         """List all KBs, enriched with counts."""
-        return [self._enrich_kb(kb) for kb in self._db.list_knowledgebases()]
+        results: list[Knowledgebase] = []
+        for kb_id, dir_name in self._index.items():
+            ctx = self._open_context(kb_id, dir_name)
+            kb = ctx.db.get_knowledgebase(kb_id)
+            if kb is not None:
+                results.append(self._enrich_kb(kb, ctx))
+        return results
 
     def delete_kb(self, kb_id: str) -> None:
-        """Delete a KB and ALL associated data.
+        """Delete a KB and ALL associated data including its directory."""
+        dir_name = self._index.get(kb_id)
+        if dir_name is None:
+            return  # idempotent
 
-        Cascade order respects FK constraints:
-        pipeline_runs -> chunks -> wiki_pages -> sources -> KB.
-        """
-        # Pipeline runs reference sources, so delete first
-        self._db.delete_pipeline_runs_by_kb(kb_id)
-        # Chunks reference sources
-        self._db.delete_chunks_by_kb(kb_id)
-        # Wiki pages (handles FTS, links, page_sources internally)
-        self._db.delete_wiki_pages_by_kb(kb_id)
-        # Sources (also cleans up any remaining page_sources)
-        self._db.delete_sources_by_kb(kb_id)
-        # Clean up vectorstore
-        self._vectorstores.pop(kb_id, None)
-        # Finally delete the KB record
-        self._db.delete_knowledgebase(kb_id)
+        # Close cached context
+        ctx = self._contexts.pop(kb_id, None)
+        if ctx is not None:
+            ctx.db.close()
+
+        # Remove the entire KB directory from disk
+        kb_dir = self._config.kb_data_dir(dir_name)
+        if kb_dir.is_dir():
+            shutil.rmtree(kb_dir)
+
+        # Update the index
+        del self._index[kb_id]
+        _save_index(self._base_dir, self._index)
+
+        # Release the per-kb_id lock entry so it doesn't drift in long-running
+        # processes.  Safe to pop even if a worker still holds the lock object —
+        # the holder still owns the object; a future re-create will get a fresh one.
+        with self._kb_locks_guard:
+            self._kb_locks.pop(kb_id, None)
+
+        # Phase 4: drop any cached backend for this kb_id so a future
+        # re-create with the same kb_id gets a fresh backend instance
+        # (and the new directory layout the cached backend may have
+        # been pointing at is not silently shared).
+        self._invalidate_backend_cache(kb_id)
 
     # ------------------------------------------------------------------
     # Source Ingestion (Pipeline-Gated)
@@ -103,193 +723,554 @@ class KnowledgebaseService:
         source_type: SourceType,
         uri: str,
         metadata: dict | None = None,
+        dedup_key: str | None = None,
+        dedup_policy: DedupPolicy = DEFAULT_DEDUP_POLICY,
+        request_id: str | None = None,
+        tool_caller_version: str | None = None,
+        batch_size: int | None = None,
+        explicit_backend: RetrieverBackend | None = None,
     ) -> Source:
         """Full ingestion pipeline for a new source.
 
-        Phases: initialize -> read_source -> chunk -> embed ->
-        integrate_wiki -> finalize.
+        Concurrent calls targeting the *same* kb_id are serialised by a
+        per-kb_id ``threading.Lock``.  Calls against *different* kb_ids
+        run concurrently — there is no global lock.
+
+        This is single-process serialisation only.  Cross-process
+        isolation (e.g., Postgres advisory locks, filesystem flock) is
+        future work.
+
+        ``request_id`` / ``tool_caller_version`` / ``batch_size`` are
+        optional caller correlators threaded through to the
+        PipelineRun telemetry row and the structured stderr log.
+
+        ``explicit_backend`` is retained for callsite compatibility
+        but is now redundant with the v0.13.0 single-backend model
+        (``self._backend`` is always the ChromadbBackend). It is kept
+        so the public method signature does not change.
         """
-        # 1. Verify KB exists
-        kb = self._db.get_knowledgebase(kb_id)
+        knowledgebase_stderr_log(
+            kb_id=kb_id,
+            op="lock_acquire",
+            phase="lock",
+            elapsed_ms=0,
+            rows_in=0,
+            rows_ok=0,
+            rows_skipped=0,
+            rows_failed=0,
+            dedup_policy="n/a",
+            request_id=request_id,
+            tool_caller_version=tool_caller_version,
+        )
+        lock_acquired_at = time.monotonic()
+        with self._get_kb_lock(kb_id):
+            knowledgebase_stderr_log(
+                kb_id=kb_id,
+                op="lock_acquired",
+                phase="lock",
+                elapsed_ms=0,
+                rows_in=0,
+                rows_ok=0,
+                rows_skipped=0,
+                rows_failed=0,
+                dedup_policy="n/a",
+                request_id=request_id,
+                tool_caller_version=tool_caller_version,
+            )
+            try:
+                return self._ingest_source_locked(
+                    kb_id,
+                    source_type,
+                    uri,
+                    metadata,
+                    dedup_key,
+                    dedup_policy,
+                    request_id=request_id,
+                    tool_caller_version=tool_caller_version,
+                    batch_size=batch_size,
+                    explicit_backend=explicit_backend,
+                )
+            finally:
+                elapsed_ms = int((time.monotonic() - lock_acquired_at) * 1000)
+                knowledgebase_stderr_log(
+                    kb_id=kb_id,
+                    op="lock_release",
+                    phase="lock",
+                    elapsed_ms=elapsed_ms,
+                    rows_in=0,
+                    rows_ok=0,
+                    rows_skipped=0,
+                    rows_failed=0,
+                    dedup_policy="n/a",
+                    request_id=request_id,
+                    tool_caller_version=tool_caller_version,
+                )
+
+    def _ingest_source_locked(
+        self,
+        kb_id: str,
+        source_type: SourceType,
+        uri: str,
+        metadata: dict | None = None,
+        dedup_key: str | None = None,
+        dedup_policy: DedupPolicy = DEFAULT_DEDUP_POLICY,
+        request_id: str | None = None,
+        tool_caller_version: str | None = None,
+        batch_size: int | None = None,
+        explicit_backend: RetrieverBackend | None = None,
+    ) -> Source:
+        """Inner pipeline body — called only while the kb_id lock is held.
+
+        ``request_id`` / ``tool_caller_version`` / ``batch_size`` are
+        captured on the PipelineRun v0.6.0 telemetry row along with the
+        resolved dedup counters (``ingested`` / ``skipped`` / ``replaced``
+        / ``failed``) and the ``ended_at`` wall-clock timestamp.
+
+        A telemetry row is written for every outcome including ``skip``
+        so callers can see the skip via ``kb_pipeline_status``.
+
+        ``explicit_backend`` (Phase-4-migration-only): when supplied,
+        the index write routes through this backend instead of the
+        cached per-KB backend. Required by ``import_from_markdown`` —
+        the ``.migrated_to`` sentinel still says ``markdown`` while the
+        reverse migration is in flight, so the cached backend is the
+        wrong target. spec_id: 70ab2170-381a-4657-bcd1-28a40c6f369b
+        """
+        ctx = self._ctx(kb_id)
+
+        # Verify KB exists
+        kb = ctx.db.get_knowledgebase(kb_id)
         if kb is None:
             raise ValueError(f"KB {kb_id} not found")
 
-        # 2. Create source record
+        # Phase 5 — mixed embedder_version rejection.
+        # Inspect the incoming embedder's version against any version(s)
+        # already stamped on this KB's chunks. If the KB carries chunks
+        # under a different embedder_version AND the operator has not
+        # opted into AGENT_KB_AUTO_REEMBED=1, refuse the ingest with
+        # EMBEDDER_VERSION_MISMATCH. The check runs BEFORE any source
+        # row is inserted so the rejection is non-destructive.
+        #
+        # Defensive: only enforce when the embedder reports a *string*
+        # version. Test mocks may return non-string sentinels (e.g.
+        # MagicMock attributes) that can't be JSON-serialized later.
+        # The Phase 5 Protocol says embedder_version is a str; treat
+        # anything else as "no version stamped" so legacy mocks keep
+        # working unchanged.
+        # spec_id: 70ab2170-381a-4657-bcd1-28a40c6f369b
+        incoming_version = getattr(self._embedder, "embedder_version", None)
+        if isinstance(incoming_version, str) and incoming_version:
+            existing_versions = ctx.db.get_embedder_versions(kb_id)
+            if (
+                existing_versions
+                and incoming_version not in existing_versions
+                and os.environ.get("AGENT_KB_AUTO_REEMBED") != "1"
+            ):
+                raise EmbedderVersionMismatchError(
+                    kb_id=kb_id,
+                    existing_versions=existing_versions,
+                    incoming_version=incoming_version,
+                )
+
+        policy_value = (
+            dedup_policy.value if isinstance(dedup_policy, DedupPolicy) else str(dedup_policy)
+        )
+
+        # Dedup check
+        action, existing = resolve_dedup_action(ctx.db, kb_id, dedup_key, dedup_policy)
+
+        # Skip outcome: emit a telemetry row and return the existing source.
+        if action == "skip":
+            skip_run = ctx.pipeline.start_run(kb_id, existing.id if existing else None)  # type: ignore[union-attr]
+            skip_run.status = RunStatus.completed
+            skip_run.completed_at = datetime.now(UTC)
+            skip_run.ended_at = skip_run.completed_at
+            skip_run.ingested = 0
+            skip_run.skipped = 1
+            skip_run.replaced = 0
+            skip_run.failed = 0
+            skip_run.batch_size = batch_size
+            skip_run.dedup_policy = policy_value
+            skip_run.request_id = request_id
+            skip_run.tool_caller_version = tool_caller_version
+            ctx.db.update_pipeline_run(skip_run)
+            return existing  # type: ignore[return-value]
+
+        replaced_count = 0
+        if action == "replace":
+            self.remove_source(existing.id)  # type: ignore[union-attr]
+            replaced_count = 1
+
+        # Create source record
         source = Source(
             kb_id=kb_id,
             source_type=source_type,
             uri=uri,
             metadata=metadata or {},
             status=SourceStatus.ingesting,
+            dedup_key=dedup_key or None,
         )
-        self._db.insert_source(source)
+        ctx.db.insert_source(source)
 
-        # 3. Start pipeline
-        run = self._pipeline.start_run(kb_id, source.id)
+        # Start pipeline
+        run = ctx.pipeline.start_run(kb_id, source.id)
+        # Stamp the telemetry-row capture fields early so they survive
+        # a mid-pipeline failure.
+        run.batch_size = batch_size
+        run.dedup_policy = policy_value
+        run.request_id = request_id
+        run.tool_caller_version = tool_caller_version
+        run.replaced = replaced_count
+        ctx.db.update_pipeline_run(run)
 
         try:
-            # Phase 1: initialize (already running from start_run)
-            self._pipeline.complete_phase(run.id)
-            self._pipeline.advance_phase(run.id)
+            # Phase 1: initialize
+            ctx.pipeline.complete_phase(run.id)
+            ctx.pipeline.advance_phase(run.id)
 
-            # Phase 2: read_source -- ingest and chunk content
+            # Phase 2: read_source
             chunks = self._ingestion.ingest(source_type, uri, metadata)
             for chunk in chunks:
                 chunk.source_id = source.id
                 chunk.kb_id = kb_id
-            self._pipeline.complete_phase(run.id)
-            self._pipeline.advance_phase(run.id)
+            ctx.pipeline.complete_phase(run.id)
+            ctx.pipeline.advance_phase(run.id)
 
-            # Phase 3: chunk (chunking was done in read_source, just advance)
-            self._pipeline.complete_phase(run.id)
-            self._pipeline.advance_phase(run.id)
+            # Phase 3: chunk
+            ctx.pipeline.complete_phase(run.id)
+            ctx.pipeline.advance_phase(run.id)
 
             # Phase 4: embed
             texts = [c.content for c in chunks]
             embeddings = self._embedder.embed(texts) if texts else []
-            vs = self._get_vectorstore(kb_id)
-            if chunks:
-                vs.add(
-                    ids=[c.id for c in chunks],
-                    embeddings=embeddings,
-                    documents=texts,
-                    metadatas=[c.metadata for c in chunks],
-                )
-            # Store chunks in DB
+            # Stamp per-chunk metadata that the retrieval path depends on:
+            # ``embedding_model`` drives per-KB embedder selection on query,
+            # and ``kb_id`` satisfies the vectorstore's where-filter (which
+            # would otherwise return zero results even though the per-KB
+            # collection holds the right chunks).
+            #
+            # Phase 4 (per-page provider snapshot): also stamp
+            # ``embedding_provider`` and ``embed_base_url`` so the
+            # retrieval path can faithfully rebuild the original
+            # embedder via ``create_embedder_for_model(model, provider=...,
+            # base_url=...)`` even AFTER the Phase 5 default flip moves
+            # ``Settings.embedding_provider`` to a different value. The
+            # secret (``embed_api_key``) is intentionally NOT stamped —
+            # secrets stay in Settings/env per the FORBIDDEN_KEYS
+            # discipline; the snapshot only carries non-secret routing
+            # metadata. spec_id: 70ab2170-381a-4657-bcd1-28a40c6f369b
+            # Phase 5: also stamp embedder_version (the opaque
+            # quantization/library discriminator) so the per-KB
+            # mixed-version rejection at the top of the next ingest
+            # has a per-chunk anchor to compare against. Pulled from
+            # the embedder via Embedder.embedder_version (Phase 5
+            # Protocol addition). Defensive isinstance() check keeps
+            # test mocks (MagicMock attributes return MagicMocks, not
+            # strings) from poisoning the JSON-serialized chunk
+            # metadata. spec_id:
+            # 70ab2170-381a-4657-bcd1-28a40c6f369b
+            embedder_version_for_stamp = getattr(self._embedder, "embedder_version", None)
+            stamp_version = isinstance(embedder_version_for_stamp, str) and bool(
+                embedder_version_for_stamp
+            )
             for chunk in chunks:
-                self._db.insert_chunk(chunk)
-            self._pipeline.complete_phase(run.id)
-            self._pipeline.advance_phase(run.id)
+                chunk.metadata["embedding_model"] = self._embedder.model_name
+                chunk.metadata["kb_id"] = kb_id
+                chunk.metadata["embedding_provider"] = self._config.embedding_provider
+                if self._config.embed_base_url is not None:
+                    chunk.metadata["embed_base_url"] = self._config.embed_base_url
+                if stamp_version:
+                    chunk.metadata["embedder_version"] = embedder_version_for_stamp
+            # Route the index write through the RetrieverBackend
+            # abstraction. v0.13.0: chromadb is the only implementation,
+            # so the routing collapses to ``self._backend``.
+            if chunks:
+                target_backend = (
+                    explicit_backend if explicit_backend is not None else self._backend
+                )
+                target_backend.index(
+                    kb_id=kb_id,
+                    documents=[
+                        {
+                            "id": c.id,
+                            "content": text,
+                            "metadata": c.metadata,
+                            "embedding": emb,
+                        }
+                        for c, text, emb in zip(chunks, texts, embeddings)
+                    ],
+                )
+            for chunk in chunks:
+                ctx.db.insert_chunk(chunk)
+            ctx.pipeline.complete_phase(run.id)
+            ctx.pipeline.advance_phase(run.id)
 
-            # Phase 5: integrate_wiki -- create a summary page for this source
+            # Phase 5: integrate_wiki
             summary_content = f"# {uri}\n\nSource type: {source_type.value}\n\n"
             summary_content += f"Chunks ingested: {len(chunks)}\n"
             if chunks:
-                summary_content += (
-                    f"\n## Content Preview\n\n{chunks[0].content[:500]}..."
-                )
-            self._wiki.create_page(
+                summary_content += f"\n## Content Preview\n\n{chunks[0].content[:500]}..."
+            ctx.wiki.create_page(
                 kb_id=kb_id,
                 title=f"Source: {uri}",
                 content=summary_content,
                 page_type=PageType.summary,
                 source_ids=[source.id],
             )
-            self._pipeline.complete_phase(run.id)
-            self._pipeline.advance_phase(run.id)
+            ctx.pipeline.complete_phase(run.id)
+            ctx.pipeline.advance_phase(run.id)
 
             # Phase 6: finalize
             source.status = SourceStatus.ingested
             source.chunk_count = len(chunks)
             source.ingested_at = datetime.now(UTC)
-            self._db.update_source(source)
-            self._pipeline.complete_phase(run.id)
+            ctx.db.update_source(source)
+            ctx.pipeline.complete_phase(run.id)
+
+            # I-01: drop the cached query embedder for this KB so the
+            # next query re-reads the snapshot. The new chunks may have
+            # shifted the dominant (model, provider, base_url) tuple
+            # (e.g. switching to a new embedder mid-KB) and a stale
+            # cache entry would silently return the old embedder.
+            self._invalidate_query_embedder_cache(kb_id)
+
+            # v0.6.0 telemetry row — final counters & ended_at.
+            final_run = ctx.pipeline.get_run(run.id)
+            if final_run is not None:
+                final_run.ended_at = datetime.now(UTC)
+                final_run.ingested = 1
+                final_run.skipped = 0
+                final_run.replaced = replaced_count
+                final_run.failed = 0
+                final_run.batch_size = batch_size
+                final_run.dedup_policy = policy_value
+                final_run.request_id = request_id
+                final_run.tool_caller_version = tool_caller_version
+                ctx.db.update_pipeline_run(final_run)
 
             return source
 
         except Exception as e:
-            self._pipeline.fail_phase(run.id, str(e))
+            ctx.pipeline.fail_phase(run.id, str(e))
             source.status = SourceStatus.failed
-            self._db.update_source(source)
+            ctx.db.update_source(source)
+            # v0.6.0 telemetry row — record failure counters.
+            fail_run = ctx.pipeline.get_run(run.id)
+            if fail_run is not None:
+                fail_run.ended_at = datetime.now(UTC)
+                fail_run.ingested = 0
+                fail_run.skipped = 0
+                fail_run.replaced = replaced_count
+                fail_run.failed = 1
+                fail_run.batch_size = batch_size
+                fail_run.dedup_policy = policy_value
+                fail_run.request_id = request_id
+                fail_run.tool_caller_version = tool_caller_version
+                ctx.db.update_pipeline_run(fail_run)
             raise
 
     def update_source(self, source_id: str) -> Source:
-        """Re-ingest a source (delete old chunks/vectors, re-run pipeline)."""
-        source = self._db.get_source(source_id)
+        """Re-ingest a source (delete old chunks/vectors, re-run pipeline).
+
+        The entire operation — cleanup *and* re-ingest — is serialised under the
+        per-kb_id lock so no concurrent ``ingest_source`` call can observe the
+        torn state between "old chunks deleted" and "new chunks inserted".
+        ``_ingest_source_locked`` is called directly (bypassing the lock
+        acquisition in ``ingest_source``) to avoid a self-deadlock, since
+        ``threading.Lock`` is non-reentrant.
+
+        Note: when the dedup policy resolves to ``'replace'``, the inner
+        ``_ingest_source_locked`` path calls ``self.remove_source(existing.id)``
+        which itself routes through ``self._backend.delete`` — so all delete
+        paths are backend-routed.
+        """
+        ctx, _ = self._find_context_by_source(source_id)
+        source = ctx.db.get_source(source_id)
         if source is None:
             raise ValueError(f"Source {source_id} not found")
 
-        # Delete old chunks from vectorstore
-        old_chunks = self._db.list_chunks(source_id)
-        if old_chunks:
-            vs = self._get_vectorstore(source.kb_id)
-            vs.delete([c.id for c in old_chunks])
-        # Delete old chunks from DB
-        self._db.delete_chunks_by_source(source_id)
-
-        # Re-ingest
-        return self.ingest_source(
-            source.kb_id, source.source_type, source.uri, source.metadata
+        kb_id = source.kb_id
+        knowledgebase_stderr_log(
+            kb_id=kb_id,
+            op="lock_acquire",
+            phase="lock",
+            elapsed_ms=0,
+            rows_in=0,
+            rows_ok=0,
+            rows_skipped=0,
+            rows_failed=0,
+            dedup_policy="n/a",
+            request_id=None,
+            tool_caller_version=None,
         )
+        lock_acquired_at = time.monotonic()
+        with self._get_kb_lock(kb_id):
+            knowledgebase_stderr_log(
+                kb_id=kb_id,
+                op="lock_acquired",
+                phase="lock",
+                elapsed_ms=0,
+                rows_in=0,
+                rows_ok=0,
+                rows_skipped=0,
+                rows_failed=0,
+                dedup_policy="n/a",
+                request_id=None,
+                tool_caller_version=None,
+            )
+            try:
+                # Delete old chunks from the backend.  v0.13.0:
+                # chromadb is the only backend.
+                old_chunks = ctx.db.list_chunks(source_id)
+                if old_chunks:
+                    self._backend.delete(kb_id=kb_id, ids=[c.id for c in old_chunks])
+                ctx.db.delete_chunks_by_source(source_id)
+
+                return self._ingest_source_locked(
+                    kb_id, source.source_type, source.uri, source.metadata
+                )
+            finally:
+                elapsed_ms = int((time.monotonic() - lock_acquired_at) * 1000)
+                knowledgebase_stderr_log(
+                    kb_id=kb_id,
+                    op="lock_release",
+                    phase="lock",
+                    elapsed_ms=elapsed_ms,
+                    rows_in=0,
+                    rows_ok=0,
+                    rows_skipped=0,
+                    rows_failed=0,
+                    dedup_policy="n/a",
+                    request_id=None,
+                    tool_caller_version=None,
+                )
 
     def remove_source(self, source_id: str) -> None:
-        """Remove a source and its chunks/vectors from the KB."""
-        source = self._db.get_source(source_id)
+        """Remove a source and its chunks/vectors from the KB.
+
+        The vector deletion routes through the
+        :class:`~agent_knowledgebase.backends.RetrieverBackend`
+        abstraction so future backends (markdown, lightrag) can swap
+        their own deletion semantics in. SQL-level cleanup
+        (pipeline_runs, chunks, page_sources, source rows) stays here
+        since those tables are backend-agnostic.
+        """
+        ctx, _ = self._find_context_by_source(source_id)
+        source = ctx.db.get_source(source_id)
         if source is None:
             raise ValueError(f"Source {source_id} not found")
 
-        # Delete chunks from vectorstore
-        old_chunks = self._db.list_chunks(source_id)
+        old_chunks = ctx.db.list_chunks(source_id)
         if old_chunks:
-            vs = self._get_vectorstore(source.kb_id)
-            vs.delete([c.id for c in old_chunks])
+            self._backend.delete(
+                kb_id=source.kb_id, ids=[c.id for c in old_chunks]
+            )
 
-        # Delete pipeline runs referencing this source
-        self._db.delete_pipeline_runs_by_source(source_id)
-        # Delete chunks from DB
-        self._db.delete_chunks_by_source(source_id)
-        # Remove page-source associations referencing this source
-        self._db.delete_page_sources_by_source(source_id)
-        # Delete the source record
-        self._db.delete_source(source_id)
+        ctx.db.delete_pipeline_runs_by_source(source_id)
+        ctx.db.delete_chunks_by_source(source_id)
+        ctx.db.delete_page_sources_by_source(source_id)
+        ctx.db.delete_source(source_id)
 
     # ------------------------------------------------------------------
     # Query (No Pipeline Required)
     # ------------------------------------------------------------------
 
-    def query(self, kb_id: str, text: str, top_k: int = 10) -> list[SearchResult]:
-        """Semantic query across a KB."""
-        vs = self._get_vectorstore(kb_id)
-        orchestrator = QueryOrchestrator(vs, self._embedder, self._wiki)
-        return orchestrator.query(text, kb_id, top_k=top_k)
+    def query(self, kb_id: str, text: str, top_k: int | None = None) -> list[SearchResult]:
+        """Semantic query across a KB.
 
-    def search(self, kb_id: str, text: str, top_k: int = 10) -> list[SearchResult]:
-        """Keyword search across a KB."""
-        vs = self._get_vectorstore(kb_id)
-        orchestrator = QueryOrchestrator(vs, self._embedder, self._wiki)
-        return orchestrator.search(text, kb_id, top_k=top_k)
+        Routes through ``self._backend.query``. The chromadb backend
+        returns dicts shaped like :class:`SearchResult`'s ``__dict__``
+        so we round-trip them back into :class:`SearchResult` instances
+        to preserve the v0.6.0 return type.
+        """
+        if top_k is None:
+            top_k = default_top_k(self._config)
+        # Resolve the kb context here so a missing kb_id raises the
+        # historical ValueError before the backend is consulted; the
+        # backend would also raise but with a less specific message.
+        self._ctx(kb_id)
+        rows = self._backend.query(kb_id=kb_id, text=text, top_k=top_k)
+        return [SearchResult(**row) for row in rows]
 
-    def hybrid_query(
-        self, kb_id: str, text: str, top_k: int = 10
-    ) -> list[SearchResult]:
-        """Combined semantic + keyword search."""
+    def search(self, kb_id: str, text: str, top_k: int | None = None) -> list[SearchResult]:
+        """Keyword search across a KB. Routes through ``self._backend.search``."""
+        if top_k is None:
+            top_k = default_top_k(self._config)
+        self._ctx(kb_id)
+        rows = self._backend.search(kb_id=kb_id, text=text, top_k=top_k)
+        return [SearchResult(**row) for row in rows]
+
+    def hybrid_query(self, kb_id: str, text: str, top_k: int | None = None) -> list[SearchResult]:
+        """Combined semantic + keyword search.
+
+        The hybrid composition itself stays in
+        :class:`QueryOrchestrator` since the merge / weighting logic is
+        backend-agnostic; the per-leg vector + FTS calls are still the
+        v0.6.0 chromadb path because ``self._backend`` defaults to
+        chromadb and ``QueryOrchestrator`` reads through the same
+        helpers the backend wraps. Phase 3 may revisit if the markdown
+        backend ships a different hybrid story.
+        """
+        if top_k is None:
+            top_k = default_top_k(self._config)
+        vector_weight, fts_weight, fetch_mult = hybrid_weights_from(self._config)
+        ctx = self._ctx(kb_id)
         vs = self._get_vectorstore(kb_id)
-        orchestrator = QueryOrchestrator(vs, self._embedder, self._wiki)
-        return orchestrator.hybrid_query(text, kb_id, top_k=top_k)
+        embedder = self._query_embedder_for(kb_id)
+        orchestrator = QueryOrchestrator(vs, embedder, ctx.wiki)
+        return orchestrator.hybrid_query(
+            text,
+            kb_id,
+            top_k=top_k,
+            vector_weight=vector_weight,
+            fts_weight=fts_weight,
+            fetch_multiplier=fetch_mult,
+        )
 
     # ------------------------------------------------------------------
     # Wiki Operations
     # ------------------------------------------------------------------
 
     def get_page(self, page_id: str) -> WikiPage | None:
-        """Get a wiki page by ID."""
-        return self._wiki.get_page(page_id)
+        """Get a wiki page by ID (scans all KBs)."""
+        for kb_id, dir_name in self._index.items():
+            ctx = self._open_context(kb_id, dir_name)
+            page = ctx.wiki.get_page(page_id)
+            if page is not None:
+                return page
+        return None
 
-    def list_pages(
-        self, kb_id: str, page_type: PageType | None = None
-    ) -> list[WikiPage]:
+    def list_pages(self, kb_id: str, page_type: PageType | None = None) -> list[WikiPage]:
         """List wiki pages in a KB, optionally filtered by type."""
-        return self._wiki.list_pages(kb_id, page_type)
+        ctx = self._ctx(kb_id)
+        pages = ctx.wiki.list_pages(kb_id, page_type)
+        # Build a source lookup in one query, then stamp first-source fields onto each page.
+        sources = {s.id: s for s in ctx.db.list_sources(kb_id)}
+        for page in pages:
+            first_source = next((sources[sid] for sid in page.source_ids if sid in sources), None)
+            page.source_type = first_source.source_type.value if first_source else None
+            page.uri = first_source.uri if first_source else None
+            page.dedup_key = first_source.dedup_key if first_source else None
+        return pages
 
     def get_source(self, source_id: str) -> Source | None:
-        """Get a source by ID."""
-        return self._db.get_source(source_id)
+        """Get a source by ID (scans all KBs)."""
+        for kb_id, dir_name in self._index.items():
+            ctx = self._open_context(kb_id, dir_name)
+            source = ctx.db.get_source(source_id)
+            if source is not None:
+                return source
+        return None
 
     def list_sources(self, kb_id: str) -> list[Source]:
         """List all sources in a KB."""
-        return self._db.list_sources(kb_id)
+        ctx = self._ctx(kb_id)
+        return ctx.db.list_sources(kb_id)
 
     def get_links(self, page_id: str, direction: str = "outbound") -> list[WikiPage]:
-        """Get pages linked to/from a page.
-
-        Parameters
-        ----------
-        page_id:
-            The page whose links are queried.
-        direction:
-            ``"outbound"`` (default) or ``"inbound"``.
-        """
-        return self._wiki.get_linked_pages(page_id, direction)
+        """Get pages linked to/from a page."""
+        ctx, _ = self._find_context_by_page(page_id)
+        return ctx.wiki.get_linked_pages(page_id, direction)
 
     # ------------------------------------------------------------------
     # Maintenance
@@ -297,19 +1278,134 @@ class KnowledgebaseService:
 
     def lint(self, kb_id: str) -> LintReport:
         """Run all lint checks on a KB."""
-        return self._linter.lint(kb_id)
+        ctx = self._ctx(kb_id)
+        return ctx.linter.lint(kb_id)
 
     def lint_fix(self, kb_id: str) -> list[LintIssue]:
         """Auto-fix fixable lint issues in a KB."""
-        return self._linter.auto_fix(kb_id)
+        ctx = self._ctx(kb_id)
+        return ctx.linter.auto_fix(kb_id)
 
     def rebuild_index(self, kb_id: str) -> WikiPage:
         """Regenerate the wiki index page for a KB."""
-        return self._wiki.generate_index(kb_id)
+        ctx = self._ctx(kb_id)
+        return ctx.wiki.generate_index(kb_id)
 
     def export(self, kb_id: str, output_dir: Path) -> list[Path]:
         """Export all wiki pages to markdown files."""
-        return self._exporter.export(kb_id, output_dir)
+        ctx = self._ctx(kb_id)
+        return ctx.exporter.export(kb_id, output_dir)
+
+    # ------------------------------------------------------------------
+    # Eager-warm (Phase A — vectorstore robustness)
+    # ------------------------------------------------------------------
+
+    def warmup_all_chromadb_kbs(self) -> dict[str, int]:
+        """Eager-warm chromadb collections at MCP server startup.
+
+        Iterates all KBs in the index, resolves each KB's effective
+        backend (honoring the ``.migrated_to`` sentinel and the
+        ``kb_backend_per_kb`` mapping), and calls
+        :meth:`ChromadbBackend.warmup` on each chromadb-backed KB so
+        the HNSW cold-load is amortised into server-init time rather
+        than the first tool call.
+
+        Warmup calls run concurrently via a :class:`ThreadPoolExecutor`
+        (one thread per KB) with a 30 s wall-clock cap across all KBs —
+        workers still running after 30 s are abandoned.  Failures are
+        absorbed (they land in ``failed_count``) so a single broken KB
+        does not block the others.
+
+        Returns
+        -------
+        dict with keys:
+            ``warmed_count``: number of KBs successfully warmed.
+            ``skipped_count``: number of KBs skipped (non-chromadb or
+                flag disabled).
+            ``failed_count``: number of KBs whose warmup raised.
+
+        Honoured settings
+        -----------------
+        ``Settings.chromadb_eager_warm``: must be ``True`` (default) or
+            the entire call returns immediately with all counts = 0.
+
+        Workers still running after 30 s are abandoned via
+        ``executor.shutdown(wait=False, cancel_futures=True)``; the
+        ``with ThreadPoolExecutor`` form is intentionally NOT used here
+        because its ``__exit__`` calls ``shutdown(wait=True)``, which
+        would block indefinitely past the timeout.
+
+        Phase A — vectorstore robustness.
+        spec_id: 70ab2170-381a-4657-bcd1-28a40c6f369b
+        """
+        # Fast path: flag disabled.
+        if not getattr(self._config, "chromadb_eager_warm", True):
+            kb_count = len(self._index)
+            return {
+                "warmed_count": 0,
+                "skipped_count": kb_count,
+                "failed_count": 0,
+            }
+
+        warmed: list[str] = []
+        skipped: list[str] = []
+        failed: list[str] = []
+
+        def _do_warmup(kb_id: str) -> str:
+            """Return 'warmed', 'skipped', or 'failed'."""
+            # v0.13.0: chromadb is the only backend, so the per-KB
+            # name resolution is unnecessary.
+            backend = self._backend
+            if not hasattr(backend, "warmup"):
+                return "skipped"
+            try:
+                backend.warmup(kb_id)
+                return "warmed"
+            except Exception:  # noqa: BLE001 — absorbed; backend.warmup already logs
+                return "failed"
+
+        kb_ids = list(self._index.keys())
+        if not kb_ids:
+            return {"warmed_count": 0, "skipped_count": 0, "failed_count": 0}
+
+        # Phase A — concurrent caller pattern note: _get_vectorstore is not yet
+        # thread-safe for concurrent callers; see follow-up tracking item.
+        executor = ThreadPoolExecutor(
+            max_workers=max(1, len(kb_ids)),
+            thread_name_prefix="kb_eager_warm",
+        )
+        try:
+            future_to_kb = {executor.submit(_do_warmup, kb_id): kb_id for kb_id in kb_ids}
+            done, _ = wait(future_to_kb, timeout=30, return_when=ALL_COMPLETED)
+        finally:
+            # shutdown(wait=False, cancel_futures=True) abandons workers still
+            # running after the 30 s cap and cancels any not-yet-started futures.
+            # Using `with ThreadPoolExecutor` would call shutdown(wait=True) on
+            # __exit__, blocking indefinitely past the timeout.
+            executor.shutdown(wait=False, cancel_futures=True)
+
+        for future, kb_id in future_to_kb.items():
+            if future in done:
+                try:
+                    outcome = future.result()
+                except Exception:  # noqa: BLE001
+                    outcome = "failed"
+            else:
+                # Timed out — treat as failed.
+                outcome = "failed"
+
+            if outcome == "warmed":
+                warmed.append(kb_id)
+            elif outcome == "skipped":
+                skipped.append(kb_id)
+            else:
+                failed.append(kb_id)
+
+        return {
+            "warmed_count": len(warmed),
+            "skipped_count": len(skipped),
+            "failed_count": len(failed),
+        }
 
     # ------------------------------------------------------------------
     # Pipeline Status
@@ -317,22 +1413,24 @@ class KnowledgebaseService:
 
     def get_pipeline_status(self, kb_id: str) -> list[PipelineRun]:
         """List all pipeline runs for a KB."""
-        return self._pipeline.list_runs(kb_id)
+        dir_name = self._index.get(kb_id)
+        if dir_name is None:
+            return []
+        ctx = self._open_context(kb_id, dir_name)
+        return ctx.pipeline.list_runs(kb_id)
 
     # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------
 
-    def _get_vectorstore(self, kb_id: str) -> VectorStore:
-        """Get or create a vectorstore collection for a KB."""
-        if kb_id not in self._vectorstores:
-            self._vectorstores[kb_id] = create_vectorstore(
-                self._config, collection_name=kb_id
-            )
-        return self._vectorstores[kb_id]
-
-    def _enrich_kb(self, kb: Knowledgebase) -> Knowledgebase:
-        """Add source_count and page_count from DB."""
-        kb.source_count = self._db.count_sources(kb.id)
-        kb.page_count = self._db.count_wiki_pages(kb.id)
+    def _enrich_kb(self, kb: Knowledgebase, ctx: _KBContext) -> Knowledgebase:
+        """Add source_count, page_count, and embedding model stats from DB."""
+        kb.source_count = ctx.db.count_sources(kb.id)
+        kb.page_count = ctx.db.count_wiki_pages(kb.id)
+        model_counts = ctx.db.count_chunks_by_embedding_model(kb.id)
+        kb.embedding_model_counts = model_counts
+        if model_counts:
+            kb.dominant_embedding_model = max(model_counts, key=lambda m: model_counts[m])
+        else:
+            kb.dominant_embedding_model = None
         return kb

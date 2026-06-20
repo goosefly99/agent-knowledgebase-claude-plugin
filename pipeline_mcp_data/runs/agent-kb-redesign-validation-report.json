@@ -1,0 +1,281 @@
+{
+  "report_id": "vr-agent-kb-redesign-2026-04-24",
+  "spec_id": "70ab2170-381a-4657-bcd1-28a40c6f369b",
+  "target_spec_id": "70ab2170-381a-4657-bcd1-28a40c6f369b",
+  "target_spec_version": "2.0",
+  "phase": "validation",
+  "validated_date": "2026-04-24",
+  "overall_status": "needs_revision",
+  "validator": "subagent-validator-opus",
+  "results": [
+    {
+      "check_id": "f-01",
+      "status": "passed",
+      "id": "f-01",
+      "claim": "Bug-1a: src/agent_knowledgebase/services/embeddings.py line 248 — RemoteEmbedder.dimension returns hardcoded 1536 fallback for unknown model_name (e.g. qwen3-embedding:8b which is 4096-dim).",
+      "evidence": "embeddings.py:248 reads literally `return _REMOTE_EMBEDDING_DIMENSIONS.get(self._model_name, 1536)`. Empirically confirmed: `RemoteEmbedder(model_name='qwen3-embedding:8b', api_key='test', base_url='http://test/v1').dimension` returns 1536 without any HTTP call. The lookup table at lines 151-155 contains only 3 OpenAI models (text-embedding-3-small/large, ada-002). Any other model — Ollama qwen3, Cohere, Voyage — silently returns 1536, guaranteeing dimension mismatch on first ingest into a chromadb collection that was created with the actual probed dimension (e.g. 4096).",
+      "verdict": "VERIFIED",
+      "severity": "high",
+      "recommendation": "Spec correctly diagnoses this. Phase 0 task (probe_dimension dry-run) is the right fix."
+    },
+    {
+      "check_id": "f-02",
+      "status": "passed",
+      "id": "f-02",
+      "claim": "Bug-1b: src/agent_knowledgebase/services/embeddings.py line 350 — OllamaEmbedder.dimension returns 0 until first embed call.",
+      "evidence": "embeddings.py:350 reads `return self._dimension_cache or 0`. _dimension_cache is initialized to None at line 298 and only populated at line 329 inside _call_embed AFTER a successful HTTP round-trip. Empirically confirmed: `create_embedder(default_settings).dimension` returns 0 for the default OllamaEmbedder before any embed call. Any caller that asks for `.dimension` to validate a chromadb collection BEFORE the first ingest gets 0 — which then mismatches whatever real dimension the embed call returns.",
+      "verdict": "VERIFIED",
+      "severity": "high",
+      "recommendation": "Spec correctly diagnoses this. Phase 0 probe_dimension fix is the right approach."
+    },
+    {
+      "check_id": "f-03",
+      "status": "passed",
+      "id": "f-03",
+      "claim": "Bug-1c: embeddings.py lines 215-228 — _call_embed catches BaseException, classifies only httpx transport errors via _classify_httpx_transport_error; HTTP 4xx/5xx propagate raw.",
+      "evidence": "embeddings.py:215 reads `except BaseException as exc:  # noqa: BLE001 — classify below`. Line 216 calls `_classify_httpx_transport_error` which (line 70-81) returns a token only for httpx.TimeoutException or httpx.NetworkError. Line 217-218: `if error_token is None: raise` — re-raises everything else unchanged. response.raise_for_status() at line 212 raises httpx.HTTPStatusError for 4xx/5xx, which is NOT a TimeoutException or NetworkError, so it bypasses the EmbedderUnavailableError wrap and propagates as a raw httpx.HTTPStatusError to the caller. Same pattern in OllamaEmbedder._call_embed lines 312-325. Spec is correct: model-not-pulled 404 from Ollama surfaces opaquely.",
+      "verdict": "VERIFIED",
+      "severity": "medium",
+      "recommendation": "Spec implies this should be classified into a structured error. Phase 0 should add explicit HTTP-status classification to EmbedderUnavailableError so model-not-pulled (404), auth-failed (401/403), rate-limited (429) are first-class structured payloads."
+    },
+    {
+      "check_id": "f-04",
+      "status": "passed",
+      "id": "f-04",
+      "claim": "Bug-1d: embeddings.py lines 424-430 — RemoteEmbedder factory raises ValueError when api_key/base_url missing, surfacing as opaque 'Internal Server Error' to MCP caller.",
+      "evidence": "embeddings.py:424 reads `if not api_key: raise ValueError(\"AGENT_KB_EMBED_API_KEY required for remote embeddings\")` and 426-430 the matching base_url check. This raises during create_embedder() called from KnowledgebaseService.__init__ called from server._get_service() (server.py:49-54). server.py does NOT catch ValueError around _get_service, so MCP RPC sees a Python exception with no structured payload. Spec correctly flags the surfacing problem; the line numbers match.",
+      "verdict": "VERIFIED",
+      "severity": "medium",
+      "recommendation": "Phase 0 should wrap _get_service in a structured-error catch so config_missing returns {\"error\":\"config_missing\",\"missing\":\"AGENT_KB_EMBED_API_KEY\"} JSON. Spec already mentions this in the FINAL Bug-2 fix list."
+    },
+    {
+      "check_id": "f-05",
+      "status": "failed",
+      "id": "f-05",
+      "claim": "Bug-2 ROOT CAUSE: server.py lines 164-822 — `@mcp.tool()` is applied OUTSIDE `@_with_tool_timeout`, so FastMCP registers the inner unwrapped function and the 180s timeout is dead code. NO-OP at MCP boundary.",
+      "evidence": "server.py applies decorators in this order on every tool (e.g. lines 164-166): `@mcp.tool()` THEN `@_with_tool_timeout` THEN `def kb_create(...)`. Python evaluates decorators bottom-up: _with_tool_timeout wraps kb_create FIRST, producing a `wrapper`; then mcp.tool() registers that wrapper. Confirmed empirically with `python -c \"import inspect; from agent_knowledgebase.server import mcp; tools = dict(mcp._tool_manager._tools); fn = tools['kb_create'].fn; print(hasattr(fn, '__wrapped__'))\"` -> True; `fn.__wrapped__.__name__` -> 'kb_create' (the original, one hop away). Live test: `@mcp.tool()` + `@_with_tool_timeout` on a slow_test_tool with _TOOL_TIMEOUT_SECONDS=0.2 returned `{\"error\": \"tool_timeout\", \"tool\": \"slow_test_tool\", \"timeout_seconds\": 0.2}` — the wrap IS engaging at MCP boundary. Full pytest run: `tests/test_tool_timeout.py` 6/6 passed including `test_every_registered_mcp_tool_is_wrapped` which asserts hasattr(fn, '__wrapped__') for every registered tool. The spec's primary Bug-2 diagnosis is INVERTED. The 'NO-OP' framing is wrong; the timeout DOES engage.",
+      "verdict": "INVALID",
+      "severity": "high",
+      "recommendation": "DELETE the decorator-order-swap task and the 25 decorator swaps from Phase 0. They would FLIP a working setup into a broken one (mcp.tool inner means FastMCP registers the raw function and timeout becomes dead code). Spec's `notes` field already contains a correct revision (REVISED Bug-2 root cause: server.py:53 Settings().resolve_paths() ValidationError when AGENT_KB_SAVES_DIR unset) but this revision is not propagated into objectives/Phase 0 tasks/risks. Replace the entire Bug-2 narrative with the config-missing narrative: catch pydantic.ValidationError in _get_service and FileNotFoundError from resolve_paths, return structured {\"error\":\"config_missing\"} payloads. Keep tests/contract/test_decorator_order.py only as a regression guard against accidental future inversion (not as the bug fix)."
+    },
+    {
+      "check_id": "f-06",
+      "status": "passed",
+      "id": "f-06",
+      "claim": "Settings().resolve_paths() raises pydantic ValidationError when AGENT_KB_SAVES_DIR unset, OR FileNotFoundError when set to a non-existent directory.",
+      "evidence": "config.py:42-46 declares `saves_dir: Path = Field(description=...)` with no default. Empirically: `del os.environ['AGENT_KB_SAVES_DIR']; Settings()` raises pydantic_core.ValidationError 'saves_dir Field required'. With AGENT_KB_SAVES_DIR='/nonexistent', Settings().resolve_paths() raises FileNotFoundError 'AGENT_KB_SAVES_DIR does not exist: ...' (config.py:217-220). Both bypass server.py:49-54 _get_service unprotected, becoming opaque MCP errors.",
+      "verdict": "VERIFIED",
+      "severity": "high",
+      "recommendation": "This is the actual user-visible Bug-2. Promote to top-level Phase 0 task: catch (pydantic.ValidationError, FileNotFoundError, NotADirectoryError) in _get_service and return structured payload. Add server startup precheck so missing AGENT_KB_SAVES_DIR fails immediately with clear stderr instead of on first MCP call."
+    },
+    {
+      "check_id": "f-07",
+      "status": "passed",
+      "id": "f-07",
+      "claim": "All 25 spec-listed kb_* MCP tools exist verbatim in server.py.",
+      "evidence": "Grep `@mcp.tool()` on server.py returned 25 hits at lines 164,180,195,225,265,280,295,313,328,343,364,376,393,416,433,450,482,499,514,532,602,628,695,724,767. Live FastMCP introspection confirms 25 registered tool names exactly matching the spec's frozen list: kb_create, kb_delete, kb_ingest, kb_ingest_batch, kb_update_source, kb_remove_source, kb_lint, kb_lint_fix, kb_rebuild_index, kb_export, kb_list, kb_info, kb_query, kb_search, kb_get_page, kb_list_pages, kb_get_source, kb_list_sources, kb_get_links, kb_pipeline_status, kb_config_path, kb_config_show, kb_config_get, kb_config_set, kb_config_validate. Spec's count is consistent (25 in components.MCP-tool-surface, but the overview.objectives bullet only enumerates 17+8=25 — wording 'plus' is awkward but math checks).",
+      "verdict": "VERIFIED",
+      "severity": "low",
+      "recommendation": "Tighten objectives bullet to say '25 frozen tools' explicitly. Spec already uses 25 elsewhere; remove 17+8 phrasing for clarity."
+    },
+    {
+      "check_id": "f-08",
+      "status": "passed",
+      "id": "f-08",
+      "claim": "Pattern A launcher feasibility: Claude Code .mcp.json with `command:python args:[<script.py>]` invokes correctly cross-platform.",
+      "evidence": "Web search confirms Claude Code's .mcp.json passes command/args directly to OS process spawner (no shell wrapping by default). Standard pattern uses `command:python` or `command:python3` with `args:[<script.py>]`. The bash shebang issue (#!/usr/bin/env python on Windows) is sidestepped because the launcher is invoked AS an argument to `python`, not directly. Windows PATHEXT only matters when the COMMAND lacks an extension; here `python` is the command and PATHEXT resolves `python.exe`. Domain-specialist's debate concern (bare `bin/run-server` failing on Windows) does NOT apply to the spec's `python ${CLAUDE_PLUGIN_ROOT}/bin/run_server.py` form. Risk that `python` on PATH is python2 on legacy macOS systems — spec's >=3.11 fail-fast handles. Sources: https://gofastmcp.com/integrations/mcp-json-configuration, https://github.com/BunPrinceton/claude-mcp-windows-guide.",
+      "verdict": "VERIFIED",
+      "severity": "low",
+      "recommendation": "Spec is correct. Add explicit note: on Windows with no Python on PATH, the npx-style cmd /c wrapper is NOT needed because the python interpreter does its own arg expansion. CI matrix should include Windows + macOS + Linux as Phase 1 calls for."
+    },
+    {
+      "check_id": "f-09",
+      "status": "passed",
+      "id": "f-09",
+      "claim": "fastembed conditional compatibility with sentence-transformers all-MiniLM-L6-v2: recall delta <1%, MMR re-tune required.",
+      "evidence": "Web search: qdrant/fastembed Issue #22 documents 99.2% mismatched elements when comparing fastembed embeddings to sentence-transformers normalized embeddings for all-MiniLM-L6-v2. The cosine similarity on the embeddings is preserved (recall metric stable), but the raw vector values diverge by ~1e-4 due to int8 quantization on some platforms (Qdrant release notes confirmed). The spec's framing 'recall delta <1%, MMR re-tune required' is materially conservative — actual element-wise mismatch is much larger but irrelevant to top-K cosine. The MMR concern (1e-4 swings on diversity-threshold boundary) is technically correct per the debate's domain-specialist evidence. Spec is directionally correct but understates the magnitude of element-level drift.",
+      "verdict": "PARTIAL",
+      "severity": "medium",
+      "recommendation": "Sharpen Phase 4 wording: 'fastembed produces cosine-rank-equivalent embeddings (recall@10 within 1%) but raw element values diverge ~1e-4 from sentence-transformers fp32. Re-tune MMR lambda; do NOT mix embedder_versions on the same kb_id'. Add tests/test_fastembed_recall_parity.py to the deliverables (compute Jaccard@10 of top-10 neighbours between fastembed-MiniLM and HF-MiniLM on a fixed corpus, assert >=0.95). Sources: https://github.com/qdrant/fastembed/issues/22."
+    },
+    {
+      "check_id": "f-10",
+      "status": "failed",
+      "id": "f-10",
+      "claim": "Constraint contradiction: Phase 4 (fastembed default + remote-only default) ships before Phase 5 (data migration tooling), yet 'Forbid partial migration' is a top-level constraint. Existing chromadb KBs ingested with sentence-transformers vectors must continue to query AS-IS.",
+      "evidence": "Spec implementation.phases ordering: Phase 4 'Embedding defaults: remote-only default, fastembed optional' explicitly switches embedding_provider default from 'ollama' to 'remote' and embedding_model default to 'text-embedding-3-small' (1536-dim). Phase 5 'Migration tooling + dual-backend transition' ships AFTER. Existing v0.6.0 ChromaDB collections were created with whatever model the user configured (default 'qwen3-embedding:8b' = 4096-dim per Ollama). After Phase 4 default-flip, a fresh install with no env override would create a RemoteEmbedder targeting 1536-dim; existing 4096-dim collections would dimension-mismatch on the first kb_query. The spec's read-fallback mitigation lives in Phase 5, AFTER the breaking change. Phase 4 also depends on 'create_embedder_for_model' (already in code at embeddings.py:380) to pin per-page embedding model — but the dominant_embedding_model field is set at ingest time, not retroactively for existing pages. Without a migration sentinel checked in Phase 4, existing KBs silently break.",
+      "verdict": "INVALID",
+      "severity": "high",
+      "recommendation": "Either (a) move Phase 5 read-fallback semantics before Phase 4 default-flip — make read-fallback PRECEDE the default change so existing KBs are protected by the time the default flips; (b) add a Phase 4 task: detect existing KBs with non-default-model dominant_embedding_model and pin per-KB override transparently using create_embedder_for_model; (c) ship Phase 4 with feature-flagged default (AGENT_KB_DEFAULT_EMBEDDING_PROVIDER) and document migration steps before flipping global default. Spec's success_criteria '#5 AGENT_KB_BACKEND=chromadb (default) preserves all v0.6.0 behavior' is contradicted by Phase 4's default-embedding-flip."
+    },
+    {
+      "check_id": "f-11",
+      "status": "failed",
+      "id": "f-11",
+      "claim": "Default install size drops from ~2GB to ~20MB (remote-only) or ~100MB (fastembed-local opt-in).",
+      "evidence": "Current pyproject.toml runtime dependencies (lines 6-21): mcp, pydantic, pydantic-settings, chromadb, sentence-transformers, trafilatura, tree-sitter, tree-sitter-languages, gitpython, sqlalchemy, sqlparse, httpx, pdfplumber, tiktoken. Spec's Phase 4 task list moves sentence-transformers to optional but KEEPS chromadb (~400MB), tree-sitter-languages (~100MB per codebase-requirements estimate), pdfplumber, sqlalchemy, tiktoken (~50MB), trafilatura (~20MB). Realistic floor after dropping torch+sentence-transformers (~1.7GB): chromadb 400MB + tree-sitter-languages 100MB + tiktoken 50MB + trafilatura 20MB + sqlalchemy 50MB + httpx 5MB + pydantic 10MB + mcp 5MB + pdfplumber 30MB + others 30MB = ~700MB realistic. The '~20MB' claim is off by a factor of 35x for the realistic surface. Tree-sitter-languages in particular is required by codebase ingestor and is NOT in the spec's optional-deps list.",
+      "verdict": "INVALID",
+      "severity": "high",
+      "recommendation": "Replace '~20MB' with realistic '~700MB' (or move tree-sitter-languages, chromadb, pdfplumber, sqlparse, sqlalchemy to per-ingestor optional extras: codebase=[tree-sitter,...], file=[pdfplumber], sql_database=[sqlalchemy,sqlparse,...]). The bare 'remote-only' install for someone using only kb_query with markdown backend could plausibly be ~200MB if chromadb is also moved to optional. Spec needs to enumerate exactly which deps move to extras. Update success_criteria #7 to reflect reality."
+    },
+    {
+      "check_id": "f-12",
+      "status": "failed",
+      "id": "f-12",
+      "claim": "AGENT_KB_BACKEND feature flag — chromadb default; markdown opt-in. Spec says it's owned by Settings.backend.",
+      "evidence": "Current config.py has NO `backend` field. Grep across src/ for 'backend' (case-sensitive) returns ONLY references in server.py docstrings, embeddings.py and vectorstore.py file-level comments. Settings already has a `vectorstore: Literal['chromadb', 'pinecone']` field (config.py:49-52) — the spec's introduction of `backend: Literal['chromadb','markdown','lightrag']` would be parallel to and potentially confusable with `vectorstore`. Spec's Phase 2 task list says 'Add Settings.backend' but does not specify how to disambiguate from existing Settings.vectorstore (which is a vector-store-specific selector). Components section names src/agent_knowledgebase/services/retriever.py and services/backends/ — neither exists. Spec is concrete about WHERE the switch lives but not about migration: should `vectorstore: pinecone` be subsumed into `backend: pinecone` or stay independent?",
+      "verdict": "PARTIAL",
+      "severity": "medium",
+      "recommendation": "Phase 2 must explicitly resolve Settings.vectorstore vs Settings.backend overlap. Two clean options: (a) RENAME existing 'vectorstore' to 'vector_store_provider' (still a chromadb/pinecone choice) and use 'backend' for the higher-level retrieval-strategy choice (chromadb-vector / markdown-fts / lightrag-graph); (b) FOLD pinecone into backend: Literal['chromadb','pinecone','markdown','lightrag'] and deprecate Settings.vectorstore. Spec should pick one and update tests/contract/test_probe4_response_shape.py to assert kb_info still shows the migrated key."
+    },
+    {
+      "check_id": "f-13",
+      "status": "passed",
+      "id": "f-13",
+      "claim": "test_tool_timeout.py contains test_every_registered_mcp_tool_is_wrapped which asserts every tool has __wrapped__.",
+      "evidence": "tests/test_tool_timeout.py:122-136 contains the test. It iterates `mcp._tool_manager._tools` and asserts hasattr(fn, '__wrapped__'). All 6 tests in this file PASS on current codebase (`PYTHONPATH=src python -m pytest tests/test_tool_timeout.py -v` → 6 passed). This further confirms f-05 INVALID: the test passes on the CURRENT decorator order, meaning the wrap IS attached to every registered tool today.",
+      "verdict": "VERIFIED",
+      "severity": "low",
+      "recommendation": "Spec's 'currently failing' framing of this test is wrong. Already passing. Useful as a regression guard, not as evidence of an existing bug."
+    },
+    {
+      "check_id": "f-14",
+      "status": "passed",
+      "id": "f-14",
+      "claim": "MCP tool surface frozen: chromadb and sentence-transformers are runtime deps; spec says they become optional extras under redesign.",
+      "evidence": "Current pyproject.toml has both as required runtime dependencies (lines 10-11). Spec's Phase 4 task list explicitly says 'Drop sentence-transformers from default install; keep as optional [project.optional-dependencies]: sentence-transformers = [...]'. Phase 4 KEEPS chromadb in default install (markdown backend opt-in, chromadb stays default). Per Phase 3 description: 'NOT default. Per-source_type guard.' for markdown. So chromadb is still the default, and is still a required runtime dep — consistent with the AGENT_KB_BACKEND=chromadb default. Spec is internally consistent on this point.",
+      "verdict": "VERIFIED",
+      "severity": "low",
+      "recommendation": "Phase 4 deliverable list should explicitly enumerate the new pyproject.toml [project.optional-dependencies] groups: sentence-transformers, fastembed, pinecone (already exists), markdown (sqlite/FTS5 is stdlib, but list explicitly), lightrag (httpx already in core)."
+    },
+    {
+      "check_id": "f-15",
+      "status": "failed",
+      "id": "f-15",
+      "claim": "MarkdownWikiBackend per-source_type guard: source_type in {sql_database, codebase, git_history} raises KB_INGESTOR_UNSUITABLE unless AGENT_KB_FORCE_WIKI_INGEST=1.",
+      "evidence": "Spec's Phase 3 task list says 'Per-source_type guard: source_type in {sql_database, codebase, git_history} raises KB_INGESTOR_UNSUITABLE error unless AGENT_KB_FORCE_WIKI_INGEST=1.' But current SourceType enum (per server.py:209 docstring 'file, directory, codebase, website, sql_database, git_history, api_endpoint') has 7 values, and the guard list only covers 3. What about 'directory' (codebase-like, plausibly bad on wiki)? What about 'api_endpoint' (could be very high-volume)? What about 'file' for a 10GB PDF? The guard list is too narrow and leaves significant footguns open. The 'website' source_type is the only one Karpathy-style wiki actually fits cleanly.",
+      "verdict": "PARTIAL",
+      "severity": "medium",
+      "recommendation": "Tighten Phase 3 guard to a positive-allow list: ALLOW {file, website, api_endpoint where size <2MB} on markdown backend. Anything else raises KB_INGESTOR_UNSUITABLE. Cost-model docs should table per-source_type LLM-token estimates so users can see why."
+    },
+    {
+      "check_id": "f-16",
+      "status": "passed",
+      "id": "f-16",
+      "claim": "RetrieverBackend protocol exists at the swap point; spec specifies the methods (add, query, search, delete, count, health_check).",
+      "evidence": "vectorstore.py:44-77 already declares VectorStore Protocol with add/query/delete/get/count. Existing protocol is at the chromadb/pinecone choice level (vector-store-specific). Spec's RetrieverBackend would be one level higher — abstracting over backend-strategy not just vector-store-provider. No file at src/agent_knowledgebase/services/retriever.py exists yet. Spec is concrete about new file path and method names. health_check is not in the existing VectorStore protocol — new addition. Spec is implementable.",
+      "verdict": "VERIFIED",
+      "severity": "low",
+      "recommendation": "Phase 2 task should explicitly list which existing VectorStore protocol methods carry over and which become new (health_check, search-as-distinct-from-query for hybrid keyword vs vector). Reference vectorstore.py:44-77 in the deliverable so reviewers can see the diff surface."
+    },
+    {
+      "check_id": "f-17",
+      "status": "passed",
+      "id": "f-17",
+      "claim": "Existing v0.6.0 chromadb-indexed KBs must continue to query AS-IS during the dual-backend transition window (read-fallback semantics).",
+      "evidence": "Spec assumption['Existing v0.6.0 chromadb-indexed KBs must continue to query AS-IS...']. Phase 5 task 'Read-fallback: if Settings.backend=markdown but <kb-name>/wiki/ does not exist while <kb-name>/vector_store/ does, ChromaDBBackend serves the query'. This is sound IF the embedder used to ingest the original KB is still constructible. After Phase 4 changes embedding_provider default to 'remote' and embedding_model default to 'text-embedding-3-small', a v0.6.0 KB ingested with default Ollama qwen3-embedding:8b cannot be re-queried unless the user keeps Ollama running and overrides via env. dominant_embedding_model is stamped on each page (per ROADMAP and spec.notes), so create_embedder_for_model can rebuild the right embedder — but only if the provider config (base_url/api_key) is also pinned per-page. embeddings.py:380 create_embedder_for_model uses CURRENT Settings.embedding_provider — NOT a per-page provider snapshot.",
+      "verdict": "PARTIAL",
+      "severity": "high",
+      "recommendation": "Add a Phase 4 task: stamp embedding_provider AND embed_base_url alongside dominant_embedding_model on every page so create_embedder_for_model can faithfully rebuild the original embedder. Migration: backfill existing pages from kb config.json. Spec's notes-section probe (test_chromadb_dimension_mismatch.py) catches the dimension-mismatch case but not the silent-wrong-vectors case where dimensions coincidentally match but model is different."
+    },
+    {
+      "check_id": "f-18",
+      "status": "failed",
+      "id": "f-18",
+      "claim": "Spec internal contradiction: notes section first claims Bug-2 root cause is decorator-order (lines 164-822), then 'WAIT' admits the order DOES register the wrapper, then proposes alt cause server.py:53 ValidationError. Final 'FINAL Bug-2 fix list' includes BOTH 'verify decorator order' AND 'catch ValidationError'. Top-level objectives bullet for Bug-2 still asserts 'NO-OP at the MCP boundary'.",
+      "evidence": "Spec.notes contains a verbatim self-correction: 'WAIT — actually that order DOES register the wrapper. Re-checking: ...' then 'REVISED Bug-2 root cause: src/agent_knowledgebase/server.py:53 — Settings().resolve_paths() fails fast when AGENT_KB_SAVES_DIR is unset'. But spec.overview.objectives[1] still says 'every kb_* MCP tool's _with_tool_timeout decorator is a NO-OP at the MCP boundary — @mcp.tool() is applied OUTSIDE @_with_tool_timeout (server.py lines 164-822)'. spec.architecture.components[3] still says 'Decorator order BUG FIX: @mcp.tool() must be applied AFTER @_with_tool_timeout'. spec.implementation.phases[0].tasks[0] still says 'Fix Bug-2 decorator order in server.py: for each of the 25 @mcp.tool()-decorated functions (lines 164-822), swap so @_with_tool_timeout is INNER and @mcp.tool() is OUTER'. The objectives, components, and Phase 0 task contradict the notes section.",
+      "verdict": "INVALID",
+      "severity": "high",
+      "recommendation": "Rewrite the spec to propagate the notes-section correction throughout: (1) overview.objectives[1] should say 'fix opaque MCP errors when AGENT_KB_SAVES_DIR or AGENT_KB_EMBED_API_KEY is unset by catching pydantic.ValidationError and FileNotFoundError in _get_service'; (2) architecture.components[3] should focus on _get_service error-wrapping not decorator swap; (3) Phase 0 task list: REMOVE 'swap so @_with_tool_timeout is INNER' (would break a working setup); ADD 'wrap _get_service in try/except (pydantic.ValidationError, FileNotFoundError, NotADirectoryError) and return JSON {error:config_missing, missing:<env_var>}'; (4) keep tests/contract/test_decorator_order.py as a regression guard but with assertion that DOES NOT prefer one order over the other — assert hasattr(fn,'__wrapped__') OR equivalent. Failing to fix this creates a high-severity production regression."
+    },
+    {
+      "check_id": "f-19",
+      "status": "passed",
+      "id": "f-19",
+      "claim": "Pattern A launcher must distinguish 3 failure modes (python_version, network_unreachable, read_only_filesystem) with structured stderr.",
+      "evidence": "Spec.architecture.components[0] enumerates the three modes with payload format. Stdlib venv + filelock are documented and supported on Win/macOS/Linux. Python 3.11+ check is trivial (sys.version_info). pip install network timeout: pip --timeout=30 is supported. read-only filesystem: os.access(path, os.W_OK) is reliable on Win/macOS/Linux. spec.risks[2] mitigation describes a single .py launcher invoked via 'python <path>' which sidesteps Windows shebang. All implementable in stdlib only as spec claims.",
+      "verdict": "VERIFIED",
+      "severity": "low",
+      "recommendation": "Phase 1 task list should add: 'add Cygwin/Git-Bash detection (sys.platform=='win32' AND env('MSYSTEM')) so paths normalize correctly when CLAUDE_PLUGIN_ROOT contains forward slashes from Git-Bash but Python expects backslashes'."
+    },
+    {
+      "check_id": "f-20",
+      "status": "passed",
+      "id": "f-20",
+      "claim": "Probe-4 contract preservation: kb_info / kb_list_pages / kb_list_sources response shapes must include source_type, uri, dedup_key, page_id, dominant_embedding_model.",
+      "evidence": "server.py:450-479 kb_list_pages docstring confirms 'page_id, source_type, uri, dedup_key' fields are added by this endpoint specifically (drawn from source_ids[0]). dominant_embedding_model is on Knowledgebase model (per ROADMAP). Spec's Phase 2 task list includes tests/contract/test_probe4_response_shape.py asserting v0.6.0-shaped JSON across all backends, with 'markdown backend returns null for embedding-related fields where N/A — probe-4 must accept null'. Sound but requires the consumer (data-etl-orchestrator probe 4) to actually accept null. Spec's risks[0] mitigation says 'Backends MUST return null for inapplicable fields, not omit them' — correct shape preservation strategy.",
+      "verdict": "VERIFIED",
+      "severity": "medium",
+      "recommendation": "Phase 2 task list should add a coordinating action: file an issue against data-etl-orchestrator >=v0.4.0 confirming probe 4 accepts dominant_embedding_model=null. Without this confirmation, Phase 3 (markdown backend) silently breaks the contract."
+    },
+    {
+      "check_id": "f-21",
+      "status": "failed",
+      "id": "f-21",
+      "claim": "Phase 0 deliverables include MISTAKES.md entry for decorator-order pitfall.",
+      "evidence": "Spec.implementation.phases[0].deliverables lists 'MISTAKES.md entry: Decorator order at @mcp.tool() boundary — outer decorator is what FastMCP registers; place @_with_tool_timeout INNER to it.' This is the OPPOSITE of correct: in current code, @mcp.tool() IS the outer decorator and @_with_tool_timeout IS the inner — and this works. The MISTAKES.md guidance as written would lead a future dev to swap them and BREAK the timeout. The MISTAKES.md entry repeats the spec's inverted Bug-2 narrative.",
+      "verdict": "INVALID",
+      "severity": "medium",
+      "recommendation": "Rewrite MISTAKES.md entry to: 'Decorator order at @mcp.tool() boundary — @mcp.tool() should be the OUTER decorator so FastMCP registers the wrapped function. @_with_tool_timeout goes INNER. Inverting the order causes timeout to be dead code at the MCP boundary.' Or remove the entry entirely until a real bug surfaces."
+    }
+  ],
+  "summary": {
+    "total_findings": 21,
+    "verified_count": 13,
+    "partial_count": 4,
+    "invalid_count": 5,
+    "uncertain_count": 0,
+    "high_severity_invalid_or_partial": 5,
+    "headline": "Spec correctly diagnoses Bug-1 (4 high-severity findings VERIFIED with file:line evidence), correctly identifies the actual user-facing root-cause in spec.notes (Settings ValidationError on missing AGENT_KB_SAVES_DIR), but fails to propagate that correction into the spec body — overview.objectives, architecture.components, and Phase 0 tasks still describe an inverted Bug-2 narrative whose implementation would FLIP a working decorator setup into a broken one. Two additional high-severity issues: (1) Phase 4 default-flip ships before Phase 5 read-fallback, breaking existing KBs; (2) ~20MB install-size claim is off by ~35x because chromadb + tree-sitter-languages remain in default deps.",
+    "must_fix_before_implementation": [
+      "Spec.overview.objectives[1], spec.architecture.components[3], spec.implementation.phases[0].tasks[0] all describe a fictional Bug-2 (decorator order). Replace with the real Bug-2 (Settings/resolve_paths exception unwrapped at _get_service).",
+      "Phase 4 must NOT flip embedding_provider default before Phase 5 ships read-fallback (or pin per-page provider stamp).",
+      "Install size target ~20MB is unrealistic — recompute against actual deps (~700MB realistic) or move chromadb+tree-sitter-languages+pdfplumber to per-feature optional extras.",
+      "MISTAKES.md entry as written would lead future devs to break the working code; rewrite or remove."
+    ],
+    "spec_strengths": [
+      "Bug-1 diagnosis (a/b/c/d) all VERIFIED at the file:line level with empirical confirmation.",
+      "Pattern A launcher design is sound and implementable cross-platform.",
+      "MCP tool surface freeze is enforceable: 25 tools confirmed in current code, all named in spec.",
+      "Phased rollout with chromadb default and markdown opt-in correctly defers complexity.",
+      "Probe-4 contract preservation strategy (null where N/A) is the right shape choice.",
+      "The spec.notes section already contains the correct revised Bug-2 diagnosis — it just needs to be hoisted into the body."
+    ]
+  },
+  "recommendations": [
+    "BLOCKER: Rewrite Bug-2 narrative throughout objectives/components/phases to match spec.notes REVISED root cause (config-missing in _get_service). DO NOT swap decorator order in Phase 0.",
+    "BLOCKER: Reorder Phase 4 vs Phase 5 — read-fallback semantics must precede default-embedding-provider flip, or pin per-page (provider, base_url) snapshot so existing KBs are queryable after the default change.",
+    "BLOCKER: Recompute install-size target. Either claim ~700MB realistic remote-only floor, or move chromadb+tree-sitter-languages+pdfplumber to per-feature optional extras to actually reach ~20MB for a query-only Ollama install.",
+    "MAJOR: Disambiguate Settings.backend vs existing Settings.vectorstore (config.py:49). Pick rename or fold-in approach and enforce in tests/contract/test_probe4_response_shape.py.",
+    "MAJOR: Sharpen Phase 3 markdown-backend per-source_type guard to a positive-allow list (file, website, small api_endpoint) instead of the current negative-deny list of 3 source_types.",
+    "MAJOR: Stamp (embedding_provider, embed_base_url) alongside dominant_embedding_model so create_embedder_for_model can faithfully reproduce the original embedder for read-fallback.",
+    "MINOR: Add explicit HTTP-status classification (404 model-not-pulled, 401/403 auth, 429 rate-limited) to EmbedderUnavailableError beyond just timeout/network errors (Bug-1c).",
+    "MINOR: MISTAKES.md entry rewrite per f-21 recommendation.",
+    "MINOR: Add Cygwin/Git-Bash detection to Pattern A launcher Phase 1 task.",
+    "MINOR: Coordinate with data-etl-orchestrator >=v0.4.0 to confirm probe 4 accepts dominant_embedding_model=null before Phase 3 ships."
+  ],
+  "validated_artifacts": [
+    {
+      "type": "design-spec",
+      "path": "C:\\Users\\olive\\claude_projects\\coding\\agent_tools_dev\\data_etl_orchestrator_dev\\agent_knowledge_base_plugin_dev\\pipeline_mcp_data\\specs\\agent-kb-redesign-spec-v2.json",
+      "spec_id": "70ab2170-381a-4657-bcd1-28a40c6f369b",
+      "spec_version": "2.0"
+    }
+  ],
+  "verification_methods": [
+    "Read on src/agent_knowledgebase/services/embeddings.py (lines 248, 350, 215-228, 424-430, 151-155, 298, 329)",
+    "Read on src/agent_knowledgebase/server.py (lines 49-54, 123-156, 164-822 decorator order)",
+    "Read on src/agent_knowledgebase/config.py (lines 42-46, 49-52, 201-225)",
+    "Grep for @mcp.tool() decorator (25 hits at lines 164,180,195,225,265,280,295,313,328,343,364,376,393,416,433,450,482,499,514,532,602,628,695,724,767)",
+    "Live empirical verification: PYTHONPATH=src python execution of mcp._tool_manager._tools introspection, all 25 tools have __wrapped__ attribute pointing to the original",
+    "Live empirical timeout test: @mcp.tool() + @_with_tool_timeout on slow_test_tool with _TOOL_TIMEOUT_SECONDS=0.2 returned tool_timeout JSON payload (proving wrap engages at MCP boundary)",
+    "pytest tests/test_tool_timeout.py — 6/6 passed including test_every_registered_mcp_tool_is_wrapped",
+    "Live Settings ValidationError reproduction with AGENT_KB_SAVES_DIR unset",
+    "Live OllamaEmbedder.dimension == 0 confirmation",
+    "Live RemoteEmbedder('qwen3-embedding:8b').dimension == 1536 confirmation",
+    "WebSearch: Claude Code MCP cross-platform (gofastmcp.com, claude-mcp-windows-guide)",
+    "WebSearch: fastembed all-MiniLM-L6-v2 cosine drift (qdrant/fastembed Issue #22)",
+    "Reading codebase-requirements.json for runtime dep list and ~2GB estimate",
+    "Reading debate-transcript.json synthesis.changes_accepted to verify spec applies them"
+  ]
+}

@@ -1,0 +1,123 @@
+# agent-knowledgebase — Update Roadmap
+Generated from run `data-etl-orchestrator-update-2026-04-13`
+
+Source spec: `pipeline_mcp_data/specs/agent-knowledgebase-update-spec.json`
+Codebase root: `C:\Users\olive\claude_projects\coding\agent_tools_dev\data_etl_orchestrator_dev\agent_knowledge_base_plugin_dev`
+Language: Python 3.11+, uv, pydantic v2, chromadb, sqlalchemy, pytest.
+
+## Release position
+**Stage 1 of 4 — ships FIRST (security gate).**
+- Gates: the SQL-injection AST validator for `kb_ingest source_type=sql_database` (where=) is the single highest-severity item across the entire release (validation-report kb-04). No orchestrator skill may suggest user-controlled where-clauses until this lands.
+- Gates downstream: youtube-mcp, x-api-mcp, data-etl-orchestrator plugin.
+- Gated by: nothing upstream. This is the security foundation.
+
+## Blocking changes (must ship in this release)
+- [x] **Replace where-clause validator with sqlparse AST allow-list.** Accept only: comparison operators (`=`, `!=`, `<`, `<=`, `>`, `>=`, `IN`, `LIKE`), logical (`AND`, `OR`, `NOT`), identifiers, literals, `IS NULL`/`IS NOT NULL`. Reject: comments (`--`, `/* */`), subqueries, multi-statements (`;`), `PRAGMA`, `ATTACH`, `DETACH`, function calls, `UNION`, backticks. Source: debate round-3 critic + validation kb-04 (high). Acceptance: `tests/test_sql_database_ingest.py::test_where_ast_validator_*` — one negative test per rejected category, passes on CI.
+- [x] **Pin sqlite read-only in the engine URL.** Append `?mode=ro` (URI-mode) or `immutable=1` when constructing the sqlalchemy engine; document Windows absolute-path quoting in `docs/sql-database-uri-grammar.md`. Source: debate round-3 critic. Acceptance: integration test asserts `engine.dialect.readonly` or that an `INSERT` on the source DB raises `OperationalError: attempt to write a readonly database`.
+- [x] **Hard-reject >50-row batches at release 1** (not soft-warn). Structured error with code `BATCH_SIZE_EXCEEDED` and remediation text. Source: debate round-3 synthesizer overturned the spec's soft-warn plan. Acceptance: `kb_ingest_batch` with 51 rows of `source_type=sql_database` returns a structured error and zero rows written.
+- [x] **Expose `dedup_key` and `dedup_policy` as first-class metadata fields** on `kb_ingest` / `kb_ingest_batch`; default `dedup_policy='skip'`. Source: spec objectives + debate round-3 advocate. Acceptance: three tests — skip, replace, force-add — each asserting the correct page count against a fixture DB.
+- [x] **Augment `kb_list_pages` and `kb_list_sources` response** with `source_type`, `uri`, `dedup_key`, `page_id` (pages) and `source_type`, `uri`, `source_id` (sources). Strictly additive — no renames. Source: spec + validation kb-03 (uncertain until audited). Acceptance: response JSON contains the new fields; existing fields unchanged; backward-compat unit test passes.
+- [x] **Per-`kb_id` serialization** via `asyncio.Lock` (or equivalent); explicitly document this is single-process-only. Source: debate round-3 critic. Acceptance: test fires two overlapping `kb_ingest_batch` calls against same `kb_id`; asserts serial execution; stderr log confirms lock acquisition/release.
+- [x] **Record embedding model per page** in metadata; surface dominant model in `kb_info` response. Source: debate round-3 synthesizer (embedding-mix risk). Acceptance: `kb_info` returns `dominant_embedding_model` + `embedding_model_counts`; `sentence_transformers_page` metadata contains `embedding_model` on every ingested row.
+
+## Recommended changes (ship if feasible)
+- [x] Public-facing `docs/safe-where-clause-grammar.md` with the allow-list formally stated and 10 example filters users can copy. Shipped in v0.6.0.
+- [x] Cross-process lock recipe documented (e.g. Postgres advisory lock or a filesystem `flock`) for future multi-worker deployments — document only in release 1; don't implement. Shipped in v0.6.0 as `docs/cross-process-lock-recipe.md`. Enforcement (graduating one recipe to a runtime dependency) remains unchecked as a v0.4.0 planning item.
+- [x] Structured `kb_pipeline_status` telemetry row per ingest run: `{kb_id, started_at, ended_at, ingested, skipped, replaced, failed, batch_size, dedup_policy}`. Shipped in v0.6.0 with additive `request_id` and `tool_caller_version` fields; `knowledgebase_stderr_log` helper lands alongside for structured stderr emissions.
+
+## Accepted as-is
+- `kb_create` / `kb_list` / `kb_info` / `kb_delete` / `kb_update_source` / `kb_remove_source` tool signatures unchanged.
+- Authentication / permissions model unchanged (no new auth surface in this spec).
+- No new external runtime dependencies (sqlparse is already transitively available via sqlalchemy; confirm in audit).
+- 50-row cap value (validated by context7 chromadb docs — kb-02).
+
+## Phased work breakdown
+
+### Phase 1 — Audit
+- files to touch: (none; read-only audit)
+- files to read: `src/agent_knowledgebase/ingestors/sql_database.py`, `src/agent_knowledgebase/models.py`, `src/agent_knowledgebase/server.py` (handlers), `src/agent_knowledgebase/services/*.py`
+- deliverable: audit note listing — (a) current uri-grammar parsing (if any), (b) current kb_list_pages/kb_list_sources response shape, (c) whether a dispatcher already exists, (d) whether sqlparse is already a dep.
+- verification: `uv run python -c "import sqlparse"` succeeds; audit note committed in the PR description.
+
+### Phase 2 — Security hardening (SQL-injection AST validator + read-only engine)
+- files to touch: `src/agent_knowledgebase/ingestors/sql_database_ingestor.py` (create or update), `src/agent_knowledgebase/services/where_clause_validator.py` (new)
+- tests to add: `tests/test_where_clause_validator.py` with one negative test per rejected AST category; `tests/test_sql_database_ingest.py::test_engine_is_readonly`
+- verification: `uv run pytest tests/test_where_clause_validator.py tests/test_sql_database_ingest.py -v`; `uv run ruff check`; `uv run mypy src/agent_knowledgebase` (if configured)
+
+### Phase 3 — Ingest service guardrails + dedup
+- files to touch: `src/agent_knowledgebase/services/kb_ingest_service.py`, `src/agent_knowledgebase/services/dedup_service.py` (new), the MCP tool handlers for `kb_ingest` and `kb_ingest_batch`
+- tests to add: `tests/test_kb_ingest_service.py` covering — (a) 51-row rejection, (b) per-kb_id serialization via overlapping async calls, (c) each of skip/replace/force-add dedup policies
+- verification: `uv run pytest tests/test_kb_ingest_service.py -v`
+
+### Phase 4 — Response augmentation + embedding-model tracking
+- files to touch: `src/agent_knowledgebase/server.py` (or wherever kb_list_pages / kb_list_sources / kb_info are implemented), pydantic response schemas
+- tests to add: `tests/test_kb_list_augmentation.py` asserting new fields present and old fields unchanged; `tests/test_kb_info_embedding_model.py`
+- verification: `uv run pytest tests/test_kb_list_augmentation.py tests/test_kb_info_embedding_model.py -v`
+
+### Phase 5 — Docs + cross-references
+- files to touch: `docs/memory-pointer-protocol.md` (new), `docs/sql-database-uri-grammar.md` (new), `README.md` (cross-reference data-etl-orchestrator `skills/references/mcp-tool-contracts.md`)
+- verification: docs exist; `README.md` cross-reference link present; no test gate.
+
+### Phase 6 — End-to-end smoke
+- verification:
+  - `uv run pytest` (full suite passes)
+  - `uv run ruff check`
+  - Smoke: `kb_create` a scratch KB; point at a fixture sqlite DB; run `kb_ingest_batch(source_type='sql_database', dedup_policy='skip')` twice and confirm second run reports all `skipped`; run with `replace` and confirm rows replaced; run with 51 rows and confirm hard-reject; run `kb_info` and confirm `dominant_embedding_model` populated.
+
+## Cross-plugin dependencies
+- **This plugin's changes gate:**
+  - `data-etl-orchestrator` — its `load-kb-from-sql` skill and every ingest skill's Stage-3 depend on the uri grammar + dedup_key + dedup_policy being live.
+  - `youtube-mcp` and `x-api-mcp` (indirectly) — orchestrator calls their cache DBs via kb's sql_database ingestor.
+- **This plugin is gated by:** nothing upstream. Ship first.
+
+## Verification commands
+```bash
+# Type-check + lint
+uv run ruff check
+uv run mypy src/agent_knowledgebase
+
+# Test suite
+uv run pytest -v
+
+# Targeted security tests
+uv run pytest tests/test_where_clause_validator.py -v
+
+# Smoke (manual)
+uv run python -m agent_knowledgebase  # start MCP server
+# then exercise kb_create / kb_ingest_batch / kb_info via MCP client
+```
+
+## Out of scope
+- No new MCP tools. No renames or removals of existing tools or fields.
+- No new vector-store backend (chromadb stays).
+- No changes to `kb_create` / `kb_list` / `kb_info` signatures — only additive fields in `kb_info` response.
+- No new authentication / permissions model.
+- No cross-process lock implementation (documented only).
+- No multi-dialect sql support in release 1 (sqlite only; document Postgres/MySQL as future work).
+- Ingestor changes for non-sql source_types (file, website, codebase, etc.) stay untouched.
+
+## Redesign Roadmap (v0.8.0 — agent-kb-redesign-2026-04-24)
+
+> spec_id: `70ab2170-381a-4657-bcd1-28a40c6f369b`
+> Source spec: `pipeline_mcp_data/specs/agent-kb-redesign-spec-v2.1.json`
+> Detailed phase breakdown: [`docs/redesign/ROADMAP.md`](docs/redesign/ROADMAP.md)
+> Subagent brief: [`docs/redesign/AGENTS.md`](docs/redesign/AGENTS.md)
+> Standing pitfalls: [`docs/redesign/MISTAKES.md`](docs/redesign/MISTAKES.md)
+
+The v0.6.0/0.7.0 sections above remain the **frozen ground-truth** for the
+current shipping plugin. This section is forecast for the v0.8.0 redesign,
+which is additive (does NOT regress probe-4, the SQL-injection AST validator,
+the stderr-tee schema, AGENT_KB_SAVES_DIR semantics, the cross-process-lock
+recipe, or the 25 frozen `kb_*` MCP tools).
+
+The redesign ships in 7 phases. **The Phase 4 → Phase 5 ordering is
+non-negotiable** — migration tooling with read-fallback MUST precede the
+embedding default-flip.
+
+- [ ] **Phase 0 — Bug fixes (chromadb backend, no architecture change).** Wrap `_get_service` for `pydantic.ValidationError` / `FileNotFoundError`; add `saves_dir` `default_factory=~/.agent-kb/saves`; probe embedding dimension on first use; classify HTTP-status errors. Bug-2 corrected diagnosis: NOT a decorator NO-OP — the current `@mcp.tool()` outer + `@_with_tool_timeout` inner order works (test_tool_timeout 6/6 passing). DO NOT swap.
+- [ ] **Phase 1 — Pattern A single-launcher runtime bootstrap.** New `bin/run_server.py` (stdlib venv auto-bootstrap, structured-stderr error modes); `.mcp.json` switches `command:uv` → `command:python args:[bin/run_server.py]`.
+- [x] **Phase 2 — RetrieverBackend abstraction behind feature flag.** New `src/agent_knowledgebase/backends/__init__.py` factory + Protocol. `ChromadbBackend` wraps existing logic with zero behavior change. Default still chromadb. AGENT_KB_BACKEND env var added. (Shipped in v0.8.1 — see `CHANGELOG.md`.)
+- [x] **Phase 3 — MarkdownWikiBackend (opt-in).** New `backends/markdown_backend.py` Karpathy-style with sqlite FTS5 over `wiki/pages/*.md`. Per-source_type positive-allow list ({file, website, small api_endpoint}); other source_types raise `KB_INGESTOR_UNSUITABLE`. Sharded index above 200 pages. MVP synchronous ingest (deterministic transformer; out-of-band LLM page-extraction deferred). chromadb stays the default — opt-in via `AGENT_KB_BACKEND=markdown`. (Shipped in v0.9.0 — see `CHANGELOG.md` + `docs/markdown_backend.md`.)
+- [x] **Phase 4 — Migration tooling + dual-backend transition + per-page provider snapshot (PRECEDES default-flip).** New `services/migration.py` with `export_to_markdown` / `import_from_markdown` / `export_chromadb_dump` / `import_chromadb_dump` / `migrate` / `backfill_provider_snapshot`; new additive `kb_migrate(kb_id, target_backend)` MCP tool (probe-4-safe; surface goes 25 -> 26 tools); `ALTER TABLE chunks ADD COLUMN embedding_provider TEXT` + `embed_base_url TEXT` (additive, non-destructive); chunk metadata stamping in `_ingest_source_locked`; `Database.get_embedding_snapshot` reads the dominant `(model, provider, base_url)` triple; `create_embedder_for_model(model_name, provider=..., base_url=...)` accepts the snapshot (backwards-compat preserved); `Settings.kb_backend_per_kb` env-driven mapping; `<saves_dir>/<kb-name>/.migrated_to` sentinel routing; `MarkdownWikiBackend.query` / `search` read-fallback to `ChromadbBackend` when `wiki/` missing while `chroma/` exists with structured `phase='read_fallback'` stderr emission; `docs/migration_guide.md`. (Shipped in v0.10.0 — see `CHANGELOG.md`.)
+- [x] **Phase 5 — Embedding defaults flip (FOLLOWS Phase 4).** `embedding_provider` default `'ollama' → 'remote'`; `embedding_model` default `'qwen3-embedding:8b' → 'text-embedding-3-small'`; sentence-transformers + tree-sitter*/pdfplumber/sqlalchemy/sqlparse moved to opt-in extras; new `'fastembed'` provider (lazy-import qdrant-fastembed via `[embed-local-onnx]`); `Embedder.embedder_version` Protocol property + per-chunk stamping (`ALTER TABLE chunks ADD COLUMN embedder_version TEXT`); `EmbedderVersionMismatchError` with `AGENT_KB_AUTO_REEMBED=1` bypass; MMR fastembed-specific lambda (`query_mmr_lambda_default` / `query_mmr_lambda_fastembed`). Realistic install-size floor ~700MB documented in `docs/install_size.md`. Phase 4 snapshot test (`test_query_embedder_for_uses_snapshot_after_default_flip`) STILL PASSES with the new defaults — proving existing v0.6.0 KBs stay queryable post-flip. (Shipped in v0.11.0 — see `CHANGELOG.md`.)
+- [x] **Phase 6 — LightRAGBackend (deferred).** Stub only; design doc; activate only if adoption signal. (Shipped as stub-only in 0.11.0+phase6 — see `CHANGELOG.md`. `LightRAGBackend` class implements the full `RetrieverBackend` Protocol surface, with `info()` and `health_check()` returning probe-4-compliant `status='unavailable'` payloads and the 5 write/read methods raising `NotImplementedError` with the canonical activation message. `docs/lightrag_backend.md` covers the deferral rationale, sidecar `docker-compose.yml` snippet, REST API contract, and activation checklist. **Intentional deferral per spec adoption-signal gate** — no live LightRAG forwarding code, conditional on operator opt-in within 6 months of v0.11.0 GA.)

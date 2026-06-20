@@ -161,7 +161,7 @@ class TestDirectoryIngestor:
 
     def test_recursive_read(self, tmp_path: Path):
         self._build_tree(tmp_path)
-        ingestor = DirectoryIngestor()
+        ingestor = DirectoryIngestor(excluded_dirs=set())
         contents = ingestor.read(str(tmp_path))
         paths = [c.metadata["file_path"] for c in contents]
         assert len(contents) == 3
@@ -174,7 +174,7 @@ class TestDirectoryIngestor:
         (tmp_path / ".hidden" / "secret.txt").write_text("nope", encoding="utf-8")
         (tmp_path / "visible.txt").write_text("yes", encoding="utf-8")
 
-        ingestor = DirectoryIngestor()
+        ingestor = DirectoryIngestor(excluded_dirs=set())
         contents = ingestor.read(str(tmp_path))
         assert len(contents) == 1
         assert "visible.txt" in contents[0].metadata["file_path"]
@@ -185,7 +185,7 @@ class TestDirectoryIngestor:
             (tmp_path / d / "junk.txt").write_text("junk", encoding="utf-8")
         (tmp_path / "keep.txt").write_text("keep", encoding="utf-8")
 
-        ingestor = DirectoryIngestor()
+        ingestor = DirectoryIngestor(excluded_dirs={"__pycache__", "node_modules", ".git"})
         contents = ingestor.read(str(tmp_path))
         assert len(contents) == 1
         assert "keep.txt" in contents[0].metadata["file_path"]
@@ -197,7 +197,7 @@ class TestDirectoryIngestor:
         (tmp_path / "build").mkdir()
         (tmp_path / "build" / "output.js").write_text("built", encoding="utf-8")
 
-        ingestor = DirectoryIngestor()
+        ingestor = DirectoryIngestor(excluded_dirs=set())
         contents = ingestor.read(str(tmp_path))
         paths = [c.metadata["file_path"] for c in contents]
         assert any("app.py" in p for p in paths)
@@ -205,13 +205,13 @@ class TestDirectoryIngestor:
         assert not any("output.js" in p for p in paths)
 
     def test_nonexistent_directory(self, tmp_path: Path):
-        ingestor = DirectoryIngestor()
+        ingestor = DirectoryIngestor(excluded_dirs=set())
         contents = ingestor.read(str(tmp_path / "nope"))
         assert contents == []
 
     def test_chunk(self, tmp_path: Path):
         self._build_tree(tmp_path)
-        ingestor = DirectoryIngestor()
+        ingestor = DirectoryIngestor(excluded_dirs=set())
         contents = ingestor.read(str(tmp_path))
         chunks = ingestor.chunk(contents, ChunkConfig(chunk_size=512))
         assert len(chunks) >= 3  # at least one per file
@@ -228,7 +228,7 @@ class TestCodebaseIngestor:
         (tmp_path / "app.js").write_text("let x = 1;", encoding="utf-8")
         (tmp_path / "data.txt").write_text("hello", encoding="utf-8")
 
-        ingestor = CodebaseIngestor()
+        ingestor = CodebaseIngestor(excluded_dirs=set())
         contents = ingestor.read(str(tmp_path))
         langs = {c.metadata["file_path"].split(".")[-1]: c.metadata["language"] for c in contents}
         assert langs["py"] == "python"
@@ -248,7 +248,7 @@ class TestCodebaseIngestor:
         """)
         (tmp_path / "module.py").write_text(code, encoding="utf-8")
 
-        ingestor = CodebaseIngestor()
+        ingestor = CodebaseIngestor(excluded_dirs=set())
         contents = ingestor.read(str(tmp_path))
         chunks = ingestor.chunk(contents, ChunkConfig(chunk_size=512, chunk_overlap=0))
 
@@ -261,7 +261,7 @@ class TestCodebaseIngestor:
     def test_unknown_language_fallback(self, tmp_path: Path):
         (tmp_path / "data.txt").write_text("word " * 200, encoding="utf-8")
 
-        ingestor = CodebaseIngestor()
+        ingestor = CodebaseIngestor(excluded_dirs=set())
         contents = ingestor.read(str(tmp_path))
         chunks = ingestor.chunk(contents, ChunkConfig(chunk_size=50, chunk_overlap=10))
         # Should fall back to token chunking.
@@ -273,7 +273,7 @@ class TestCodebaseIngestor:
         code = "def huge_function():\n" + "\n".join(body_lines)
         (tmp_path / "big.py").write_text(code, encoding="utf-8")
 
-        ingestor = CodebaseIngestor()
+        ingestor = CodebaseIngestor(excluded_dirs=set())
         contents = ingestor.read(str(tmp_path))
         chunks = ingestor.chunk(contents, ChunkConfig(chunk_size=50, chunk_overlap=10))
         # The single large function should be broken into multiple chunks.
@@ -558,7 +558,7 @@ class TestIngestionOrchestrator:
         f = tmp_path / "test.txt"
         f.write_text("Hello orchestrator!", encoding="utf-8")
 
-        settings = Settings()
+        settings = Settings(saves_dir=tmp_path)
         orchestrator = IngestionOrchestrator(settings)
         chunks = orchestrator.ingest(SourceType.file, str(f))
         assert len(chunks) >= 1
@@ -568,7 +568,7 @@ class TestIngestionOrchestrator:
         (tmp_path / "a.txt").write_text("aaa", encoding="utf-8")
         (tmp_path / "b.txt").write_text("bbb", encoding="utf-8")
 
-        settings = Settings()
+        settings = Settings(saves_dir=tmp_path)
         orchestrator = IngestionOrchestrator(settings)
         chunks = orchestrator.ingest(SourceType.directory, str(tmp_path))
         assert len(chunks) >= 2
@@ -577,14 +577,14 @@ class TestIngestionOrchestrator:
         f = tmp_path / "big.txt"
         f.write_text("word " * 500, encoding="utf-8")
 
-        settings = Settings()
+        settings = Settings(saves_dir=tmp_path)
         orchestrator = IngestionOrchestrator(settings)
         custom = ChunkConfig(chunk_size=50, chunk_overlap=5)
         chunks = orchestrator.ingest(SourceType.file, str(f), chunk_config=custom)
         assert len(chunks) > 1
 
-    def test_unknown_source_type(self):
-        settings = Settings()
+    def test_unknown_source_type(self, tmp_path: Path):
+        settings = Settings(saves_dir=tmp_path)
         orchestrator = IngestionOrchestrator(settings)
         # Create a fake source type value to trigger the error.
         with pytest.raises(ValueError, match="No ingestor registered"):
@@ -594,7 +594,7 @@ class TestIngestionOrchestrator:
         f = tmp_path / "test.txt"
         f.write_text("short", encoding="utf-8")
 
-        settings = Settings(chunk_size=512, chunk_overlap=64)
+        settings = Settings(saves_dir=tmp_path, chunk_size=512, chunk_overlap=64)
         orchestrator = IngestionOrchestrator(settings)
         chunks = orchestrator.ingest(SourceType.file, str(f))
         assert len(chunks) == 1

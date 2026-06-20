@@ -1,7 +1,7 @@
 {
-  "name": "agent-knowledgebase",
+  "name": "agent-knowledgebase-auto-dev",
   "description": "Personal knowledgebase plugin — ingest sources, build wiki artifacts, query with vector search",
-  "version": "0.1.0",
+  "version": "0.13.1",
   "author": { "name": "olive" },
   "repository": "https://github.com/goosefly99/agent-knowledgebase-claude-plugin.git"
 }

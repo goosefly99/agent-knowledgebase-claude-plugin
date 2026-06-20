@@ -1,0 +1,58 @@
+# docker/docker-compose.yml — agent-knowledgebase runtime
+#
+# Start with: cd ${CLAUDE_PLUGIN_ROOT}/docker && docker compose up -d
+# Stop with:  cd ${CLAUDE_PLUGIN_ROOT}/docker && docker compose down
+#
+# Run from this directory (not from the plugin root with `-f`) so any
+# host-specific `docker-compose.override.yml` is auto-loaded.
+#
+# The agent-kb container stays up via `tail -f /dev/null` so the plugin's
+# `bin/run_server.py` shim can `docker exec -i` a fresh MCP server per
+# session. State persists in the named volume `agent-kb-data`.
+#
+# The ollama sidecar provides the default qwen3-embedding:8b model. If
+# you have an external Ollama on the host, comment out the ollama
+# service and set OLLAMA_HOST=http://host.docker.internal:11434 in the
+# agent-kb environment.
+
+services:
+  agent-knowledgebase:
+    image: agent-knowledgebase:dev
+    container_name: agent-knowledgebase
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    restart: unless-stopped
+    volumes:
+      - agent-kb-data:/data/saves
+    environment:
+      AGENT_KB_SAVES_DIR: /data/saves
+      AGENT_KB_EMBEDDING_PROVIDER: ${AGENT_KB_EMBEDDING_PROVIDER:-ollama}
+      AGENT_KB_EMBEDDING_MODEL: ${AGENT_KB_EMBEDDING_MODEL:-qwen3-embedding:8b}
+      AGENT_KB_EMBED_BASE_URL: ${AGENT_KB_EMBED_BASE_URL:-http://ollama:11434}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+    depends_on:
+      ollama:
+        condition: service_started
+    networks:
+      - agent-kb-net
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: agent-kb-ollama
+    restart: unless-stopped
+    volumes:
+      - ollama-models:/root/.ollama
+    networks:
+      - agent-kb-net
+    # The qwen3-embedding:8b pull is a manual one-time step:
+    #   docker exec agent-kb-ollama ollama pull qwen3-embedding:8b
+    # so first-boot doesn't block on the model download (~5 GB).
+
+volumes:
+  agent-kb-data:
+  ollama-models:
+
+networks:
+  agent-kb-net:
+    driver: bridge
